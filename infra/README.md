@@ -1,26 +1,15 @@
 # open-videocore — Infrastructure
 
-OSC service provisioning scripts for open-videocore.
+open-videocore provisions OSC service instances on behalf of operators via its API. There is no separate infra provisioning step — deploying open-videocore itself is the setup.
 
-## Scripts
+## How it works
 
-| Script | Purpose |
-|--------|---------|
-| `provision-dev.sh` | Provision all OSC dev-tier service instances and parameter store |
-| `teardown-dev.sh` | Delete all dev-tier instances (use with care) |
+1. Deploy open-videocore to OSC (or run it locally with `pnpm dev` in `backend-api/`).
+2. Supply your `OSC_ACCESS_TOKEN` — on OSC this is injected automatically at service creation time.
+3. Call `POST /api/v1/provision` to provision a full stack (MinIO, CouchDB, PostgreSQL, Valkey, Encore, etc.) in your OSC workspace.
 
-## Usage
+open-videocore uses `@osaas/client-core` (`Context`, `createInstance`, `removeInstance`) for all OSC API calls.
 
-```bash
-# Provision from scratch (idempotent)
-./provision-dev.sh
-
-# Check status of all instances
-./status.sh
-```
-
-Requires `gh` and the OSC MCP CLI. All connection strings land in the `openvideocore` parameter store.
-
-## Services provisioned
+## OSC services provisioned by the API
 
 See [../docs/architecture/ADR-001-osc-stack.md](../docs/architecture/ADR-001-osc-stack.md) for the full service list and rationale.

@@ -15,6 +15,7 @@
   "dependencies": {
     "@fastify/cors": "^10.0.2",
     "@fastify/helmet": "^13.0.2",
+    "@osaas/client-core": "^0.24.0",
     "fastify": "^5.3.2",
     "fastify-type-provider-zod": "^4.0.2",
     "nano": "^10.1.4",
