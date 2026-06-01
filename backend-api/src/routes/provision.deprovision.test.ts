@@ -31,11 +31,18 @@ vi.mock('@osaas/client-core', () => ({
   removeInstance: (...args: unknown[]) => removeInstance(...args),
   getPortsForInstance: vi.fn(),
   waitForInstanceReady: vi.fn(),
+  saveSecret: vi.fn(),
   Context: class {}
 }));
 
+// Provisioning credentials are read from the environment at router
+// registration time (ADR-002, issue #30); set them so the router can register.
+process.env['MINIO_ROOT_PASSWORD'] = 'test-minio-password';
+process.env['COUCHDB_ADMIN_PASSWORD'] = 'test-couchdb-password';
+
 import { registerAuth } from '../auth/middleware.js';
 import { provisionRouter } from './provision.js';
+import type { ParamStore } from '../services/param-store.js';
 
 const getServiceAccessToken = vi.fn(async () => 'test-sat');
 const osc = { getServiceAccessToken } as never;
@@ -43,12 +50,16 @@ const osc = { getServiceAccessToken } as never;
 // Valid bearer header for the authenticated paths (issue #28).
 const AUTH = { authorization: 'Bearer token-a' };
 
-async function buildApp() {
+async function buildApp(paramStore?: ParamStore) {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
-  await app.register(provisionRouter, { prefix: '/api/v1/provision', osc });
+  await app.register(provisionRouter, {
+    prefix: '/api/v1/provision',
+    osc,
+    paramStore
+  });
   await app.ready();
   return app;
 }
@@ -152,7 +163,7 @@ describe('provision/deprovision authentication (issue #28)', () => {
     const res = await app.inject({
       method: 'POST',
       url: '/api/v1/provision',
-      payload: { name: 'mystack', adminPassword: 'supersecret' }
+      payload: { name: 'mystack' }
     });
     expect(res.statusCode).toBe(401);
     expect(res.headers['www-authenticate']).toBe('Bearer');
@@ -166,6 +177,79 @@ describe('provision/deprovision authentication (issue #28)', () => {
       url: '/api/v1/provision',
       headers: { authorization: 'Bearer nope' },
       payload: { name: 'mystack', adminPassword: 'supersecret' }
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe('GET /api/v1/provision/:name (issue #31)', () => {
+  const storedConfig = {
+    minioEndpoint: 'https://minio.example.osaas.io',
+    couchdbUrl: 'https://couch.example.osaas.io',
+    databaseUrl: 'postgresql://host.example.osaas.io:5432/openvideocore',
+    redisUrl: 'redis://valkey.svc.cluster.local:6379',
+    encoreUrl: 'https://encore.example.osaas.io',
+    encoreCallbackUrl: 'https://callback.example.osaas.io',
+    sourceBucket: 'openvideocore-source',
+    packagedBucket: 'openvideocore-packaged',
+    services: [{ serviceId: 'minio-minio', instanceName: 'mystack' }]
+  };
+
+  it('returns 200 with stored coordinates, scoped to the workspace', async () => {
+    const loadStackConfig = vi.fn(async () => storedConfig);
+    const paramStore = {
+      storeStackConfig: vi.fn(),
+      loadStackConfig
+    } as unknown as ParamStore;
+
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/provision/mystack',
+      headers: AUTH
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual(storedConfig);
+    expect(loadStackConfig).toHaveBeenCalledWith('workspace-a', 'mystack');
+  });
+
+  it('returns 404 when no config is stored for the stack', async () => {
+    const paramStore = {
+      storeStackConfig: vi.fn(),
+      loadStackConfig: vi.fn(async () => undefined)
+    } as unknown as ParamStore;
+
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/provision/ghoststack',
+      headers: AUTH
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('returns 501 when the parameter store is not configured', async () => {
+    const app = await buildApp(undefined);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/provision/mystack',
+      headers: AUTH
+    });
+
+    expect(res.statusCode).toBe(501);
+  });
+
+  it('rejects GET without a token (401)', async () => {
+    const paramStore = {
+      storeStackConfig: vi.fn(),
+      loadStackConfig: vi.fn()
+    } as unknown as ParamStore;
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/provision/mystack'
     });
     expect(res.statusCode).toBe(401);
   });
