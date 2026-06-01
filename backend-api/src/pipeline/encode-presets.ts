@@ -64,9 +64,14 @@ function rung(label: string, width: number, height: number, videoKbps: number): 
 // The three built-in ABR ladders. Each is named by its top rung; lower rungs
 // are conventional steps down so adaptive players can switch under bandwidth
 // pressure.
+// All presets map to "program" — the only confirmed profile in the OSC Encore
+// instance (smoke tested 2026-06-01). The `outputs` array describes the
+// intended ladder for documentation purposes but is NOT sent to Encore.
+// When Encore is configured with named abr-1080p/720p/480p profiles these
+// names can be restored.
 export const PRESETS: Record<PresetName, EncoreProfile> = {
   '1080p': {
-    name: 'abr-1080p',
+    name: 'program',
     outputs: [
       rung('1080p', 1920, 1080, 5000),
       rung('720p', 1280, 720, 3000),
@@ -75,7 +80,7 @@ export const PRESETS: Record<PresetName, EncoreProfile> = {
     ]
   },
   '720p': {
-    name: 'abr-720p',
+    name: 'program',
     outputs: [
       rung('720p', 1280, 720, 3000),
       rung('480p', 854, 480, 1500),
@@ -83,7 +88,7 @@ export const PRESETS: Record<PresetName, EncoreProfile> = {
     ]
   },
   '480p': {
-    name: 'abr-480p',
+    name: 'program',
     outputs: [
       rung('480p', 854, 480, 1500),
       rung('360p', 640, 360, 800)

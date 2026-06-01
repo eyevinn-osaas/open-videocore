@@ -118,7 +118,7 @@ describe('transcode job management (issue #8)', () => {
 
       // Encore received the resolved 1080p ladder + s3 input/output URIs.
       expect(h.submitted).toHaveLength(1);
-      expect(h.submitted[0].profile.name).toBe('abr-1080p');
+      expect(h.submitted[0].profile.name).toBe('program');
       expect(h.submitted[0].profile.outputs[0].label).toBe('1080p');
       expect(h.submitted[0].inputUri).toBe(`s3://src-bucket/ingest/my-video`);
       expect(h.submitted[0].outputUri).toContain('s3://out-bucket/');
@@ -133,7 +133,7 @@ describe('transcode job management (issue #8)', () => {
       const h = await buildApp();
       const sourceId = await makeSource(h);
 
-      for (const [preset, name] of [['720p', 'abr-720p'], ['480p', 'abr-480p']] as const) {
+      for (const [preset, name] of [['720p', 'program'], ['480p', 'program']] as const) {
         h.submitted.length = 0;
         const res = await h.app.inject({
           method: 'POST',
