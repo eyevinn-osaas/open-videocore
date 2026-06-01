@@ -1,0 +1,50 @@
+# Local contributor dev environment.
+# On OSC the parameter store injects all env vars — this file is not used in production.
+#
+# Usage:
+#   docker compose up -d
+#   cd backend-api && pnpm dev
+
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: openvideocore
+      MINIO_ROOT_PASSWORD: Openvideocore1
+    volumes:
+      - minio_data:/data
+
+  couchdb:
+    image: apache/couchdb:3
+    ports:
+      - "5984:5984"
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: Openvideocore1
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: openvideocore
+      POSTGRES_PASSWORD: Openvideocore1
+      POSTGRES_DB: openvideocore
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  minio_data:
+  couchdb_data:
+  postgres_data:
