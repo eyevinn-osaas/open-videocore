@@ -50,6 +50,9 @@ export interface ParamStore {
     workspaceId: string,
     name: string
   ): Promise<StackConfig | undefined>;
+  // Remove the stored coordinates for a named stack (deprovision, #29). Must be
+  // idempotent: deleting an already-absent entry resolves without error.
+  deleteStackConfig(workspaceId: string, name: string): Promise<void>;
 }
 
 // Key under which a stack's config blob is stored. Namespaced by workspace so
@@ -195,6 +198,22 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
           `parameter store value for "${key}" is not valid JSON`
         );
       }
+    },
+
+    async deleteStackConfig(workspaceId, name) {
+      const key = stackConfigKey(workspaceId, name);
+      const res = await withTimeout((signal) =>
+        doFetch(paramUrl(key), { method: 'DELETE', headers: authHeader, signal })
+      );
+      // 404 is success from an idempotency standpoint: the entry is already
+      // gone, which is exactly the desired end state.
+      if (res.status === 404 || res.ok) {
+        return;
+      }
+      const text = await res.text().catch(() => '');
+      throw new Error(
+        `parameter store delete failed: ${res.status} ${text}`.trim()
+      );
     }
   };
 }

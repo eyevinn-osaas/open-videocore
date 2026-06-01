@@ -12,7 +12,10 @@ import {
   waitForInstanceReady
 } from '@osaas/client-core';
 import { Client as MinioClient } from 'minio';
-import { deprovisionStack } from '../services/deprovision.js';
+import {
+  deprovisionStack,
+  deprovisionStackFromConfig
+} from '../services/deprovision.js';
 import {
   type ParamStore,
   type StackConfig,
@@ -564,19 +567,67 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     async (request, reply) => {
       const { name } = request.params;
 
-      const result = await deprovisionStack(osc, name);
+      // Without a parameter store there is no per-workspace ownership record to
+      // consult, so fall back to the legacy hardcoded-list teardown. This keeps
+      // store-less deployments working; ownership scoping (#29) requires the
+      // store and is exercised on the path below.
+      if (!paramStore) {
+        const result = await deprovisionStack(osc, name);
+        if (result.status === 'failed') {
+          request.log.error({ result }, 'stack teardown reported failures');
+          return reply.code(502).send(result);
+        }
+        if (result.status === 'not_found') {
+          return reply.code(404).send(result);
+        }
+        return reply.code(200).send(result);
+      }
+
+      // Ownership + discovery: the stored config is namespaced by workspace, so
+      // a caller can only ever load (and therefore tear down) a stack their own
+      // workspace provisioned. A miss means the stack is not owned by this
+      // workspace — or never existed, or was already deprovisioned.
+      const config = await paramStore.loadStackConfig(
+        request.workspaceId,
+        name
+      );
+      if (!config) {
+        // Idempotent: a retry after a successful teardown (entry already gone)
+        // lands here. Report not_found rather than erroring.
+        return reply.code(404).send({ name, status: 'not_found', services: [] });
+      }
+
+      // Teardown order and the instance set come from what was actually
+      // provisioned (the stored services[]), not the static STACK_SERVICES list.
+      const result = await deprovisionStackFromConfig(
+        osc,
+        name,
+        config.services
+      );
 
       if (result.status === 'failed') {
         request.log.error({ result }, 'stack teardown reported failures');
         // 502 Bad Gateway: the failure originates in a downstream OSC service.
+        // The parameter-store entry is intentionally NOT removed so a retry can
+        // re-read the services[] and finish the teardown.
         return reply.code(502).send(result);
       }
 
-      if (result.status === 'not_found') {
-        return reply.code(404).send(result);
+      // removed | partial | not_found — every instance is gone (or was already
+      // gone). The stack is fully torn down, so remove the stored coordinates.
+      // deleteStackConfig is idempotent, so a retry that re-finds a stale entry
+      // still converges. A delete failure is logged but does not fail the call:
+      // the OSC instances are already removed and a stale config entry is a
+      // recoverable inconsistency, not a stranded stack.
+      try {
+        await paramStore.deleteStackConfig(request.workspaceId, name);
+      } catch (err) {
+        request.log.error(
+          { err, name, workspaceId: request.workspaceId },
+          'stack torn down but failed to remove parameter store entry'
+        );
       }
 
-      // removed | partial
       return reply.code(200).send(result);
     }
   );

@@ -70,7 +70,121 @@ beforeEach(() => {
   getServiceAccessToken.mockClear();
 });
 
-describe('DELETE /api/v1/provision/:name', () => {
+// A StackConfig as it would be returned from the parameter store for a stack
+// owned by workspace-a. The services[] list drives teardown (issue #29).
+const STORED_CONFIG = {
+  minioEndpoint: 'https://minio.example.osaas.io',
+  couchdbUrl: 'https://couch.example.osaas.io',
+  databaseUrl: 'postgresql://host.example.osaas.io:5432/openvideocore',
+  redisUrl: 'redis://valkey.svc.cluster.local:6379',
+  encoreUrl: 'https://encore.example.osaas.io',
+  encoreCallbackUrl: 'https://callback.example.osaas.io',
+  sourceBucket: 'openvideocore-source',
+  packagedBucket: 'openvideocore-packaged',
+  services: [
+    { serviceId: 'minio-minio', instanceName: 'mystack' },
+    { serviceId: 'apache-couchdb', instanceName: 'mystack' },
+    { serviceId: 'birme-osc-postgresql', instanceName: 'mystack' },
+    { serviceId: 'valkey-io-valkey', instanceName: 'mystack' },
+    { serviceId: 'encore', instanceName: 'mystack' },
+    { serviceId: 'eyevinn-encore-callback-listener', instanceName: 'mystack' },
+    { serviceId: 'eyevinn-encore-packager', instanceName: 'mystack' }
+  ]
+};
+
+function makeParamStore(loadResult: unknown) {
+  return {
+    storeStackConfig: vi.fn(),
+    loadStackConfig: vi.fn(async () => loadResult),
+    deleteStackConfig: vi.fn(async () => undefined)
+  } as unknown as ParamStore & {
+    loadStackConfig: ReturnType<typeof vi.fn>;
+    deleteStackConfig: ReturnType<typeof vi.fn>;
+  };
+}
+
+describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
+  it('reads services[] from the store, tears down, and deletes the entry', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/v1/provision/mystack',
+      headers: AUTH
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe('removed');
+    // Ownership scoping: looked up under the caller's workspace.
+    expect(paramStore.loadStackConfig).toHaveBeenCalledWith(
+      'workspace-a',
+      'mystack'
+    );
+    // Param store entry removed on successful teardown.
+    expect(paramStore.deleteStackConfig).toHaveBeenCalledWith(
+      'workspace-a',
+      'mystack'
+    );
+    // Teardown removed every stored service.
+    expect(removeInstance).toHaveBeenCalledTimes(STORED_CONFIG.services.length);
+  });
+
+  it('returns 404 when the store has no entry for this workspace (ownership)', async () => {
+    const paramStore = makeParamStore(undefined);
+
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/v1/provision/notmine',
+      headers: AUTH
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().status).toBe('not_found');
+    // No OSC teardown attempted for a stack the workspace does not own.
+    expect(getInstance).not.toHaveBeenCalled();
+    expect(removeInstance).not.toHaveBeenCalled();
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent: a retry after the entry is gone returns 404 not_found', async () => {
+    const paramStore = makeParamStore(undefined);
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/v1/provision/mystack',
+      headers: AUTH
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().status).toBe('not_found');
+  });
+
+  it('returns 502 and keeps the store entry when a teardown fails', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === 'minio-minio') throw new Error('boom');
+      return undefined;
+    });
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/v1/provision/mystack',
+      headers: AUTH
+    });
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json().status).toBe('failed');
+    // Entry retained so a retry can re-read services[] and finish teardown.
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('DELETE /api/v1/provision/:name (no param store, legacy)', () => {
   it('returns 200 status=removed on full teardown', async () => {
     getInstance.mockResolvedValue({ name: 'mystack' });
     removeInstance.mockResolvedValue(undefined);
