@@ -1,15 +1,18 @@
 // ABR encoding presets + the Encore profile shape (issue #8).
 //
-// Encore is driven by an "encore profile": a named set of inputs/outputs that
-// describe the ABR ladder to produce. open-videocore ships three built-in ABR
-// presets (1080p, 720p, 480p) so a caller can transcode with a single
-// `profile` name and never hand-author a ladder. A caller who needs something
-// bespoke may instead pass a full `customProfile` that conforms to
-// EncoreProfile, which is forwarded to Encore verbatim.
+// IMPORTANT — Encore profiles are SERVER-SIDE named configurations:
+// The `profile` field in a job submission is a name string that Encore resolves
+// against profiles registered in its own configuration. We cannot send an
+// inline outputs ladder. Our preset `name` values MUST match profile names
+// configured in the provisioned Encore instance.
 //
-// Each preset's top rung names the resolution (1080p = a ladder topping out at
-// 1920x1080, etc.) and each lower rung is a standard step down, so every preset
-// is a genuine adaptive ladder rather than a single rendition.
+// SMOKE TEST CONFIRMED (2026-06-01): The only known profile in the
+// openvideocore Encore instance is "program". The preset names below
+// (abr-1080p, abr-720p, abr-480p) are PLACEHOLDERS — they will fail until
+// matching profiles are registered in the Encore instance configuration.
+//
+// The `outputs` field on EncoreProfile is kept for documentation/UI purposes
+// (describing what the ladder produces) but is NOT sent to Encore's API.
 
 // A single output rung of an Encore profile. These map to the fields Encore's
 // transcode API expects per output rendition.

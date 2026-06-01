@@ -49,28 +49,25 @@ export type HttpEncoreConfig = {
   fetch?: typeof globalThis.fetch;
 };
 
-// Map our EncoreProfile to Encore's job-creation payload. Encore's API accepts
-// an input list and an output profile; we send the ladder as the profile's
-// outputs and the single source as the lone input. The exact field names track
-// Encore's documented `EncoreJob` schema; see the OSC friction log if Encore's
-// schema diverges from this mapping.
+// Map our EncoreProfile to Encore's job-creation payload.
+//
+// SMOKE TEST CONFIRMED (2026-06-01): Encore's API schema has NO top-level
+// `outputs` field. Profiles are server-side named configurations — the profile
+// name string is the only way to select a ladder. `profileParams` may be used
+// to evaluate SpEL expressions within the profile if needed.
+//
+// Our preset names (abr-1080p, abr-720p, abr-480p) must match profiles
+// registered in the provisioned Encore instance. The only confirmed built-in
+// profile name is "program". See OSC friction log incoming-issue8-transcode.md.
 export function toEncorePayload(input: EncoreSubmitInput): Record<string, unknown> {
   return {
     externalId: input.externalId,
     profile: input.profile.name,
     outputFolder: input.outputUri,
     baseName: 'rendition',
-    inputs: [{ uri: input.inputUri, type: 'AudioVideo' }],
-    // The concrete ladder, forwarded so an Encore deployment without our named
-    // profile pre-registered can still honour the request.
-    outputs: input.profile.outputs.map((o) => ({
-      label: o.label,
-      width: o.width,
-      height: o.height,
-      videoBitrate: o.videoBitrateBps,
-      audioBitrate: o.audioBitrateBps,
-      format: o.format
-    }))
+    inputs: [{ uri: input.inputUri, type: 'AudioVideo' }]
+    // NOTE: no `outputs` field — Encore profiles are server-side only.
+    // profileParams can be added here if the profile uses SpEL expressions.
   };
 }
 

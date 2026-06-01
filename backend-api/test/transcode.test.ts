@@ -275,9 +275,10 @@ describe('transcode job management (issue #8)', () => {
         payload: {
           externalId: encoreJobId,
           status: 'SUCCESSFUL',
-          outputs: [
-            { label: '1080p', key: 'out/1080.mp4', width: 1920, height: 1080 },
-            { label: '720p', key: 'out/720.mp4', width: 1280, height: 720 }
+          // Real Encore shape: field is "output" (not "outputs"), VideoFile with videoStreams
+          output: [
+            { type: 'VideoFile', file: 'out/1080.mp4', videoStreams: [{ width: 1920, height: 1080 }] },
+            { type: 'VideoFile', file: 'out/720.mp4', videoStreams: [{ width: 1280, height: 720 }] }
           ]
         }
       });
@@ -297,7 +298,7 @@ describe('transcode job management (issue #8)', () => {
       const src = await h.assets.get('workspace-a', sourceId);
       expect(src?.status).toBe('ready');
       expect(src?.renditions).toHaveLength(2);
-      expect(src?.renditions?.map((r) => r.label)).toEqual(['1080p', '720p']);
+      expect(src?.renditions?.map((r) => r.label)).toEqual(['rendition-1', 'rendition-2']);
       expect(src?.renditions?.[0].objectKey).toBe('out/1080.mp4');
     });
 
@@ -308,7 +309,7 @@ describe('transcode job management (issue #8)', () => {
       const payload = {
         externalId: encoreJobId,
         status: 'SUCCESSFUL',
-        outputs: [{ label: '1080p', key: 'out/1080.mp4', width: 1920, height: 1080 }]
+        output: [{ type: 'VideoFile', file: 'out/1080.mp4', videoStreams: [{ width: 1920, height: 1080 }] }]
       };
       const first = await h.app.inject({
         method: 'POST',
@@ -349,7 +350,7 @@ describe('transcode job management (issue #8)', () => {
       const cb = await h.app.inject({
         method: 'POST',
         url: '/api/v1/internal/encore-callback',
-        payload: { externalId: 'workspace-a__job-nope', status: 'SUCCESSFUL', outputs: [] }
+        payload: { externalId: 'workspace-a__job-nope', status: 'SUCCESSFUL', output: [] }
       });
       expect(cb.statusCode).toBe(404);
     });

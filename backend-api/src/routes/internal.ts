@@ -42,23 +42,36 @@ const packagerCallbackSchema = z.object({
 const ackSchema = z.object({ ok: z.boolean() });
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
-// Encore completion callback payload (issue #8). Lenient: the callback listener
-// forwards Encore's job document, from which we need the externalId (our
-// encoreJobId), the status, and the produced outputs.
-const callbackOutputSchema = z.object({
-  label: z.string().optional(),
-  key: z.string().optional(),
-  file: z.string().optional(),
+// Encore completion callback payload (issue #8).
+//
+// SMOKE TEST CONFIRMED (2026-06-01): Encore POSTs its full EncoreJob document
+// to progressCallbackUri. The relevant fields are:
+//   externalId  — our encoreJobId (embeds workspaceId + jobId)
+//   status      — "NEW"|"QUEUED"|"IN_PROGRESS"|"SUCCESSFUL"|"FAILED"|"CANCELLED"
+//   message     — error message when status=FAILED
+//   output      — array of MediaFile (VideoFile|AudioFile|ImageFile|SubtitleFile)
+//                 VideoFile has: file (path), type ("VideoFile"), videoStreams[{width,height}]
+//
+// We filter output to VideoFile entries only (type === "VideoFile") to extract
+// rendition dimensions. The schema is lenient on unknown fields.
+const videoStreamSchema = z.object({
   width: z.number().optional(),
   height: z.number().optional()
-});
+}).passthrough();
+
+const callbackOutputSchema = z.object({
+  file: z.string().optional(),       // path/key of the produced file
+  type: z.string().optional(),       // "VideoFile" | "AudioFile" | "ImageFile" | ...
+  videoStreams: z.array(videoStreamSchema).optional(),
+  overallBitrate: z.number().optional()
+}).passthrough();
 
 const encoreCallbackSchema = z.object({
   externalId: z.string().min(1),
   status: z.string().min(1),
   message: z.string().optional(),
-  outputs: z.array(callbackOutputSchema).optional()
-});
+  output: z.array(callbackOutputSchema).optional()   // NOTE: "output" not "outputs"
+}).passthrough();
 
 const encoreAckSchema = z.object({
   applied: z.boolean(),
@@ -77,15 +90,20 @@ type InternalRouterOptions = {
 };
 
 function normaliseRenditions(
-  outputs: z.infer<typeof callbackOutputSchema>[] | undefined
+  output: z.infer<typeof callbackOutputSchema>[] | undefined
 ): CallbackRendition[] {
-  if (!outputs) return [];
-  return outputs.map((o, i) => ({
-    label: o.label ?? `rendition-${i + 1}`,
-    width: o.width ?? 0,
-    height: o.height ?? 0,
-    objectKey: o.key ?? o.file ?? `rendition-${i + 1}`
-  }));
+  if (!output) return [];
+  // Filter to video files only; other types (audio, image, subtitle) are not renditions.
+  const videoFiles = output.filter((o) => !o.type || o.type === 'VideoFile');
+  return videoFiles.map((o, i) => {
+    const stream = o.videoStreams?.[0];
+    return {
+      label: `rendition-${i + 1}`,
+      width: stream?.width ?? 0,
+      height: stream?.height ?? 0,
+      objectKey: o.file ?? `rendition-${i + 1}`
+    };
+  });
 }
 
 export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (fastify, opts) => {
@@ -139,7 +157,7 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           .code(501)
           .send({ error: 'not_configured', message: 'transcoding is not configured' });
       }
-      const { externalId, status, message, outputs } = request.body;
+      const { externalId, status, message, output } = request.body;
 
       const found = await jobRepository.findByEncoreJobId(externalId);
       if (!found) {
@@ -155,7 +173,7 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           sourceAssetId: found.job.assetId,
           success,
           error: success ? undefined : (message ?? `encore status: ${status}`),
-          renditions: success ? normaliseRenditions(outputs) : []
+          renditions: success ? normaliseRenditions(output) : []
         },
         { jobs: jobRepository, assets: repository }
       );
