@@ -6,10 +6,12 @@ import { z } from 'zod';
 import {
   Context,
   createInstance,
+  getInstance,
   getPortsForInstance,
   waitForInstanceReady
 } from '@osaas/client-core';
 import { Client as MinioClient } from 'minio';
+import { deprovisionStack } from '../services/deprovision.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
 // referenced by Encore (input/source) and eyevinn-encore-packager
@@ -48,6 +50,29 @@ const errorSchema = z.object({
 });
 
 type ProvisionedEntry = z.infer<typeof provisionedEntrySchema>;
+
+// Shared name validation for the :name path parameter on DELETE. Mirrors the
+// rules used when the stack was provisioned.
+const nameParamSchema = z.object({
+  name: z
+    .string()
+    .min(1)
+    .max(63)
+    .regex(/^[a-z0-9]+$/, 'name must be lowercase alphanumeric')
+});
+
+const serviceTeardownResultSchema = z.object({
+  serviceId: z.string(),
+  role: z.string(),
+  status: z.enum(['removed', 'not_found', 'failed']),
+  error: z.string().optional()
+});
+
+const teardownResponseSchema = z.object({
+  name: z.string(),
+  status: z.enum(['removed', 'not_found', 'partial', 'failed']),
+  services: z.array(serviceTeardownResultSchema)
+});
 
 type ProvisionRouterOptions = {
   osc: Context;
@@ -103,11 +128,12 @@ function databaseUrlFrom(
   return `postgresql://${opts.user}:${encodeURIComponent(opts.password)}@${host}:5432/${opts.db}`;
 }
 
-// Valkey (Redis-compatible) connection string. Valkey is reached over a raw TCP
-// port, not the HTTP .url field. OSC routes extra TCP ports via the ports API,
-// so we resolve the externally routed port for this instance.
-// FLAGGED FOR SMOKE-TEST VERIFICATION: confirm the routed port/host shape
-// against a live valkey-io-valkey instance.
+// Valkey (Redis-compatible) connection string.
+// OSC Valkey instances use internal-only cluster DNS (publicAccess=false).
+// The internal DNS follows the pattern:
+//   oscaidev-<name>.valkey-io-valkey.svc.cluster.local:6379
+// This is only reachable from within the OSC cluster — correct for
+// open-videocore running as an OSC service.
 async function redisUrlFrom(
   osc: Context,
   serviceId: string,
@@ -115,11 +141,22 @@ async function redisUrlFrom(
 ): Promise<string> {
   const sat = await osc.getServiceAccessToken(serviceId);
   const ports = await getPortsForInstance(osc, serviceId, name, sat);
-  if (!ports || ports.length === 0) {
-    throw new Error('valkey instance did not expose a routed TCP port');
+  if (ports && ports.length > 0) {
+    // Public TCP endpoint available (non-default config)
+    const { externalIp, externalPort } = ports[0];
+    return `redis://${externalIp}:${externalPort}`;
   }
-  const { externalIp, externalPort } = ports[0];
-  return `redis://${externalIp}:${externalPort}`;
+  // Internal-only: the instance URL is
+  //   https://oscaidev-<name>.valkey-io-valkey.auto.prod.osaas.io
+  // Strip to the cluster-DNS form:
+  //   oscaidev-<name>.valkey-io-valkey.svc.cluster.local:6379
+  const instance = await getInstance(osc, serviceId, name, sat);
+  const instanceHostname = new URL(instance.url as string).hostname;
+  const clusterHost = instanceHostname.replace(
+    /\.auto\.prod\.osaas\.io$/,
+    '.svc.cluster.local'
+  );
+  return `redis://${clusterHost}:6379`;
 }
 
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
@@ -174,9 +211,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         await waitForInstanceReady('minio-minio', name, osc);
         const minioEndpoint = instanceUrl(minio);
 
-        // 1b. Create the source and packaged buckets on the live MinIO instance
-        // before any downstream service references them. Done synchronously so
-        // Encore (input) and the packager (OutputFolder) can rely on them.
+        // 1b. Create the source and packaged buckets on the live MinIO instance.
+        // waitForInstanceReady passes when the container health check is green,
+        // but the MinIO S3 API may still be initialising. Retry with backoff
+        // until S3 is actually accepting connections.
         const minioUrl = new URL(minioEndpoint);
         const minioClient = new MinioClient({
           endPoint: minioUrl.hostname,
@@ -189,10 +227,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           accessKey: 'admin',
           secretKey: adminPassword
         });
+        const delay = (ms: number) =>
+          new Promise((resolve) => setTimeout(resolve, ms));
         for (const bucket of [SOURCE_BUCKET, PACKAGED_BUCKET]) {
-          const exists = await minioClient.bucketExists(bucket);
-          if (!exists) {
-            await minioClient.makeBucket(bucket);
+          let attempts = 0;
+          while (true) {
+            try {
+              const exists = await minioClient.bucketExists(bucket);
+              if (!exists) {
+                await minioClient.makeBucket(bucket);
+              }
+              break;
+            } catch (err) {
+              attempts++;
+              if (attempts >= 20) throw err;
+              await delay(5000);
+            }
           }
         }
 
@@ -286,6 +336,47 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           provisioned
         });
       }
+    }
+  );
+
+  // DELETE /api/v1/provision/:name — tear down a named stack.
+  //
+  // Removes every OSC instance that makes up the stack in dependency-safe
+  // order (consumers before producers). Behaviour:
+  //   - 200 status=removed    every instance was removed this call
+  //   - 200 status=partial    some removed, some already gone (no failures)
+  //   - 404 status=not_found  no instances existed for this name
+  //   - 502 status=failed     one or more instances failed to remove; the
+  //                           call is safe to retry (idempotent)
+  app.delete(
+    '/:name',
+    {
+      schema: {
+        params: nameParamSchema,
+        response: {
+          200: teardownResponseSchema,
+          404: teardownResponseSchema,
+          502: teardownResponseSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const { name } = request.params;
+
+      const result = await deprovisionStack(osc, name);
+
+      if (result.status === 'failed') {
+        request.log.error({ result }, 'stack teardown reported failures');
+        // 502 Bad Gateway: the failure originates in a downstream OSC service.
+        return reply.code(502).send(result);
+      }
+
+      if (result.status === 'not_found') {
+        return reply.code(404).send(result);
+      }
+
+      // removed | partial
+      return reply.code(200).send(result);
     }
   );
 };
