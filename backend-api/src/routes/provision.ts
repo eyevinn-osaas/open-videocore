@@ -166,9 +166,17 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const { osc } = opts;
 
+  // Provision/deprovision are privileged stack-lifecycle operations and must
+  // run with a validated caller identity (issue #28, prerequisite for ADR-002).
+  // The `authenticate` preHandler resolves the OSC bearer token to
+  // request.workspaceId and rejects unauthenticated callers with 401 +
+  // WWW-Authenticate: Bearer before the handler runs.
+  const guarded = { onRequest: app.authenticate };
+
   app.post(
     '/',
     {
+      ...guarded,
       schema: {
         body: requestSchema,
         response: {
@@ -351,6 +359,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   app.delete(
     '/:name',
     {
+      ...guarded,
       schema: {
         params: nameParamSchema,
         response: {
