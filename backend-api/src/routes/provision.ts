@@ -11,6 +11,7 @@ import {
   waitForInstanceReady
 } from '@osaas/client-core';
 import { Client as MinioClient } from 'minio';
+import { deprovisionStack } from '../services/deprovision.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
 // referenced by Encore (input/source) and eyevinn-encore-packager
@@ -49,6 +50,29 @@ const errorSchema = z.object({
 });
 
 type ProvisionedEntry = z.infer<typeof provisionedEntrySchema>;
+
+// Shared name validation for the :name path parameter on DELETE. Mirrors the
+// rules used when the stack was provisioned.
+const nameParamSchema = z.object({
+  name: z
+    .string()
+    .min(1)
+    .max(63)
+    .regex(/^[a-z0-9]+$/, 'name must be lowercase alphanumeric')
+});
+
+const serviceTeardownResultSchema = z.object({
+  serviceId: z.string(),
+  role: z.string(),
+  status: z.enum(['removed', 'not_found', 'failed']),
+  error: z.string().optional()
+});
+
+const teardownResponseSchema = z.object({
+  name: z.string(),
+  status: z.enum(['removed', 'not_found', 'partial', 'failed']),
+  services: z.array(serviceTeardownResultSchema)
+});
 
 type ProvisionRouterOptions = {
   osc: Context;
@@ -312,6 +336,47 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           provisioned
         });
       }
+    }
+  );
+
+  // DELETE /api/v1/provision/:name — tear down a named stack.
+  //
+  // Removes every OSC instance that makes up the stack in dependency-safe
+  // order (consumers before producers). Behaviour:
+  //   - 200 status=removed    every instance was removed this call
+  //   - 200 status=partial    some removed, some already gone (no failures)
+  //   - 404 status=not_found  no instances existed for this name
+  //   - 502 status=failed     one or more instances failed to remove; the
+  //                           call is safe to retry (idempotent)
+  app.delete(
+    '/:name',
+    {
+      schema: {
+        params: nameParamSchema,
+        response: {
+          200: teardownResponseSchema,
+          404: teardownResponseSchema,
+          502: teardownResponseSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const { name } = request.params;
+
+      const result = await deprovisionStack(osc, name);
+
+      if (result.status === 'failed') {
+        request.log.error({ result }, 'stack teardown reported failures');
+        // 502 Bad Gateway: the failure originates in a downstream OSC service.
+        return reply.code(502).send(result);
+      }
+
+      if (result.status === 'not_found') {
+        return reply.code(404).send(result);
+      }
+
+      // removed | partial
+      return reply.code(200).send(result);
     }
   );
 };
