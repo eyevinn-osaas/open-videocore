@@ -133,6 +133,12 @@ export type Asset = {
   // (issue #7). Workspace-local MinIO keys; undefined until the first
   // successful extraction. A later extraction replaces the list wholesale.
   thumbnails?: string[];
+  // Free-form, operator-defined key-value metadata (issue #12). A JSON object
+  // stored alongside the fixed schema fields; values must be JSON-serializable.
+  // Undefined until the operator sets any metadata. Distinct from
+  // `technicalMetadata` (machine-extracted) — this is editorial/business data
+  // such as genre, rightsHolder, or language.
+  metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
 };
@@ -142,6 +148,8 @@ export type CreateAssetInput = {
   description?: string;
   parentId?: string;
   objectKey?: string;
+  // Optional free-form metadata supplied at creation time (issue #12).
+  metadata?: Record<string, unknown>;
 };
 
 // Mutable fields accepted by PATCH. `status` is validated against the state
@@ -168,6 +176,14 @@ export type UpdateAssetInput = {
   // Set by the thumbnail pipeline (issue #7). Replaces the asset's thumbnail
   // key list wholesale. Does not change `status`.
   thumbnails?: string[];
+  // Free-form operator metadata (issue #12). On PATCH this is SHALLOW-MERGED
+  // into any existing metadata: top-level keys present here override existing
+  // keys, all other existing keys are preserved. To replace the whole object
+  // wholesale use the dedicated PUT /:id/metadata route (see metadata field).
+  metadata?: Record<string, unknown>;
+  // When true, `metadata` replaces the existing object wholesale instead of
+  // being shallow-merged. Used by PUT /:id/metadata; PATCH leaves it false.
+  replaceMetadata?: boolean;
 };
 
 export type ListOptions = {
@@ -261,6 +277,21 @@ export function applyStatus(
   };
 }
 
+// Apply a metadata patch to an asset's existing metadata (issue #12). When
+// `replace` is set the patch becomes the new metadata wholesale (PUT semantics);
+// otherwise the patch is shallow-merged into the existing object — top-level
+// keys in the patch override existing keys, all other existing keys are kept.
+export function applyMetadata(
+  existing: Record<string, unknown> | undefined,
+  patch: Record<string, unknown>,
+  replace: boolean
+): Record<string, unknown> {
+  if (replace) {
+    return { ...patch };
+  }
+  return { ...(existing ?? {}), ...patch };
+}
+
 // ---------------------------------------------------------------------------
 // In-memory implementation
 // ---------------------------------------------------------------------------
@@ -289,6 +320,7 @@ export class InMemoryAssetRepository implements AssetRepository {
       parentId: input.parentId,
       objectKey: input.objectKey,
       statusHistory: initialHistory(now),
+      metadata: input.metadata,
       createdAt: now,
       updatedAt: now
     };
@@ -373,6 +405,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.thumbnails !== undefined) {
       next.thumbnails = patch.thumbnails;
+    }
+    if (patch.metadata !== undefined) {
+      next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
     }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);

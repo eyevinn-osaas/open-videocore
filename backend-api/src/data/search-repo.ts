@@ -18,6 +18,10 @@ export interface SearchQuery {
   tags?: string[];
   // Container/MIME type, matched against the extracted containerFormat.
   mimeType?: string;
+  // Free-form metadata filter (issue #12). An asset matches when, for every
+  // key/value pair given here, its `metadata` carries that exact value
+  // (strict equality on top-level keys).
+  metadata?: Record<string, unknown>;
   page?: number;
   pageSize?: number;
 }
@@ -80,6 +84,14 @@ export function matchesQuery(asset: Asset, query: SearchQuery): boolean {
   if (query.mimeType) {
     if (assetMimeType(asset) !== query.mimeType) {
       return false;
+    }
+  }
+  if (query.metadata) {
+    const md = asset.metadata ?? {};
+    for (const [key, value] of Object.entries(query.metadata)) {
+      if (md[key] !== value) {
+        return false;
+      }
     }
   }
   return true;
