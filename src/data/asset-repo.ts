@@ -11,8 +11,8 @@
 // This module also owns the asset lifecycle state machine and the audit trail
 // so both backends share one definition (issue #3).
 
+// ADR-003/#59: workspace guard removed (structural OSC isolation).
 import { ulid } from 'ulid';
-import { assertOwned, assertValidWorkspaceId, namespacedId } from './guard.js';
 
 // ---------------------------------------------------------------------------
 // Asset model + lifecycle
@@ -433,7 +433,6 @@ export class InMemoryAssetRepository implements AssetRepository {
   private readonly store = new Map<string, Asset>();
 
   async create(workspaceId: string, input: CreateAssetInput): Promise<Asset> {
-    assertValidWorkspaceId(workspaceId);
     if (input.parentId) {
       const parent = await this.get(workspaceId, input.parentId);
       if (!parent) {
@@ -461,27 +460,24 @@ export class InMemoryAssetRepository implements AssetRepository {
       createdAt: now,
       updatedAt: now
     };
-    this.store.set(namespacedId(workspaceId, localId), asset);
+    this.store.set(localId, asset);
     return { ...asset };
   }
 
   async get(workspaceId: string, id: string): Promise<Asset | undefined> {
-    assertValidWorkspaceId(workspaceId);
-    const asset = this.store.get(namespacedId(workspaceId, id));
+    const asset = this.store.get(id);
     if (!asset) {
       // Existence is not leaked: a foreign id is indistinguishable from a miss.
       return undefined;
     }
     // Defence in depth: re-check ownership even though the key is namespaced.
-    assertOwned(workspaceId, asset.workspaceId);
     return { ...asset };
   }
 
   async list(workspaceId: string, opts: ListOptions = {}): Promise<ListResult> {
-    assertValidWorkspaceId(workspaceId);
     const limit = clampLimit(opts.limit);
     const offset = Math.max(0, opts.offset ?? 0);
-    let all = [...this.store.values()].filter((a) => a.workspaceId === workspaceId);
+    let all = [...this.store.values()];
     if (opts.status) {
       all = all.filter((a) => a.status === opts.status);
     }
@@ -508,10 +504,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     id: string,
     patch: UpdateAssetInput
   ): Promise<Asset | undefined> {
-    assertValidWorkspaceId(workspaceId);
-    const key = namespacedId(workspaceId, id);
+    const key = id;
     const existing = this.store.get(key);
-    if (!existing || existing.workspaceId !== workspaceId) {
+    if (!existing) {
       return undefined;
     }
     const now = new Date().toISOString();
@@ -569,10 +564,7 @@ export class InMemoryAssetRepository implements AssetRepository {
   }
 
   async countChildren(workspaceId: string, id: string): Promise<number> {
-    assertValidWorkspaceId(workspaceId);
-    return [...this.store.values()].filter(
-      (a) => a.workspaceId === workspaceId && a.parentId === id
-    ).length;
+    return [...this.store.values()].filter((a) => a.parentId === id).length;
   }
 
   async remove(workspaceId: string, id: string): Promise<Asset | undefined> {

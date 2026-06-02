@@ -45,6 +45,7 @@ import {
   type AssetDocument
 } from './asset-document.js';
 import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
+import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
 
 const RESOURCE_TYPE = 'asset';
 
@@ -246,7 +247,9 @@ function fromDoc(doc: StoredDoc): Asset {
     type: 'asset',
     schemaVersion: 1
   });
-  return fromAssetDocument(document, doc.workspaceId);
+  // #64: workspace scoping removed — the synthesized workspaceId on the model
+  // is the fixed deployment context (OSC provides structural tenant isolation).
+  return fromAssetDocument(document, DEPLOYMENT_CONTEXT);
 }
 
 // `<workspaceId>:<localId>` -> `<localId>`.
