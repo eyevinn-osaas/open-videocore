@@ -526,6 +526,55 @@ pre.code-block {
   background: var(--bg);
 }
 
+/* Storage tab */
+.bucket-cards {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.bucket-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  cursor: pointer;
+  min-width: 200px;
+  transition: border-color 0.15s ease;
+}
+
+.bucket-card:hover {
+  border-color: var(--accent);
+}
+
+.bucket-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.bucket-card-name {
+  font-weight: 600;
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+
+.breadcrumb {
+  margin: 8px 0 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.crumb-seg,
+.storage-folder {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.crumb-seg:hover,
+.storage-folder:hover {
+  text-decoration: underline;
+}
+
 /* Utility */
 .mt8 { margin-top: 8px; }
 .mt12 { margin-top: 12px; }
