@@ -21,6 +21,9 @@ export type EncoreSubmitInput = {
   // listener echoes it back on completion. It embeds the workspace + job id
   // (see job-repo.encodeEncoreJobId).
   externalId: string;
+  // If set, Encore will POST its job document here when the job completes.
+  // Should point at POST /api/v1/internal/encore-callback on our API.
+  progressCallbackUri?: string;
   // S3 URI of the source object Encore should read (s3://bucket/key).
   inputUri: string;
   // S3 URI prefix where Encore should write the produced renditions.
@@ -37,6 +40,9 @@ export type EncoreSubmitResult = {
 
 export interface EncoreClient {
   submit(input: EncoreSubmitInput): Promise<EncoreSubmitResult>;
+  // Poll Encore for the current status of a job by its internal Encore id.
+  // Returns a normalized JobStatus string, or undefined if the job is unknown.
+  getJobStatus(encoreJobId: string): Promise<string | undefined>;
 }
 
 // Configuration for the HTTP-backed client. The base URL is the provisioned
@@ -62,6 +68,7 @@ export type HttpEncoreConfig = {
 export function toEncorePayload(input: EncoreSubmitInput): Record<string, unknown> {
   return {
     externalId: input.externalId,
+    ...(input.progressCallbackUri ? { progressCallbackUri: input.progressCallbackUri } : {}),
     profile: input.profile.name,
     outputFolder: input.outputUri,
     baseName: 'rendition',
@@ -71,9 +78,31 @@ export function toEncorePayload(input: EncoreSubmitInput): Record<string, unknow
   };
 }
 
+// Map Encore's status strings to our internal job status.
+function normalizeEncoreStatus(encoreStatus: string): string | undefined {
+  const s = encoreStatus.toUpperCase();
+  if (s === 'SUCCESSFUL') return 'done';
+  if (s === 'FAILED' || s === 'CANCELLED') return 'failed';
+  if (s === 'IN_PROGRESS' || s === 'QUEUED') return 'running';
+  return undefined;
+}
+
 export function makeHttpEncoreClient(config: HttpEncoreConfig): EncoreClient {
   const doFetch = config.fetch ?? globalThis.fetch;
   return {
+    async getJobStatus(encoreJobId: string): Promise<string | undefined> {
+      const token = await config.getToken();
+      const res = await doFetch(`${config.baseUrl.replace(/\/$/, '')}/encoreJobs/${encoreJobId}`, {
+        headers: { authorization: `Bearer ${token}` }
+      });
+      // 404 means Encore cleaned up the job (typically happens after success).
+      // We cannot distinguish success from failure here, so return undefined
+      // and let the caller decide (don't overwrite a known status).
+      if (res.status === 404) return undefined;
+      if (!res.ok) return undefined;
+      const body = (await res.json().catch(() => ({}))) as { status?: string };
+      return body.status ? normalizeEncoreStatus(body.status) : undefined;
+    },
     async submit(input: EncoreSubmitInput): Promise<EncoreSubmitResult> {
       const token = await config.getToken();
       const res = await doFetch(`${config.baseUrl.replace(/\/$/, '')}/encoreJobs`, {

@@ -52,10 +52,11 @@ export type Job = {
   // Terminal error message when status === 'failed'.
   error?: string;
   // --- Transcode-job fields (issue #8) ---
-  // Encore's own job id, returned when the job is submitted to Encore. The
-  // callback listener references this id so the webhook handler can correlate
-  // a completion back to this Job.
+  // Our correlation externalId passed to Encore on submission. Used by the
+  // callback listener to correlate completions back to this Job.
   encoreJobId?: string;
+  // Encore's internal UUID, returned on submission. Used to poll job status.
+  encoreInternalJobId?: string;
   // Name of the encode profile used (preset name or custom profile name).
   profile?: string;
   // Child asset ids created for each produced rendition on completion.
@@ -74,6 +75,7 @@ export type CreateJobInput = {
   sourceUrl?: string;
   // Transcode jobs only.
   encoreJobId?: string;
+  encoreInternalJobId?: string;
   profile?: string;
 };
 
@@ -87,6 +89,7 @@ export type UpdateJobInput = {
   attempts?: number;
   error?: string;
   encoreJobId?: string;
+  encoreInternalJobId?: string;
   profile?: string;
   renditionAssetIds?: string[];
 };
@@ -177,6 +180,7 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.attempts !== undefined) next.attempts = patch.attempts;
   if (patch.error !== undefined) next.error = patch.error;
   if (patch.encoreJobId !== undefined) next.encoreJobId = patch.encoreJobId;
+  if (patch.encoreInternalJobId !== undefined) next.encoreInternalJobId = patch.encoreInternalJobId;
   if (patch.profile !== undefined) next.profile = patch.profile;
   if (patch.renditionAssetIds !== undefined) next.renditionAssetIds = patch.renditionAssetIds;
   return next;

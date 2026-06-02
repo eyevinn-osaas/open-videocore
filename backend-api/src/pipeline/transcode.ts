@@ -70,8 +70,14 @@ export async function submitTranscode(
   await deps.jobs.update(params.workspaceId, job.id, { encoreJobId, status: 'running' });
   await deps.assets.update(params.workspaceId, params.sourceAssetId, { status: 'processing' });
 
+  let encoreInternalJobId: string | undefined;
   try {
-    await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile });
+    const progressCallbackUri = process.env['ENCORE_CALLBACK_URL'];
+    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile, progressCallbackUri });
+    encoreInternalJobId = result.encoreInternalId || undefined;
+    if (encoreInternalJobId) {
+      await deps.jobs.update(params.workspaceId, job.id, { encoreInternalJobId });
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await deps.jobs.update(params.workspaceId, job.id, { status: 'failed', error: message });

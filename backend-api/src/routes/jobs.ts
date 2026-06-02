@@ -8,7 +8,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
-import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, type JobRepository } from '../data/job-repo.js';
+import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, type JobRepository, type JobStatus } from '../data/job-repo.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
@@ -26,6 +26,7 @@ const jobSchema = z.object({
   error: z.string().optional(),
   // Transcode-job fields (issue #8). Present only when type === 'transcode'.
   encoreJobId: z.string().optional(),
+  encoreInternalJobId: z.string().optional(),
   profile: z.string().optional(),
   renditionAssetIds: z.array(z.string()).optional(),
   createdAt: z.string(),
@@ -95,6 +96,23 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       const job = await repo.get(request.workspaceId, request.params.id);
       if (!job) {
         return reply.code(404).send({ error: 'not_found' });
+      }
+      // For running transcode jobs, actively poll Encore for the current status.
+      // This bridges the gap when the encore-callback-listener cannot reach the
+      // API (e.g. local dev). If Encore has no record the job is marked failed.
+      if (job.status === 'running' && job.type === 'transcode' && job.encoreInternalJobId) {
+        const encore = request.connections?.encore;
+        if (encore) {
+          try {
+            const encoreStatus = await encore.getJobStatus(job.encoreInternalJobId) as JobStatus | undefined;
+            if (encoreStatus && encoreStatus !== job.status) {
+              const updated = await repo.update(request.workspaceId, job.id, { status: encoreStatus });
+              return reply.code(200).send(updated ?? job);
+            }
+          } catch {
+            // Encore unreachable or job not found — leave status as-is
+          }
+        }
       }
       return reply.code(200).send(job);
     }
