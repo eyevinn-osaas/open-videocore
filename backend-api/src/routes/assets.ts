@@ -32,6 +32,11 @@ import {
   type ProbeRunner
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
+import {
+  extractThumbnails,
+  type ExtractThumbnailsDeps,
+  type FrameExtractor
+} from '../pipeline/thumbnail.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { PRESET_NAMES, type EncoreProfile } from '../pipeline/encode-presets.js';
 
@@ -94,6 +99,16 @@ const listQuerySchema = z.object({
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
+// Thumbnail extraction request (issue #7): one or more timecodes in seconds.
+const thumbnailsBodySchema = z.object({
+  timecodes: z.array(z.number().min(0)).min(1).max(50)
+});
+
+const thumbnailsResultSchema = z.object({
+  assetId: z.string(),
+  thumbnails: z.array(z.string())
+});
+
 const transitionSchema = z.object({
   at: z.string(),
   from: statusSchema.nullable(),
@@ -151,6 +166,9 @@ const assetSchema = z.object({
   // ABR renditions produced by transcoding (issue #8). Absent until a transcode
   // job completes; each entry links to a child asset via its assetId.
   renditions: z.array(renditionSchema).optional(),
+  // Thumbnail / poster-frame object keys (issue #7). Absent until the first
+  // successful extraction; replaced wholesale by a later extraction.
+  thumbnails: z.array(z.string()).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -192,6 +210,17 @@ type AssetsRouterOptions = {
   // S3 bucket names Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
+  // Thumbnail / poster-frame extraction (issue #7). `thumbnailExtractor` runs
+  // the OSC ffmpeg job (eyevinn-ffmpeg-s3 in production, a stub in tests). When
+  // absent (or no object storage), the thumbnail routes respond 501.
+  thumbnailExtractor?: FrameExtractor;
+  // Injectable extractor runner + extra deps (tests stub the extractor/TTL).
+  // Defaults to the real awaited extractor.
+  extractThumbnails?: typeof extractThumbnails;
+  thumbnailDeps?: Partial<ExtractThumbnailsDeps>;
+  // Public base URL for building thumbnail URLs in GET responses. When unset,
+  // GET returns workspace-local object keys instead of absolute URLs.
+  thumbnailPublicBaseUrl?: string;
 };
 
 const ingestUrlSchema = z.object({
@@ -211,6 +240,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const jobs = opts.jobRepository ?? new InMemoryJobRepository();
   const runner = opts.runPull ?? runPull;
   const extractRunner = opts.extract ?? extractTechnicalMetadata;
+  const thumbnailRunner = opts.extractThumbnails ?? extractThumbnails;
   const storageFor = opts.storageFor;
 
   // Fire-and-forget technical metadata extraction (issue #6). Detached, never
@@ -479,6 +509,101 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
       }
+    }
+  );
+
+  // Thumbnail / poster-frame extraction (issue #7). Workspace-scoped and behind
+  // `authenticate`. Unlike metadata extraction this is AWAITED: the caller gets
+  // back the stored thumbnail keys (or an error) synchronously. Re-running for
+  // the same timecodes overwrites the same keys (idempotent).
+  //   200 — frames extracted, thumbnail keys returned
+  //   404 — unknown/foreign asset (existence not leaked)
+  //   409 — the asset has no stored object to extract frames from
+  //   501 — thumbnail extraction is not configured on this deployment
+  //   502 — the OSC ffmpeg job failed
+  app.post(
+    '/:id/thumbnails',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: thumbnailsBodySchema,
+        response: {
+          200: thumbnailsResultSchema,
+          404: errorSchema,
+          409: errorSchema,
+          501: errorSchema,
+          502: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      if (!asset.objectKey) {
+        return reply.code(409).send({
+          error: 'no_object',
+          message: 'asset has no stored object to extract thumbnails from'
+        });
+      }
+      if (!opts.thumbnailExtractor || !storageFor) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'thumbnail extraction is not configured'
+        });
+      }
+      try {
+        const thumbnails = await thumbnailRunner(
+          {
+            workspaceId: request.workspaceId,
+            assetId: asset.id,
+            objectKey: asset.objectKey,
+            timecodes: request.body.timecodes
+          },
+          {
+            assets: repo,
+            storage: storageFor(request.workspaceId),
+            extractor: opts.thumbnailExtractor,
+            ...opts.thumbnailDeps
+          }
+        );
+        return reply.code(200).send({ assetId: asset.id, thumbnails });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.code(502).send({ error: 'thumbnail_extraction_failed', message });
+      }
+    }
+  );
+
+  // List an asset's thumbnail URLs (issue #7). Returns absolute URLs when a
+  // public base URL is configured, otherwise the workspace-local object keys.
+  //   200 — list of thumbnail URLs (possibly empty)
+  //   404 — unknown/foreign asset (existence not leaked)
+  app.get(
+    '/:id/thumbnails',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: {
+          200: z.object({ assetId: z.string(), thumbnails: z.array(z.string()) }),
+          404: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const keys = asset.thumbnails ?? [];
+      const base = opts.thumbnailPublicBaseUrl;
+      const thumbnails = base
+        ? keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`)
+        : keys;
+      return reply.code(200).send({ assetId: asset.id, thumbnails });
     }
   );
 

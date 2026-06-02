@@ -28,6 +28,8 @@ import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
+import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
+import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { internalRouter } from './routes/internal.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
@@ -181,6 +183,21 @@ const probe: ProbeRunner | undefined = storage
     })
   : undefined;
 
+// Thumbnail / poster-frame extraction (issue #7) reuses the OSC
+// eyevinn-ffmpeg-s3 ephemeral job to seek + emit JPEG frames, writing each back
+// to MinIO via a presigned PUT URL. Like the probe runner it needs both an OSC
+// context and object storage; when either is missing the thumbnail routes
+// respond 501.
+const thumbnailExtractor: FrameExtractor | undefined = storage
+  ? makeOscThumbnailExtractor({
+      context: oscContext,
+      createJob,
+      waitForJobToComplete,
+      getLogsForInstance,
+      removeJob
+    })
+  : undefined;
+
 // ABR transcoding (issue #8). Encore is a long-lived OSC instance; we submit
 // jobs to its REST API and receive completion via the encore-callback listener.
 // Enabled only when ENCORE_URL is set; otherwise POST /:id/transcode responds
@@ -215,7 +232,9 @@ await app.register(assetsRouter, {
   probe,
   encore,
   sourceBucket,
-  outputBucket
+  outputBucket,
+  thumbnailExtractor,
+  thumbnailPublicBaseUrl: process.env['THUMBNAIL_PUBLIC_BASE_URL']
 });
 
 await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository });
