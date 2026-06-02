@@ -148,6 +148,9 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.renditions !== undefined) {
       next.renditions = patch.renditions;
     }
+    if (patch.thumbnails !== undefined) {
+      next.thumbnails = patch.thumbnails;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -197,6 +200,7 @@ function toDoc(asset: Asset): Record<string, unknown> {
     manifestUrls: asset.manifestUrls ?? null,
     packagingError: asset.packagingError,
     renditions: asset.renditions ?? null,
+    thumbnails: asset.thumbnails ?? null,
     createdAt: asset.createdAt,
     updatedAt: asset.updatedAt
   };
@@ -217,6 +221,7 @@ function fromDoc(doc: StoredDoc): Asset {
     manifestUrls: (doc['manifestUrls'] as Asset['manifestUrls']) ?? undefined,
     packagingError: doc['packagingError'] as string | undefined,
     renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
+    thumbnails: (doc['thumbnails'] as Asset['thumbnails']) ?? undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

@@ -129,6 +129,10 @@ export type Asset = {
   // ABR renditions produced by transcoding (issue #8). Populated on the SOURCE
   // asset when a transcode job completes; undefined until then.
   renditions?: Rendition[];
+  // Thumbnail / poster-frame object keys produced by the extraction pipeline
+  // (issue #7). Workspace-local MinIO keys; undefined until the first
+  // successful extraction. A later extraction replaces the list wholesale.
+  thumbnails?: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -161,6 +165,9 @@ export type UpdateAssetInput = {
   // Set by the transcode pipeline (issue #8) on the source asset when a
   // transcode job completes. Does not change `status`.
   renditions?: Rendition[];
+  // Set by the thumbnail pipeline (issue #7). Replaces the asset's thumbnail
+  // key list wholesale. Does not change `status`.
+  thumbnails?: string[];
 };
 
 export type ListOptions = {
@@ -363,6 +370,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.renditions !== undefined) {
       next.renditions = patch.renditions;
+    }
+    if (patch.thumbnails !== undefined) {
+      next.thumbnails = patch.thumbnails;
     }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
