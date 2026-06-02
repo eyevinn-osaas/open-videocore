@@ -27,6 +27,7 @@ import {
   type ListOptions,
   type ListResult,
   type UpdateAssetInput,
+  applyMetadata,
   applyStatus,
   clampLimit,
   initialHistory,
@@ -64,6 +65,7 @@ export class CouchAssetRepository implements AssetRepository {
       parentId: input.parentId,
       objectKey: input.objectKey,
       statusHistory: initialHistory(now),
+      metadata: input.metadata,
       createdAt: now,
       updatedAt: now
     };
@@ -151,6 +153,9 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.thumbnails !== undefined) {
       next.thumbnails = patch.thumbnails;
     }
+    if (patch.metadata !== undefined) {
+      next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -201,6 +206,7 @@ function toDoc(asset: Asset): Record<string, unknown> {
     packagingError: asset.packagingError,
     renditions: asset.renditions ?? null,
     thumbnails: asset.thumbnails ?? null,
+    metadata: asset.metadata ?? null,
     createdAt: asset.createdAt,
     updatedAt: asset.updatedAt
   };
@@ -222,6 +228,7 @@ function fromDoc(doc: StoredDoc): Asset {
     packagingError: doc['packagingError'] as string | undefined,
     renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
     thumbnails: (doc['thumbnails'] as Asset['thumbnails']) ?? undefined,
+    metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

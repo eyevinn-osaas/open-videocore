@@ -76,21 +76,29 @@ const transcodeAcceptedSchema = z.object({
   encoreJobId: z.string()
 });
 
+// Free-form, operator-defined metadata (issue #12). Values must be
+// JSON-serializable; the object is otherwise opaque to the API.
+const metadataSchema = z.record(z.unknown());
+
 const createSchema = z.object({
   name: z.string().min(1).max(256),
   description: z.string().max(2048).optional(),
   parentId: z.string().min(1).optional(),
-  objectKey: z.string().min(1).max(1024).optional()
+  objectKey: z.string().min(1).max(1024).optional(),
+  metadata: metadataSchema.optional()
 });
 
 // PATCH: all fields optional; at least one is required. `status` is checked
-// against the state machine in the repository layer.
+// against the state machine in the repository layer. `metadata` here is
+// SHALLOW-MERGED into the asset's existing metadata (issue #12) — to replace
+// the whole object use PUT /:id/metadata instead.
 const updateSchema = z
   .object({
     name: z.string().min(1).max(256).optional(),
     description: z.string().max(2048).optional(),
     objectKey: z.string().min(1).max(1024).optional(),
-    status: statusSchema.optional()
+    status: statusSchema.optional(),
+    metadata: metadataSchema.optional()
   })
   .refine((b) => Object.keys(b).length > 0, { message: 'no updatable fields provided' });
 
@@ -190,6 +198,9 @@ const assetSchema = z.object({
   // Thumbnail / poster-frame object keys (issue #7). Absent until the first
   // successful extraction; replaced wholesale by a later extraction.
   thumbnails: z.array(z.string()).optional(),
+  // Free-form operator metadata (issue #12). Absent until the operator sets any
+  // metadata; a JSON object of JSON-serializable values.
+  metadata: metadataSchema.optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -685,6 +696,34 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         ? keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`)
         : keys;
       return reply.code(200).send({ assetId: asset.id, thumbnails });
+    }
+  );
+
+  // Replace an asset's free-form metadata wholesale (issue #12). Unlike PATCH
+  // (which shallow-merges), this sets the entire metadata object to the request
+  // body, dropping any keys not present. Workspace-scoped and behind
+  // `authenticate`.
+  //   200 — metadata replaced, full asset returned
+  //   404 — unknown/foreign asset (existence not leaked)
+  app.put(
+    '/:id/metadata',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: metadataSchema,
+        response: { 200: assetSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.update(request.workspaceId, request.params.id, {
+        metadata: request.body,
+        replaceMetadata: true
+      });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
     }
   );
 

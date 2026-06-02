@@ -4,6 +4,10 @@
 // search over the caller's assets. Behind `authenticate`, so each handler runs
 // with a validated request.workspaceId and the search repo scopes every query
 // to that workspace. `tags` may be repeated or comma-separated.
+//
+// Free-form operator metadata (issue #12) is filtered with `metadata.<key>=<value>`
+// query params (e.g. ?metadata.genre=documentary&metadata.language=sv). Each pair
+// is an exact-match (string) filter; an asset matches when it carries all of them.
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -64,6 +68,7 @@ const assetSchema = z.object({
   manifestUrls: manifestUrlsSchema.optional(),
   packagingError: z.string().optional(),
   renditions: z.array(renditionSchema).optional(),
+  metadata: z.record(z.unknown()).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -89,13 +94,36 @@ const tagsSchema = z
     return flattened.length > 0 ? flattened : undefined;
   });
 
-const searchQuerySchema = z.object({
-  q: z.string().min(1).max(512).optional(),
-  tags: tagsSchema,
-  mimeType: z.string().min(1).max(128).optional(),
-  page: z.coerce.number().int().min(1).optional(),
-  pageSize: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).optional()
-});
+const searchQuerySchema = z
+  .object({
+    q: z.string().min(1).max(512).optional(),
+    tags: tagsSchema,
+    mimeType: z.string().min(1).max(128).optional(),
+    page: z.coerce.number().int().min(1).optional(),
+    pageSize: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).optional()
+  })
+  // Allow `metadata.<key>=<value>` filter params through (issue #12); extracted
+  // from the raw query below since their key names are dynamic.
+  .passthrough();
+
+// Pull `metadata.<key>=<value>` pairs out of the raw query object into a flat
+// metadata filter. Only the first value is used when a key is repeated.
+function extractMetadataFilter(
+  query: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(query)) {
+    if (!key.startsWith('metadata.')) {
+      continue;
+    }
+    const field = key.slice('metadata.'.length);
+    if (field.length === 0) {
+      continue;
+    }
+    out[field] = Array.isArray(value) ? value[0] : value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 type SearchRouterOptions = {
   repository: SearchRepository;
@@ -123,7 +151,8 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
     },
     async (request) => {
       const { q, tags, mimeType, page, pageSize } = request.query;
-      return repo.search(request.workspaceId, { q, tags, mimeType, page, pageSize });
+      const metadata = extractMetadataFilter(request.query as Record<string, unknown>);
+      return repo.search(request.workspaceId, { q, tags, mimeType, metadata, page, pageSize });
     }
   );
 };

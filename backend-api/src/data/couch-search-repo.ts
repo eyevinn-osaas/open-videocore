@@ -57,6 +57,14 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
   if (query.tags && query.tags.length > 0) {
     selector['tags'] = { $all: query.tags };
   }
+  // Metadata filters push down as `metadata.<key>: { $eq: value }` so CouchDB
+  // matches exact top-level metadata values within the workspace partition
+  // (issue #12). Dotted keys address nested document fields in Mango.
+  if (query.metadata) {
+    for (const [key, value] of Object.entries(query.metadata)) {
+      selector[`metadata.${key}`] = { $eq: value };
+    }
+  }
   return selector;
 }
 
@@ -75,6 +83,7 @@ function fromDoc(doc: StoredDoc): Asset {
     manifestUrls: (doc['manifestUrls'] as Asset['manifestUrls']) ?? undefined,
     packagingError: doc['packagingError'] as string | undefined,
     renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
+    metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };
