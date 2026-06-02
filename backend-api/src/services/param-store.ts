@@ -53,6 +53,8 @@ export interface ParamStore {
   // Remove the stored coordinates for a named stack (deprovision, #29). Must be
   // idempotent: deleting an already-absent entry resolves without error.
   deleteStackConfig(workspaceId: string, name: string): Promise<void>;
+  // List all stack names persisted for a workspace.
+  listStackNames(workspaceId: string): Promise<string[]>;
 }
 
 // Key under which a stack's config blob is stored. Namespaced by workspace so
@@ -221,6 +223,25 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
       if (res.status === 404 || res.ok) return;
       const text = await res.text().catch(() => '');
       throw new Error(`parameter store delete failed: ${res.status} ${text}`.trim());
+    },
+
+    async listStackNames(workspaceId) {
+      const prefix = `openvideocore/${workspaceId}/`;
+      const h = await buildHeaders();
+      // The app-config-svc list endpoint returns { items: [{ key, value }], total }
+      // with a configurable limit. We fetch up to 200 to cover realistic use.
+      const res = await withTimeout((signal) =>
+        doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`parameter store list failed: ${res.status} ${text}`.trim());
+      }
+      const body = (await res.json()) as { items?: { key: string }[] };
+      return (body.items ?? [])
+        .map((item) => item.key)
+        .filter((key) => key.startsWith(prefix))
+        .map((key) => key.slice(prefix.length));
     }
   };
 }

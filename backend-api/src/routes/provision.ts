@@ -540,6 +540,29 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     }
   );
 
+  // GET /api/v1/provision — list all stack names provisioned for this workspace.
+  //   200  array of stack name strings
+  //   501  parameter store not configured
+  app.get(
+    '/',
+    {
+      schema: {
+        response: {
+          200: z.array(z.string()),
+          501: notConfiguredSchema
+        }
+      }
+    },
+    async (_request, reply) => {
+      if (!opts.paramStore) {
+        return reply.code(501).send({ error: 'parameter store not configured (set PARAMETER_STORE_URL and PARAMETER_STORE_API_KEY)' });
+      }
+      const workspaceId = await deriveWorkspaceId(osc);
+      const names = await opts.paramStore.listStackNames(workspaceId);
+      return reply.send(names);
+    }
+  );
+
   // GET /api/v1/provision/:name — return the stored connection coordinates for
   // a named stack, scoped to the caller's workspace (issue #31). The values are
   // those persisted by a prior successful POST (non-secret endpoints + bucket

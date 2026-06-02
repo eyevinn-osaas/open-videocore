@@ -930,11 +930,51 @@ async function renderWebhooksTab(container) {
 
 // ─── PROVISION TAB ───────────────────────────────────────────────────────────
 
+window.showStackDetail = async function(name) {
+  try {
+    const data = await apiFetch('/provision/' + encodeURIComponent(name));
+    const lines = Object.entries(data)
+      .filter(([k]) => k !== 'services')
+      .map(([k, v]) => '<tr><td style="color:var(--text-muted);padding-right:16px">' + escHtml(k) + '</td><td style="word-break:break-all">' + escHtml(String(v)) + '</td></tr>')
+      .join('');
+    alert('Stack: ' + name + '\n\n' +
+      Object.entries(data)
+        .filter(([k]) => k !== 'services')
+        .map(([k, v]) => k + ': ' + v)
+        .join('\n'));
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+};
+
 async function renderProvisionTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
   title.textContent = 'Provision OSC Stack';
   container.appendChild(title);
+
+  // Stack list
+  const listSection = document.createElement('div');
+  listSection.className = 'section';
+  listSection.innerHTML = '<div class="section-title">Provisioned stacks</div><div id="stacks-list">' + loadingEl().outerHTML + '</div>';
+  container.appendChild(listSection);
+
+  apiFetch('/provision').then(function(names) {
+    const el = document.getElementById('stacks-list');
+    if (!el) return;
+    if (!names.length) {
+      el.innerHTML = '<p class="text-muted">No stacks provisioned yet.</p>';
+      return;
+    }
+    el.innerHTML = '<table><thead><tr><th>Name</th><th></th></tr></thead><tbody>' +
+      names.map(function(name) {
+        return '<tr><td>' + escHtml(name) + '</td>' +
+          '<td><button class="btn-sm" onclick="showStackDetail(\'' + escHtml(name) + '\')">Details</button></td></tr>';
+      }).join('') + '</tbody></table>';
+  }).catch(function(err) {
+    const el = document.getElementById('stacks-list');
+    if (el) el.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
+  });
 
   // Provision form
   const section = document.createElement('div');
