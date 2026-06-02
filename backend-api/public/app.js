@@ -930,23 +930,6 @@ async function renderWebhooksTab(container) {
 
 // ─── PROVISION TAB ───────────────────────────────────────────────────────────
 
-window.showStackDetail = async function(name) {
-  try {
-    const data = await apiFetch('/provision/' + encodeURIComponent(name));
-    const lines = Object.entries(data)
-      .filter(([k]) => k !== 'services')
-      .map(([k, v]) => '<tr><td style="color:var(--text-muted);padding-right:16px">' + escHtml(k) + '</td><td style="word-break:break-all">' + escHtml(String(v)) + '</td></tr>')
-      .join('');
-    alert('Stack: ' + name + '\n\n' +
-      Object.entries(data)
-        .filter(([k]) => k !== 'services')
-        .map(([k, v]) => k + ': ' + v)
-        .join('\n'));
-  } catch (err) {
-    alert('Error: ' + err.message);
-  }
-};
-
 async function renderProvisionTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
@@ -956,24 +939,63 @@ async function renderProvisionTab(container) {
   // Stack list
   const listSection = document.createElement('div');
   listSection.className = 'section';
-  listSection.innerHTML = '<div class="section-title">Provisioned stacks</div><div id="stacks-list">' + loadingEl().outerHTML + '</div>';
+  const listContent = document.createElement('div');
+  listContent.id = 'stacks-list';
+  listContent.appendChild(loadingEl());
+  listSection.innerHTML = '<div class="section-title">Provisioned stacks</div>';
+  listSection.appendChild(listContent);
   container.appendChild(listSection);
 
+  // Detail panel (hidden until a stack is clicked)
+  const detailSection = document.createElement('div');
+  detailSection.className = 'section';
+  detailSection.style.display = 'none';
+  detailSection.id = 'stack-detail';
+  listSection.appendChild(detailSection);
+
+  function showStackDetail(name) {
+    detailSection.innerHTML = '<div class="section-title">Stack: ' + escHtml(name) + '</div>' + loadingEl().outerHTML;
+    detailSection.style.display = 'block';
+    apiFetch('/provision/' + encodeURIComponent(name)).then(function(data) {
+      const rows = Object.entries(data)
+        .filter(function(e) { return e[0] !== 'services'; })
+        .map(function(e) {
+          return '<tr><td style="color:var(--text-muted);white-space:nowrap;padding-right:16px">' + escHtml(e[0]) + '</td>' +
+            '<td style="word-break:break-all;font-family:monospace;font-size:12px">' + escHtml(String(e[1])) + '</td></tr>';
+        }).join('');
+      detailSection.innerHTML = '<div class="section-title">Stack: ' + escHtml(name) + '</div><table>' + rows + '</table>';
+    }).catch(function(err) {
+      detailSection.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
+    });
+  }
+
   apiFetch('/provision').then(function(names) {
-    const el = document.getElementById('stacks-list');
-    if (!el) return;
+    listContent.innerHTML = '';
     if (!names.length) {
-      el.innerHTML = '<p class="text-muted">No stacks provisioned yet.</p>';
+      listContent.innerHTML = '<p class="text-muted">No stacks provisioned yet.</p>';
       return;
     }
-    el.innerHTML = '<table><thead><tr><th>Name</th><th></th></tr></thead><tbody>' +
-      names.map(function(name) {
-        return '<tr><td>' + escHtml(name) + '</td>' +
-          '<td><button class="btn-sm" onclick="showStackDetail(\'' + escHtml(name) + '\')">Details</button></td></tr>';
-      }).join('') + '</tbody></table>';
+    const table = document.createElement('table');
+    table.innerHTML = '<thead><tr><th>Name</th><th></th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    names.forEach(function(name) {
+      const tr = document.createElement('tr');
+      const tdName = document.createElement('td');
+      tdName.textContent = name;
+      const tdBtn = document.createElement('td');
+      const btn = document.createElement('button');
+      btn.className = 'btn-sm';
+      btn.textContent = 'Details';
+      btn.addEventListener('click', function() { showStackDetail(name); });
+      tdBtn.appendChild(btn);
+      tr.appendChild(tdName);
+      tr.appendChild(tdBtn);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    listContent.appendChild(table);
   }).catch(function(err) {
-    const el = document.getElementById('stacks-list');
-    if (el) el.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
+    listContent.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
   });
 
   // Provision form
