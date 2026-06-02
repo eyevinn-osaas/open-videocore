@@ -8,22 +8,6 @@
  * only with fully-escaped, controlled template strings.
  */
 
-// ─── Token helpers ───────────────────────────────────────────────────────────
-
-const TOKEN_KEY = 'ovc_token';
-
-function getToken() {
-  return localStorage.getItem(TOKEN_KEY) || '';
-}
-
-function setToken(value) {
-  if (value) {
-    localStorage.setItem(TOKEN_KEY, value);
-  } else {
-    localStorage.removeItem(TOKEN_KEY);
-  }
-}
-
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -40,14 +24,10 @@ function escHtml(str) {
 const API_BASE = window.location.origin + '/api/v1';
 
 async function apiFetch(path, options = {}) {
-  const token = getToken();
   const headers = {
     'Content-Type': 'application/json',
     ...(options.headers || {}),
   };
-  if (token) {
-    headers['Authorization'] = 'Bearer ' + token;
-  }
   const res = await fetch(API_BASE + path, { ...options, headers });
   if (!res.ok) {
     let msg = 'HTTP ' + res.status;
@@ -111,27 +91,6 @@ function loadingEl() {
   const txt = document.createTextNode(' Loading…');
   el.appendChild(txt);
   return el;
-}
-
-// ─── Token bar setup ─────────────────────────────────────────────────────────
-
-function setupTokenBar() {
-  const input = document.getElementById('token-input');
-  const btn = document.getElementById('token-save');
-  const status = document.getElementById('token-status');
-
-  const stored = getToken();
-  if (stored) {
-    input.value = stored;
-    status.textContent = 'Token set';
-  }
-
-  btn.addEventListener('click', function() {
-    const val = input.value.trim();
-    setToken(val);
-    status.textContent = val ? 'Saved.' : 'Cleared.';
-    setTimeout(function() { status.textContent = val ? 'Token set' : ''; }, 2000);
-  });
 }
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
@@ -1099,6 +1058,5 @@ TAB_RENDERERS['provision'] = renderProvisionTab;
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
-setupTokenBar();
 setupTabs();
 switchTab('assets');

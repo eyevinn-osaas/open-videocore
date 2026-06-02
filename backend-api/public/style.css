@@ -53,24 +53,6 @@ header {
   white-space: nowrap;
 }
 
-.token-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1;
-}
-
-.token-bar input {
-  flex: 1;
-  max-width: 400px;
-  min-width: 200px;
-}
-
-#token-status {
-  font-size: 12px;
-  color: var(--success);
-}
-
 /* Tab bar */
 .tab-bar {
   display: flex;
