@@ -499,7 +499,7 @@ async function renderJobsTab(container) {
   container.appendChild(statusSection);
 
   try {
-    const status = await apiFetch('/admin/status');
+    const status = await apiFetch('/admin/watch-folder/status');
     adminLoader.remove();
     const pre = document.createElement('pre');
     pre.className = 'code-block';
