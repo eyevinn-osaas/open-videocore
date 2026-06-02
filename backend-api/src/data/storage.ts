@@ -43,6 +43,25 @@ export function uploadUrlTtlSeconds(): number {
   return parsed;
 }
 
+// Default lifetime for a delivery / playback URL handed back to a client
+// (issue #14). Longer than the upload TTL because playback sessions are longer
+// lived than an upload handshake. Override globally via DELIVERY_URL_TTL_SECONDS.
+export const DEFAULT_DELIVERY_TTL_SECONDS = 60 * 60; // 1 hour
+
+// Resolve the configured delivery-URL TTL (12-factor: config via env). Falls
+// back to the 1-hour default when unset or invalid.
+export function deliveryUrlTtlSeconds(): number {
+  const raw = process.env['DELIVERY_URL_TTL_SECONDS'];
+  if (!raw) {
+    return DEFAULT_DELIVERY_TTL_SECONDS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_DELIVERY_TTL_SECONDS;
+  }
+  return parsed;
+}
+
 // One part of a multipart upload, as reported by the client on completion.
 export type CompletedPart = {
   partNumber: number;
