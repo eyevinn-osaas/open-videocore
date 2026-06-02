@@ -479,6 +479,38 @@ async function renderJobsTab(container) {
   title.textContent = 'Jobs';
   container.appendChild(title);
 
+  // Job list
+  const listSection = document.createElement('div');
+  listSection.className = 'section';
+  const listContent = document.createElement('div');
+  listContent.appendChild(loadingEl());
+  listSection.innerHTML = '<div class="section-title">Recent jobs</div>';
+  listSection.appendChild(listContent);
+  container.appendChild(listSection);
+
+  apiFetch('/jobs').then(function(data) {
+    listContent.innerHTML = '';
+    if (!data.items || !data.items.length) {
+      listContent.innerHTML = '<p class="text-muted">No jobs yet.</p>';
+      return;
+    }
+    var rows = data.items.map(function(j) {
+      return '<tr>' +
+        '<td class="cell-id">' + escHtml(j.id) + '</td>' +
+        '<td>' + escHtml(j.type) + '</td>' +
+        '<td>' + renderBadge(j.status) + '</td>' +
+        '<td class="cell-id">' + escHtml(j.assetId || '—') + '</td>' +
+        '<td>' + (j.progress != null ? j.progress + '%' : '—') + '</td>' +
+        '<td>' + escHtml(fmtDate(j.createdAt)) + '</td>' +
+        '</tr>';
+    }).join('');
+    listContent.innerHTML = '<table><thead><tr>' +
+      '<th>ID</th><th>Type</th><th>Status</th><th>Asset</th><th>Progress</th><th>Created</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table>';
+  }).catch(function(err) {
+    listContent.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
+  });
+
   // Job lookup
   const section = document.createElement('div');
   section.className = 'section';

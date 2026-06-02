@@ -120,6 +120,7 @@ export function isValidJobTransition(from: JobStatus, to: JobStatus): boolean {
 export interface JobRepository {
   create(workspaceId: string, input: CreateJobInput): Promise<Job>;
   get(workspaceId: string, id: string): Promise<Job | undefined>;
+  list(workspaceId: string, opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }>;
   update(workspaceId: string, id: string, patch: UpdateJobInput): Promise<Job | undefined>;
   // Locate a transcode job by Encore's job id WITHOUT a workspace context.
   // Used by the internal Encore callback endpoint (issue #8): the callback
@@ -220,6 +221,16 @@ export class InMemoryJobRepository implements JobRepository {
     }
     assertOwned(workspaceId, job.workspaceId);
     return { ...job };
+  }
+
+  async list(workspaceId: string, opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
+    assertValidWorkspaceId(workspaceId);
+    const all = Array.from(this.store.values())
+      .filter((j) => j.workspaceId === workspaceId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const offset = opts?.offset ?? 0;
+    const limit = opts?.limit ?? 50;
+    return { items: all.slice(offset, offset + limit).map((j) => ({ ...j })), total: all.length };
   }
 
   async update(

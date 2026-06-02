@@ -42,6 +42,25 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
   const guarded = { onRequest: app.authenticate };
 
   app.get(
+    '/',
+    {
+      ...guarded,
+      schema: {
+        querystring: z.object({
+          limit: z.coerce.number().min(1).max(100).default(50),
+          offset: z.coerce.number().min(0).default(0)
+        }),
+        response: {
+          200: z.object({ items: z.array(jobSchema), total: z.number() })
+        }
+      }
+    },
+    async (request) => {
+      return repo.list(request.workspaceId, request.query);
+    }
+  );
+
+  app.get(
     '/:id',
     {
       ...guarded,

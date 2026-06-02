@@ -57,6 +57,16 @@ export class CouchJobRepository implements JobRepository {
     return fromDoc(doc);
   }
 
+  async list(workspaceId: string, opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
+    const couch = this.couchFor(workspaceId);
+    const limit = opts?.limit ?? 50;
+    const skip = opts?.offset ?? 0;
+    const docs = await couch.find({ resourceType: RESOURCE_TYPE }, { limit, skip });
+    const items = docs.filter((d) => d.resourceType === RESOURCE_TYPE).map(fromDoc);
+    items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return { items, total: skip + items.length + (items.length === limit ? 1 : 0) };
+  }
+
   // The internal Encore callback is unauthenticated and carries no workspace.
   // We encode the workspaceId into the encoreJobId at submit time (see
   // job-repo.encodeEncoreJobId), so we can decode it here and resolve the job
