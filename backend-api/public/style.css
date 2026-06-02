@@ -496,6 +496,19 @@ pre.code-block {
   margin-top: 8px;
 }
 
+/* Inline thumbnail in asset list */
+.thumb-xs {
+  width: 48px;
+  height: 27px;
+  object-fit: cover;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  display: block;
+}
+.thumb-placeholder {
+  background: var(--surface);
+}
+
 /* Thumbnails strip */
 .thumbnails {
   display: flex;

@@ -264,7 +264,11 @@ async function loadAssets(listSection, detailPanel) {
 
   // Build table using escaped values
   const rows = assets.map(function(a) {
+    var thumb = a.thumbnails && a.thumbnails.length
+      ? '<img src="' + escHtml(a.thumbnails[0]) + '" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
+      : '<div class="thumb-xs thumb-placeholder"></div>';
     return '<tr data-id="' + escHtml(a.id) + '">' +
+      '<td style="width:52px;padding:4px 6px">' + thumb + '</td>' +
       '<td class="cell-id">' + escHtml(a.id) + '</td>' +
       '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
       '<td>' + renderBadge(a.status) + '</td>' +
@@ -278,7 +282,7 @@ async function loadAssets(listSection, detailPanel) {
   }).join('');
 
   tableWrap.innerHTML = '<table>' +
-    '<thead><tr><th>ID</th><th>Name / Title</th><th>Status</th><th>Tags</th><th>Created</th><th>Actions</th></tr></thead>' +
+    '<thead><tr><th></th><th>ID</th><th>Name / Title</th><th>Status</th><th>Tags</th><th>Created</th><th>Actions</th></tr></thead>' +
     '<tbody>' + rows + '</tbody>' +
     '</table>';
   wrap.appendChild(tableWrap);
