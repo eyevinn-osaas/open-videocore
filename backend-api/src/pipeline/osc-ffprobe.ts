@@ -16,6 +16,7 @@
 
 import {
   createJob,
+  getJob,
   getLogsForInstance,
   removeJob,
   waitForJobToComplete,
@@ -29,6 +30,7 @@ import type { FfprobeResult, FfprobeStream, ProbeRunner } from './metadata-extra
 export type OscJobApi = {
   context: Context;
   createJob: typeof createJob;
+  getJob: typeof getJob;
   waitForJobToComplete: typeof waitForJobToComplete;
   getLogsForInstance: typeof getLogsForInstance;
   removeJob: typeof removeJob;
@@ -137,9 +139,33 @@ function probeJobName(): string {
   return `ffprobe${ts}${rand}`.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40);
 }
 
-// Construct the production ProbeRunner. Each invocation creates an ephemeral
-// ffprobe job, waits for completion, scrapes the JSON from its logs, and
-// best-effort removes the job so spent ephemeral instances do not accumulate.
+// The eyevinn-ffmpeg-s3 service uses 'SuccessCriteriaMet' as its terminal
+// success status — not 'Complete'. The SDK's waitForJobToComplete polls for
+// 'Complete' and therefore loops all 1000 iterations (~16 min) before giving
+// up. We poll directly to handle the real status.
+// OSC FRICTION: logged in docs/osc-feedback/incoming-issue6-metadata.md
+const TERMINAL_STATUSES = new Set(['SuccessCriteriaMet', 'Complete', 'Failed', 'Error']);
+const POLL_INTERVAL_MS = 2000;
+const POLL_MAX_MS = 120_000;
+
+async function pollJobUntilDone(
+  api: OscJobApi,
+  name: string,
+  sat: string
+): Promise<string> {
+  const deadline = Date.now() + POLL_MAX_MS;
+  while (Date.now() < deadline) {
+    const job = await api.getJob(api.context, FFPROBE_SERVICE_ID, name, sat) as { status?: string };
+    const status = job?.status ?? '';
+    if (TERMINAL_STATUSES.has(status)) return status;
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+  throw new Error(`probe job "${name}" did not complete within ${POLL_MAX_MS / 1000}s`);
+}
+
+// The logs endpoint for eyevinn-ffmpeg-s3 is /logs/:name (not /ffmpeg-s3job/:name/logs).
+// getLogsForInstance constructs the URL from the service's apiUrl, which resolves
+// correctly via the SDK. Confirmed against the live API.
 export function makeOscProbeRunner(api: OscJobApi): ProbeRunner {
   return async (presignedUrl: string): Promise<FfprobeResult> => {
     const sat = await api.context.getServiceAccessToken(FFPROBE_SERVICE_ID);
@@ -149,13 +175,14 @@ export function makeOscProbeRunner(api: OscJobApi): ProbeRunner {
       cmdLineArgs: ffprobeCmdLine(presignedUrl)
     });
     try {
-      await api.waitForJobToComplete(api.context, FFPROBE_SERVICE_ID, name, sat);
+      const finalStatus = await pollJobUntilDone(api, name, sat);
+      if (finalStatus === 'Failed' || finalStatus === 'Error') {
+        throw new Error(`probe job "${name}" ended with status "${finalStatus}"`);
+      }
       const log = await api.getLogsForInstance(api.context, FFPROBE_SERVICE_ID, name, sat);
-      const text = Array.isArray(log) ? log.join('\n') : log;
+      const text = Array.isArray(log) ? log.join('\n') : String(log ?? '');
       return parseFfmpegLogToProbeResult(text);
     } finally {
-      // Reclaim the ephemeral instance. Failure here is non-fatal: the probe
-      // result (if any) has already been read.
       try {
         await api.removeJob(api.context, FFPROBE_SERVICE_ID, name, sat);
       } catch {

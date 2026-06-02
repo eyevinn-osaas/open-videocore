@@ -51,6 +51,7 @@ import { makeHttpEncoreClient, type EncoreClient } from './pipeline/encore-clien
 import { Redis as IORedis } from 'ioredis';
 import {
   createJob,
+  getJob,
   getLogsForInstance,
   removeJob,
   waitForJobToComplete
@@ -237,6 +238,7 @@ const probe: ProbeRunner | undefined = storage
   ? makeOscProbeRunner({
       context: oscContext,
       createJob,
+      getJob,
       waitForJobToComplete,
       getLogsForInstance,
       removeJob

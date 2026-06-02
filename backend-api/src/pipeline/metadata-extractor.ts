@@ -135,16 +135,18 @@ export async function extractTechnicalMetadata(
     const presignedUrl = await deps.storage.presignedGet(objectKey, ttl);
     const result = await deps.probe(presignedUrl);
     const metadata = parseFfprobe(result, new Date().toISOString());
-    await deps.assets.update(workspaceId, assetId, { technicalMetadata: metadata });
+    await deps.assets.update(workspaceId, assetId, { technicalMetadata: metadata, status: 'ready' });
   } catch (err) {
     deps.onError?.(err);
     const message = err instanceof Error ? err.message : String(err);
     // Best-effort error recording. If even this write fails there is nothing
     // more we can do from a detached task; we still must not throw.
+    // Still advance to ready — a missing probe result is not a fatal failure.
     try {
       await deps.assets.update(workspaceId, assetId, {
         technicalMetadata: null,
-        technicalMetadataError: message
+        technicalMetadataError: message,
+        status: 'ready'
       });
     } catch {
       // Swallow: the detached caller has no error channel.
