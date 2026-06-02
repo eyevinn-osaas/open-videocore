@@ -32,6 +32,8 @@ import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { internalRouter } from './routes/internal.js';
+import { adminRouter } from './routes/admin.js';
+import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import { makeHttpEncoreClient, type EncoreClient } from './pipeline/encore-client.js';
@@ -295,21 +297,47 @@ await app.register(internalRouter, {
   webhookDispatcher
 });
 
+// On object storage (upload-complete OR watch-folder ingest), fire-and-forget
+// ffprobe extraction (issue #6). Shared by the upload route and the
+// watch-folder service so a direct-bucket drop gets the same treatment as an
+// API upload. Undefined when no probe runner is configured.
+const onObjectStored =
+  storage && probe
+    ? (workspaceId: string, assetId: string, objectKey: string) =>
+        void extractTechnicalMetadata(
+          { workspaceId, assetId, objectKey },
+          { assets: assetRepository, storage: storage.storageFor(workspaceId), probe }
+        )
+    : undefined;
+
 if (storage) {
   await app.register(assetUploadRouter, {
     prefix: '/api/v1/assets',
     repository: assetRepository,
     storageFor: storage.storageFor,
-    // On upload completion, fire-and-forget ffprobe extraction (issue #6).
-    onObjectStored: probe
-      ? (workspaceId, assetId, objectKey) =>
-          void extractTechnicalMetadata(
-            { workspaceId, assetId, objectKey },
-            { assets: assetRepository, storage: storage.storageFor(workspaceId), probe }
-          )
-      : undefined
+    onObjectStored
   });
 }
+
+// Watch-folder ingest (issue #16). Opt-in via WATCH_FOLDER_ENABLED=true and
+// only when MinIO is configured (graceful degradation: silently skipped
+// otherwise). Detects objects written directly to the source bucket — bypassing
+// the API upload route — and creates asset records for them. Started after all
+// routers are registered (see app.listen below).
+const watchFolder =
+  storage && watchFolderEnabled()
+    ? new WatchFolderService({
+        client: storage.client,
+        bucket: sourceBucket,
+        repository: assetRepository,
+        log: app.log,
+        onObjectStored
+      })
+    : undefined;
+
+// Operational status (issue #16). Unauthenticated; reports background service
+// state without exposing workspace data.
+await app.register(adminRouter, { prefix: '/api/v1/admin', watchFolder });
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
 
@@ -318,3 +346,8 @@ await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: web
 
 const port = parseInt(process.env['PORT'] ?? '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
+
+// Start watch-folder ingest only after the server is listening and every router
+// is registered, so a detected object can flow through the full pipeline. The
+// service silently no-ops when not configured/enabled.
+watchFolder?.start();
