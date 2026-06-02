@@ -140,28 +140,7 @@ function probeJobName(): string {
 }
 
 // The eyevinn-ffmpeg-s3 service uses 'SuccessCriteriaMet' as its terminal
-// success status — not 'Complete'. The SDK's waitForJobToComplete polls for
-// 'Complete' and therefore loops all 1000 iterations (~16 min) before giving
-// up. We poll directly to handle the real status.
-// OSC FRICTION: logged in docs/osc-feedback/incoming-issue6-metadata.md
-const TERMINAL_STATUSES = new Set(['SuccessCriteriaMet', 'Complete', 'Failed', 'Error']);
-const POLL_INTERVAL_MS = 2000;
-const POLL_MAX_MS = 120_000;
-
-async function pollJobUntilDone(
-  api: OscJobApi,
-  name: string,
-  sat: string
-): Promise<string> {
-  const deadline = Date.now() + POLL_MAX_MS;
-  while (Date.now() < deadline) {
-    const job = await api.getJob(api.context, FFPROBE_SERVICE_ID, name, sat) as { status?: string };
-    const status = job?.status ?? '';
-    if (TERMINAL_STATUSES.has(status)) return status;
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-  }
-  throw new Error(`probe job "${name}" did not complete within ${POLL_MAX_MS / 1000}s`);
-}
+import { pollOscJobUntilDone } from './osc-job-poll.js';
 
 // The logs endpoint for eyevinn-ffmpeg-s3 is /logs/:name (not /ffmpeg-s3job/:name/logs).
 // getLogsForInstance constructs the URL from the service's apiUrl, which resolves
@@ -175,7 +154,7 @@ export function makeOscProbeRunner(api: OscJobApi): ProbeRunner {
       cmdLineArgs: ffprobeCmdLine(presignedUrl)
     });
     try {
-      const finalStatus = await pollJobUntilDone(api, name, sat);
+      const finalStatus = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat);
       if (finalStatus === 'Failed' || finalStatus === 'Error') {
         throw new Error(`probe job "${name}" ended with status "${finalStatus}"`);
       }

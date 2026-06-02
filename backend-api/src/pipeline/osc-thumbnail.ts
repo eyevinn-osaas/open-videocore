@@ -23,10 +23,12 @@ import {
   createJob,
   getLogsForInstance,
   removeJob,
+  getJob,
   waitForJobToComplete,
   type Context
 } from '@osaas/client-core';
 import { FFPROBE_SERVICE_ID } from '../services/stack.js';
+import { pollOscJobUntilDone } from './osc-job-poll.js';
 import type { FrameExtractor, FrameTarget } from './thumbnail.js';
 
 // Subset of the OSC SDK surface this runner needs. Declared structurally so the
@@ -35,6 +37,7 @@ import type { FrameExtractor, FrameTarget } from './thumbnail.js';
 export type OscJobApi = {
   context: Context;
   createJob: typeof createJob;
+  getJob: typeof getJob;
   waitForJobToComplete: typeof waitForJobToComplete;
   getLogsForInstance: typeof getLogsForInstance;
   removeJob: typeof removeJob;
@@ -77,7 +80,9 @@ export function makeOscThumbnailExtractor(api: OscJobApi): FrameExtractor {
       cmdLineArgs: thumbnailCmdLine(sourceUrl, frames)
     });
     try {
-      await api.waitForJobToComplete(api.context, FFPROBE_SERVICE_ID, name, sat);
+      const _status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat);
+      if (_status === 'Failed' || _status === 'Error') throw new Error(`OSC job "${name}" failed with status "${_status}"`);
+      void _status;
     } finally {
       try {
         await api.removeJob(api.context, FFPROBE_SERVICE_ID, name, sat);

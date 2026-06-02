@@ -289,6 +289,7 @@ const thumbnailExtractor: FrameExtractor | undefined = storage
   ? makeOscThumbnailExtractor({
       context: oscContext,
       createJob,
+      getJob,
       waitForJobToComplete,
       getLogsForInstance,
       removeJob
@@ -304,6 +305,7 @@ const rewrapRunner: RewrapRunner | undefined = storage
   ? makeOscRewrapRunner({
       context: oscContext,
       createJob,
+      getJob,
       waitForJobToComplete,
       getLogsForInstance,
       removeJob
@@ -314,6 +316,7 @@ const clipRunner: ClipRunner | undefined = storage
   ? makeOscClipRunner({
       context: oscContext,
       createJob,
+      getJob,
       waitForJobToComplete,
       getLogsForInstance,
       removeJob
