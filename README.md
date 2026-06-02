@@ -58,7 +58,6 @@ osc create eyevinn-app-config-svc ovcconfig \
 ### 2. Configure and run
 
 ```bash
-cd backend-api
 cp .env.example .env   # fill in the values below
 pnpm install
 pnpm dev
@@ -143,7 +142,6 @@ Each workspace provisions and owns its own stack. The middleware resolves the ri
 ## Development
 
 ```bash
-cd backend-api
 pnpm install
 pnpm dev          # starts with tsx watch + .env auto-load
 pnpm build        # compile TypeScript

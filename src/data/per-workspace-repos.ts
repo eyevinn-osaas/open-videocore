@@ -121,6 +121,14 @@ export class PerWorkspaceEncoreClient implements EncoreClient {
     }
     return conns.encore.submit(input);
   }
+  async getJobStatus(encoreJobId: string): Promise<string | undefined> {
+    // Decode workspace from the encoreJobId to resolve the right Encore instance.
+    const decoded = decodeEncoreJobId(encoreJobId);
+    const wid = decoded?.workspaceId ?? encoreJobId.split('__')[0];
+    const conns = await this.resolver.resolve(wid);
+    if (!conns.encore) return undefined;
+    return conns.encore.getJobStatus(encoreJobId);
+  }
 }
 
 export class PerWorkspaceSearchRepository implements SearchRepository {
