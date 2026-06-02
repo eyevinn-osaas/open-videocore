@@ -279,7 +279,7 @@ async function showAssetDetail(id, detailPanel) {
   try {
     const asset = await apiFetch('/assets/' + encodeURIComponent(id));
     let deliveryUrl = null;
-    try { deliveryUrl = await apiFetch('/assets/' + encodeURIComponent(id) + '/delivery-url'); } catch (_) {}
+    try { deliveryUrl = await apiFetch('/assets/' + encodeURIComponent(id) + '/delivery'); } catch (_) {}
 
     loader.remove();
 
@@ -293,8 +293,11 @@ async function showAssetDetail(id, detailPanel) {
       ['Created', escHtml(fmtDate(asset.createdAt))],
       ['Updated', escHtml(fmtDate(asset.updatedAt))],
     ];
-    if (deliveryUrl && deliveryUrl.url) {
-      kvRows.push(['Delivery URL', '<a href="' + escHtml(deliveryUrl.url) + '" target="_blank" rel="noopener" style="color:var(--accent)">Open</a>']);
+    if (deliveryUrl && deliveryUrl.urls) {
+      var du = deliveryUrl.urls;
+      if (du.hls) kvRows.push(['HLS', '<a href="' + escHtml(du.hls) + '" target="_blank" rel="noopener" style="color:var(--accent)">Open</a>']);
+      if (du.dash) kvRows.push(['DASH', '<a href="' + escHtml(du.dash) + '" target="_blank" rel="noopener" style="color:var(--accent)">Open</a>']);
+      if (du.source) kvRows.push(['Source URL', '<a href="' + escHtml(du.source) + '" target="_blank" rel="noopener" style="color:var(--accent)">Download</a>']);
     }
 
     const kvHtml = kvRows.map(function(r) {
@@ -366,30 +369,48 @@ async function showAssetDetail(id, detailPanel) {
     body.querySelector('#btn-thumbnails').addEventListener('click', async function() {
       actionMsg.innerHTML = '';
       thumbArea.innerHTML = '';
+      // First fetch existing thumbnails; if none, extract at 0s, 25%, 50%, 75%
       try {
-        const r = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails', { method: 'POST', body: JSON.stringify({}) });
-        const urls = r && (r.urls || r.thumbnails) ? (r.urls || r.thumbnails) : (Array.isArray(r) ? r : []);
+        var existing = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails');
+        var existingUrls = existing && existing.thumbnails ? existing.thumbnails : [];
+        if (existingUrls.length) {
+          renderThumbnailStrip(thumbArea, existingUrls);
+          return;
+        }
+        // Extract using duration from technicalMetadata if available
+        var dur = asset.technicalMetadata && asset.technicalMetadata.durationSeconds
+          ? asset.technicalMetadata.durationSeconds : 10;
+        var timecodes = [0, Math.round(dur * 0.25), Math.round(dur * 0.5), Math.round(dur * 0.75)];
+        showMsg(actionMsg, 'Extracting thumbnails…', 'info');
+        var r = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails',
+          { method: 'POST', body: JSON.stringify({ timecodes: timecodes }) });
+        actionMsg.innerHTML = '';
+        var urls = r && r.thumbnails ? r.thumbnails : [];
         if (urls.length) {
-          const titleEl = document.createElement('div');
-          titleEl.className = 'section-title mt12';
-          titleEl.textContent = 'Thumbnails';
-          thumbArea.appendChild(titleEl);
-          const strip = document.createElement('div');
-          strip.className = 'thumbnails';
-          urls.forEach(function(u) {
-            const img = document.createElement('img');
-            img.src = u;
-            img.alt = 'thumbnail';
-            strip.appendChild(img);
-          });
-          thumbArea.appendChild(strip);
+          renderThumbnailStrip(thumbArea, urls);
         } else {
-          showMsg(actionMsg, 'Thumbnails job submitted.', 'success');
+          showMsg(actionMsg, 'Thumbnails extracted.', 'success');
         }
       } catch (err) {
         showMsg(actionMsg, 'Error: ' + err.message, 'error');
       }
     });
+
+    function renderThumbnailStrip(container, urls) {
+      var titleEl = document.createElement('div');
+      titleEl.className = 'section-title mt12';
+      titleEl.textContent = 'Thumbnails';
+      container.appendChild(titleEl);
+      var strip = document.createElement('div');
+      strip.className = 'thumbnails';
+      urls.forEach(function(u) {
+        var img = document.createElement('img');
+        img.src = u;
+        img.alt = 'thumbnail';
+        strip.appendChild(img);
+      });
+      container.appendChild(strip);
+    }
 
   } catch (err) {
     body.innerHTML = '';
