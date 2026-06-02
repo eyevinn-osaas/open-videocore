@@ -6,7 +6,7 @@ import fastifySwagger from '@fastify/swagger';
 import fastifySwaggerUi from '@fastify/swagger-ui';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
-import { Context, createInstance, getInstance } from '@osaas/client-core';
+import { Context, createInstance, getInstance, listSubscriptions } from '@osaas/client-core';
 import {
   jsonSchemaTransform,
   serializerCompiler,
@@ -144,6 +144,43 @@ if (!paramStore) {
     },
     log: app.log
   });
+
+  // Self-configuration: if OVC_STACK_NAME is set, load the provisioned stack
+  // coordinates from the parameter store and inject them into the process
+  // environment so all downstream builders (CouchDB, MinIO, Redis, Encore) pick
+  // them up without requiring manual env var configuration.
+  const stackName = process.env['OVC_STACK_NAME'];
+  if (stackName) {
+    try {
+      const oscSubscriptions = await listSubscriptions(oscContext);
+      const workspaceId = oscSubscriptions.find(
+        (s: { tenantId?: string }) => typeof s.tenantId === 'string' && s.tenantId.length > 0
+      )?.tenantId;
+      const stackConfig = workspaceId
+        ? await paramStore.loadStackConfig(workspaceId, stackName)
+        : undefined;
+      if (stackConfig) {
+        const pw = process.env['MINIO_ROOT_PASSWORD'] ?? '';
+        const couchPw = process.env['COUCHDB_ADMIN_PASSWORD'] ?? '';
+        process.env['MINIO_URL'] ??= stackConfig.minioEndpoint;
+        process.env['MINIO_ACCESS_KEY'] ??= 'admin';
+        process.env['MINIO_SECRET_KEY'] ??= pw;
+        process.env['MINIO_SOURCE_BUCKET'] ??= stackConfig.sourceBucket;
+        process.env['MINIO_PACKAGED_BUCKET'] ??= stackConfig.packagedBucket;
+        process.env['COUCHDB_URL'] ??= `${stackConfig.couchdbUrl.replace(/\/$/, '')}`.replace(
+          /^(https?:\/\/)/, `$1admin:${couchPw}@`
+        );
+        process.env['REDIS_URL'] ??= stackConfig.redisUrl;
+        process.env['ENCORE_URL'] ??= stackConfig.encoreUrl;
+        app.log.info(`stack "${stackName}" loaded from parameter store — connection env vars auto-configured`);
+      } else {
+        app.log.warn(`OVC_STACK_NAME="${stackName}" set but no stack config found in parameter store`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      app.log.warn(`stack self-configuration failed: ${msg} — falling back to explicit env vars`);
+    }
+  }
 }
 
 await app.register(provisionRouter, {
