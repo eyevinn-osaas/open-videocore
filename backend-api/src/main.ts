@@ -21,6 +21,7 @@ import { searchRouter } from './routes/search.js';
 import { WebhookDispatcher } from './services/webhook-dispatcher.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { collectionsRouter } from './routes/collections.js';
+import { storageRouter } from './routes/storage.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, type WorkspaceConnections } from './services/workspace-stack.js';
@@ -82,6 +83,7 @@ await app.register(fastifySwagger, {
       { name: 'collections', description: 'Named asset groups' },
       { name: 'webhooks', description: 'Event notification registrations' },
       { name: 'provision', description: 'OSC stack provisioning and teardown' },
+      { name: 'storage', description: 'Bucket and object-storage management' },
       { name: 'admin', description: 'Operational status and background service control' },
     ],
     components: {
@@ -432,6 +434,12 @@ await app.register(collectionsRouter, {
   repository: collectionRepository,
   assetRepository
 });
+
+// Bucket / object-storage management. Workspace-scoped; behind `authenticate`.
+// Lets an operator browse and prune the objects stored in the workspace's
+// source + packaged buckets. Resolves storage from the request's stack at
+// request time and degrades to 501 when no object storage is configured.
+await app.register(storageRouter, { prefix: '/api/v1/storage', stackResolver });
 
 // Static file serving for the web UI (issue #frontend). Files are served from
 // the public/ directory at the /ui/ prefix. The directory is intentionally

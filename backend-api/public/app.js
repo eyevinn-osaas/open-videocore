@@ -104,6 +104,16 @@ function fmtDate(val) {
   }
 }
 
+function fmtBytes(n) {
+  if (n == null || isNaN(n)) return '—';
+  n = Number(n);
+  if (n === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  const v = n / Math.pow(1024, i);
+  return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
+}
+
 function badgeClass(status) {
   if (!status) return 'badge-unknown';
   const s = status.toLowerCase();
@@ -144,7 +154,7 @@ function loadingEl() {
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
 
-const TABS = ['assets', 'jobs', 'collections', 'search', 'webhooks', 'provision'];
+const TABS = ['assets', 'jobs', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 function switchTab(name) {
@@ -1084,6 +1094,171 @@ async function renderWebhooksTab(container) {
   await loadWebhooks();
 }
 
+// ─── STORAGE TAB ─────────────────────────────────────────────────────────────
+
+async function renderStorageTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Storage';
+  container.appendChild(title);
+
+  // Bucket list section
+  const bucketsSection = document.createElement('div');
+  bucketsSection.className = 'section';
+  bucketsSection.innerHTML = '<div class="section-title">Buckets</div><div id="buckets-wrap"></div>';
+  container.appendChild(bucketsSection);
+
+  // Browser panel (hidden until a bucket is selected)
+  const browser = document.createElement('div');
+  browser.id = 'storage-browser';
+  browser.style.display = 'none';
+  container.appendChild(browser);
+
+  const bucketsWrap = bucketsSection.querySelector('#buckets-wrap');
+  const loader = loadingEl();
+  bucketsWrap.appendChild(loader);
+
+  let buckets = [];
+  try {
+    buckets = await apiFetch('/storage/buckets');
+  } catch (err) {
+    loader.remove();
+    showMsg(bucketsWrap, 'Failed to load buckets: ' + err.message, 'error');
+    return;
+  }
+  loader.remove();
+
+  if (!buckets || buckets.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No buckets configured.';
+    bucketsWrap.appendChild(empty);
+    return;
+  }
+
+  const cards = document.createElement('div');
+  cards.className = 'bucket-cards';
+  buckets.forEach(function(b) {
+    const card = document.createElement('div');
+    card.className = 'bucket-card';
+    card.innerHTML =
+      '<div class="bucket-card-name">📦 ' + escHtml(b.name) + '</div>' +
+      '<span class="badge ' + (b.role === 'source' ? 'badge-pending' : 'badge-ready') + '">' + escHtml(b.role) + '</span>';
+    card.addEventListener('click', function() {
+      cards.querySelectorAll('.bucket-card').forEach(function(c) { c.classList.remove('active'); });
+      card.classList.add('active');
+      openBucketBrowser(browser, b.name, '');
+    });
+    cards.appendChild(card);
+  });
+  bucketsWrap.appendChild(cards);
+}
+
+async function openBucketBrowser(browser, bucket, prefix) {
+  browser.style.display = 'block';
+  browser.className = 'section';
+  browser.innerHTML = [
+    '<div class="section-title">Bucket: ' + escHtml(bucket) + '</div>',
+    '<div id="storage-breadcrumb" class="breadcrumb"></div>',
+    '<div id="storage-objects"></div>',
+  ].join('');
+
+  // Breadcrumb trail — each segment clickable, narrows the prefix.
+  const crumb = browser.querySelector('#storage-breadcrumb');
+  const segments = prefix.split('/').filter(Boolean);
+  const rootLink = document.createElement('a');
+  rootLink.href = '#';
+  rootLink.className = 'crumb-seg';
+  rootLink.textContent = '(root)';
+  rootLink.addEventListener('click', function(e) { e.preventDefault(); openBucketBrowser(browser, bucket, ''); });
+  crumb.appendChild(rootLink);
+  let acc = '';
+  segments.forEach(function(seg) {
+    acc += seg + '/';
+    const sep = document.createTextNode(' / ');
+    crumb.appendChild(sep);
+    const link = document.createElement('a');
+    link.href = '#';
+    link.className = 'crumb-seg';
+    link.textContent = seg;
+    const target = acc;
+    link.addEventListener('click', function(e) { e.preventDefault(); openBucketBrowser(browser, bucket, target); });
+    crumb.appendChild(link);
+  });
+
+  const objectsEl = browser.querySelector('#storage-objects');
+  const loader = loadingEl();
+  objectsEl.appendChild(loader);
+
+  let data;
+  try {
+    const qs = new URLSearchParams();
+    if (prefix) qs.set('prefix', prefix);
+    data = await apiFetch('/storage/buckets/' + encodeURIComponent(bucket) + '/objects' + (qs.toString() ? '?' + qs.toString() : ''));
+  } catch (err) {
+    loader.remove();
+    showMsg(objectsEl, 'Failed to list objects: ' + err.message, 'error');
+    return;
+  }
+  loader.remove();
+
+  const objects = (data && data.objects) || [];
+  if (objects.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No objects in this location.';
+    objectsEl.appendChild(empty);
+    return;
+  }
+
+  const rows = objects.map(function(o) {
+    // Display only the portion of the key below the current prefix.
+    const display = prefix && o.key.indexOf(prefix) === 0 ? o.key.slice(prefix.length) : o.key;
+    if (o.isPrefix) {
+      return '<tr>' +
+        '<td><a href="#" class="storage-folder" data-prefix="' + escHtml(o.key) + '">📁 ' + escHtml(display) + '</a></td>' +
+        '<td>—</td>' +
+        '<td>—</td>' +
+        '<td></td>' +
+        '</tr>';
+    }
+    return '<tr>' +
+      '<td>' + escHtml(display) + '</td>' +
+      '<td>' + escHtml(fmtBytes(o.size)) + '</td>' +
+      '<td>' + escHtml(fmtDate(o.lastModified)) + '</td>' +
+      '<td><button class="btn-danger storage-delete-btn" data-key="' + escHtml(o.key) + '" style="font-size:12px;padding:3px 8px;">Delete</button></td>' +
+      '</tr>';
+  }).join('');
+
+  const tableWrap = document.createElement('div');
+  tableWrap.className = 'table-wrap';
+  tableWrap.innerHTML = '<table>' +
+    '<thead><tr><th>Name</th><th>Size</th><th>Last modified</th><th>Actions</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody>' +
+    '</table>';
+  objectsEl.appendChild(tableWrap);
+
+  tableWrap.querySelectorAll('.storage-folder').forEach(function(link) {
+    link.addEventListener('click', function(e) {
+      e.preventDefault();
+      openBucketBrowser(browser, bucket, link.dataset.prefix);
+    });
+  });
+
+  tableWrap.querySelectorAll('.storage-delete-btn').forEach(function(btn) {
+    btn.addEventListener('click', async function() {
+      if (!confirm('Delete object ' + btn.dataset.key + '?')) return;
+      try {
+        const path = btn.dataset.key.split('/').map(encodeURIComponent).join('/');
+        await apiFetch('/storage/buckets/' + encodeURIComponent(bucket) + '/objects/' + path, { method: 'DELETE' });
+        openBucketBrowser(browser, bucket, prefix);
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    });
+  });
+}
+
 // ─── PROVISION TAB ───────────────────────────────────────────────────────────
 
 async function renderProvisionTab(container) {
@@ -1272,6 +1447,7 @@ TAB_RENDERERS['jobs'] = renderJobsTab;
 TAB_RENDERERS['collections'] = renderCollectionsTab;
 TAB_RENDERERS['search'] = renderSearchTab;
 TAB_RENDERERS['webhooks'] = renderWebhooksTab;
+TAB_RENDERERS['storage'] = renderStorageTab;
 TAB_RENDERERS['provision'] = renderProvisionTab;
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
