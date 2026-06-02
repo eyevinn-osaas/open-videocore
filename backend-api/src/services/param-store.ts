@@ -245,7 +245,7 @@ export const PARAM_STORE_SERVICE_ID = 'eyevinn-app-config-svc' as const;
 // Default OSC instance name for the auto-bootstrapped parameter store. The
 // operator may override it with PARAMETER_STORE_INSTANCE_NAME (must match the
 // instance PARAMETER_STORE_URL points at when both are pre-provisioned).
-const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'openvideocore-config';
+const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'ovcconfig';
 
 // The slice of the @osaas/client-core SDK ensureParameterStore needs. Declared
 // as a narrow interface so the bootstrap can be unit-tested without a live OSC
