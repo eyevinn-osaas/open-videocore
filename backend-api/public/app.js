@@ -498,17 +498,48 @@ async function renderJobsTab(container) {
   statusSection.appendChild(adminWrap);
   container.appendChild(statusSection);
 
-  try {
-    const status = await apiFetch('/admin/watch-folder/status');
-    adminLoader.remove();
-    const pre = document.createElement('pre');
-    pre.className = 'code-block';
-    pre.textContent = JSON.stringify(status, null, 2);
-    adminWrap.appendChild(pre);
-  } catch (err) {
-    adminLoader.remove();
-    showMsg(adminWrap, 'Failed: ' + err.message, 'error');
+  async function refreshWatchFolderStatus() {
+    try {
+      const status = await apiFetch('/admin/watch-folder/status');
+      adminLoader.remove();
+      adminWrap.innerHTML = '';
+
+      const row = document.createElement('div');
+      row.className = 'form-row';
+      row.style.alignItems = 'center';
+
+      const info = document.createElement('span');
+      info.style.flex = '1';
+      info.innerHTML =
+        '<strong>Watch folder:</strong> ' +
+        (status.enabled ? (status.running ? '🟢 running' : '🔴 stopped') : '⚪ not configured') +
+        ' &nbsp;|&nbsp; processed: <strong>' + escHtml(String(status.processedCount)) + '</strong>';
+      row.appendChild(info);
+
+      if (status.enabled) {
+        const btn = document.createElement('button');
+        btn.className = 'btn-sm';
+        btn.textContent = status.running ? 'Stop' : 'Start';
+        btn.addEventListener('click', async function() {
+          btn.disabled = true;
+          try {
+            await apiFetch('/admin/watch-folder/' + (status.running ? 'stop' : 'start'), { method: 'POST' });
+            await refreshWatchFolderStatus();
+          } catch (err) {
+            showMsg(adminWrap, 'Error: ' + err.message, 'error');
+            btn.disabled = false;
+          }
+        });
+        row.appendChild(btn);
+      }
+      adminWrap.appendChild(row);
+    } catch (err) {
+      adminLoader.remove();
+      showMsg(adminWrap, 'Failed: ' + err.message, 'error');
+    }
   }
+
+  await refreshWatchFolderStatus();
 }
 
 // ─── COLLECTIONS TAB ─────────────────────────────────────────────────────────

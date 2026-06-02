@@ -39,4 +39,28 @@ export const adminRouter: FastifyPluginAsync<AdminRouterOptions> = async (fastif
       };
     }
   );
+
+  const notConfigured = z.object({ error: z.string() });
+
+  app.post(
+    '/watch-folder/start',
+    { schema: { response: { 200: watchFolderStatus, 409: watchFolderStatus, 501: notConfigured } } },
+    async (_req, reply) => {
+      const wf = opts.watchFolder;
+      if (!wf) return reply.code(501).send({ error: 'watch-folder not configured (set WATCH_FOLDER_ENABLED=true and MINIO_URL)' });
+      if (!wf.isRunning()) wf.start();
+      return reply.send({ enabled: true, running: wf.isRunning(), processedCount: wf.processedCount() });
+    }
+  );
+
+  app.post(
+    '/watch-folder/stop',
+    { schema: { response: { 200: watchFolderStatus, 501: notConfigured } } },
+    async (_req, reply) => {
+      const wf = opts.watchFolder;
+      if (!wf) return reply.code(501).send({ error: 'watch-folder not configured' });
+      wf.stop();
+      return reply.send({ enabled: true, running: wf.isRunning(), processedCount: wf.processedCount() });
+    }
+  );
 };
