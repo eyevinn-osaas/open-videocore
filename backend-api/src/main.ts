@@ -107,7 +107,7 @@ await app.register(helmet, {
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'", "'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", 'data:'],
+      imgSrc: ["'self'", 'data:', 'https:'],
       connectSrc: ["'self'"],
       upgradeInsecureRequests: null
     }
