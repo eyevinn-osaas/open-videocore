@@ -23,7 +23,11 @@ import {
 } from '../data/asset-repo.js';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
-import { SourceTooLargeError, type WorkspaceStorage } from '../data/storage.js';
+import {
+  SourceTooLargeError,
+  deliveryUrlTtlSeconds,
+  type WorkspaceStorage
+} from '../data/storage.js';
 import { parseSource, assertPublicHost, SourceValidationError } from '../pipeline/source.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
 import {
@@ -98,6 +102,23 @@ const listQuerySchema = z.object({
 });
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
+
+// Delivery URL response (issue #14). Closes the pipeline loop: a client asks for
+// playback/download URLs for an asset and gets back whatever delivery surface is
+// available — packaged HLS/DASH manifests (preferred) and/or a presigned source
+// download. `expiresAt` is the ISO instant the presigned URLs stop working; for
+// already-public manifest URLs it bounds the advertised validity window.
+const deliveryUrlsSchema = z.object({
+  hls: z.string().optional(),
+  dash: z.string().optional(),
+  source: z.string().optional()
+});
+
+const deliverySchema = z.object({
+  assetId: z.string(),
+  urls: deliveryUrlsSchema,
+  expiresAt: z.string()
+});
 
 // Thumbnail extraction request (issue #7): one or more timecodes in seconds.
 const thumbnailsBodySchema = z.object({
@@ -402,6 +423,66 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send(asset);
+    }
+  );
+
+  // Delivery URL generation (issue #14). Closes the pipeline loop: ingest ->
+  // transcode -> package -> deliver. Workspace-scoped and behind `authenticate`.
+  // Resolution order:
+  //   - If the asset has packaged HLS/DASH output (`manifestUrls` from issue #9)
+  //     those URLs are returned directly (they are already public CMAF
+  //     manifests served from the packaged bucket / CDN).
+  //   - Otherwise, if the asset has a stored source object (`objectKey`) we mint
+  //     a presigned GET URL so the raw source can be downloaded/played.
+  //   - If neither is available the asset has nothing to deliver -> 404.
+  // Presigned source URLs expire after DELIVERY_URL_TTL_SECONDS (default 1h).
+  //   200 — delivery URLs returned
+  //   404 — unknown/foreign asset, or asset has no deliverable output
+  //   501 — a source-only asset but object storage is not configured here
+  app.get(
+    '/:id/delivery',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: deliverySchema, 404: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      const ttl = deliveryUrlTtlSeconds();
+      const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+
+      // Preferred: packaged streaming manifests (issue #9). Already public URLs.
+      if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
+        return reply.code(200).send({
+          assetId: asset.id,
+          urls: { hls: asset.manifestUrls.hls, dash: asset.manifestUrls.dash },
+          expiresAt
+        });
+      }
+
+      // Fallback: presigned download of the raw source object.
+      if (asset.objectKey) {
+        if (!storageFor) {
+          return reply.code(501).send({
+            error: 'not_configured',
+            message: 'object storage is not configured'
+          });
+        }
+        const source = await storageFor(request.workspaceId).presignedGet(asset.objectKey, ttl);
+        return reply.code(200).send({ assetId: asset.id, urls: { source }, expiresAt });
+      }
+
+      // Nothing to deliver yet (no packaged output and no stored source object).
+      return reply.code(404).send({
+        error: 'no_delivery',
+        message: 'asset has no packaged output or stored source object to deliver'
+      });
     }
   );
 
