@@ -7,8 +7,6 @@
 // observability for the pull worker — clients poll GET /api/v1/jobs/:id to see
 // status, progress, and any terminal error.
 
-import { assertOwned, assertValidWorkspaceId, namespacedId } from './guard.js';
-
 // ---------------------------------------------------------------------------
 // Job model + lifecycle
 // ---------------------------------------------------------------------------
@@ -32,7 +30,6 @@ export type JobType = (typeof JOB_TYPES)[number];
 // issue #5 code compiles unchanged.
 export type Job = {
   id: string;
-  workspaceId: string;
   type: JobType;
   status: JobStatus;
   // The asset this job operates on. For ingest this is the asset being
@@ -121,27 +118,26 @@ export function isValidJobTransition(from: JobStatus, to: JobStatus): boolean {
 // ---------------------------------------------------------------------------
 
 export interface JobRepository {
-  create(workspaceId: string, input: CreateJobInput): Promise<Job>;
-  get(workspaceId: string, id: string): Promise<Job | undefined>;
-  list(workspaceId: string, opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }>;
-  update(workspaceId: string, id: string, patch: UpdateJobInput): Promise<Job | undefined>;
-  // Locate a transcode job by Encore's job id WITHOUT a workspace context.
-  // Used by the internal Encore callback endpoint (issue #8): the callback
-  // listener is unauthenticated and does not know our workspace, so the job is
-  // looked up globally by the opaque encoreJobId we issued when submitting.
-  // Returns the job and its owning workspaceId, or undefined if unknown.
-  findByEncoreJobId(encoreJobId: string): Promise<{ workspaceId: string; job: Job } | undefined>;
+  create(input: CreateJobInput): Promise<Job>;
+  get(id: string): Promise<Job | undefined>;
+  list(opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }>;
+  update(id: string, patch: UpdateJobInput): Promise<Job | undefined>;
+  // Locate a transcode job by Encore's job id. Used by the internal Encore
+  // callback endpoint (issue #8): the callback listener is unauthenticated, so
+  // the job is looked up by the opaque encoreJobId we issued when submitting.
+  // Returns the job, or undefined if unknown.
+  findByEncoreJobId(encoreJobId: string): Promise<{ job: Job } | undefined>;
 }
 
-// The Encore job id we issue when submitting a transcode job. It embeds the
-// workspaceId and the job's local id so the UNAUTHENTICATED Encore callback can
-// resolve the owning workspace + job without a cross-partition scan. The
-// separator is chosen to never collide with workspace ids (validated as a
-// limited charset by guard.assertValidWorkspaceId) or job ids (`job-...`).
+// The Encore job id we issue when submitting a transcode job. It embeds a
+// context token and the job's local id so the UNAUTHENTICATED Encore callback
+// (and the Encore auto-scaler's Valkey pool keying) can resolve the job. The
+// context token is the fixed deployment context (OSC provides structural
+// isolation); it is retained so the scaler's pool-key partitioning stays stable.
 const ENCORE_ID_SEP = '__';
 
-export function encodeEncoreJobId(workspaceId: string, jobLocalId: string): string {
-  return `${workspaceId}${ENCORE_ID_SEP}${jobLocalId}`;
+export function encodeEncoreJobId(contextId: string, jobLocalId: string): string {
+  return `${contextId}${ENCORE_ID_SEP}${jobLocalId}`;
 }
 
 export function decodeEncoreJobId(
@@ -194,13 +190,11 @@ export class InMemoryJobRepository implements JobRepository {
   private readonly store = new Map<string, IngestJob>();
   private counter = 0;
 
-  async create(workspaceId: string, input: CreateJobInput): Promise<IngestJob> {
-    assertValidWorkspaceId(workspaceId);
+  async create(input: CreateJobInput): Promise<IngestJob> {
     const now = new Date().toISOString();
     const localId = `job-${++this.counter}`;
     const job: Job = {
       id: localId,
-      workspaceId,
       type: input.type,
       status: 'pending',
       assetId: input.assetId,
@@ -213,24 +207,20 @@ export class InMemoryJobRepository implements JobRepository {
       createdAt: now,
       updatedAt: now
     };
-    this.store.set(namespacedId(workspaceId, localId), job);
+    this.store.set(localId, job);
     return { ...job };
   }
 
-  async get(workspaceId: string, id: string): Promise<IngestJob | undefined> {
-    assertValidWorkspaceId(workspaceId);
-    const job = this.store.get(namespacedId(workspaceId, id));
+  async get(id: string): Promise<IngestJob | undefined> {
+    const job = this.store.get(id);
     if (!job) {
       return undefined;
     }
-    assertOwned(workspaceId, job.workspaceId);
     return { ...job };
   }
 
-  async list(workspaceId: string, opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
-    assertValidWorkspaceId(workspaceId);
+  async list(opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
     const all = Array.from(this.store.values())
-      .filter((j) => j.workspaceId === workspaceId)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     const offset = opts?.offset ?? 0;
     const limit = opts?.limit ?? 50;
@@ -238,27 +228,24 @@ export class InMemoryJobRepository implements JobRepository {
   }
 
   async update(
-    workspaceId: string,
     id: string,
     patch: UpdateJobInput
   ): Promise<IngestJob | undefined> {
-    assertValidWorkspaceId(workspaceId);
-    const key = namespacedId(workspaceId, id);
-    const existing = this.store.get(key);
-    if (!existing || existing.workspaceId !== workspaceId) {
+    const existing = this.store.get(id);
+    if (!existing) {
       return undefined;
     }
     const next = applyJobPatch(existing, patch, new Date().toISOString());
-    this.store.set(key, next);
+    this.store.set(id, next);
     return { ...next };
   }
 
   async findByEncoreJobId(
     encoreJobId: string
-  ): Promise<{ workspaceId: string; job: Job } | undefined> {
+  ): Promise<{ job: Job } | undefined> {
     for (const job of this.store.values()) {
       if (job.encoreJobId === encoreJobId) {
-        return { workspaceId: job.workspaceId, job: { ...job } };
+        return { job: { ...job } };
       }
     }
     return undefined;

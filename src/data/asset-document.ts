@@ -281,9 +281,7 @@ export function toAssetDocument(
 }
 
 // Map a persisted four-namespace document back to the flat domain Asset.
-// `workspaceId` is supplied by the repository (it lives on the storage
-// envelope, not the model — see header).
-export function fromAssetDocument(doc: AssetDocument, workspaceId: string): Asset {
+export function fromAssetDocument(doc: AssetDocument): Asset {
   const technical = technicalToAsset(doc.technical ?? {});
   const manifestUrls =
     doc.structural?.manifests && (doc.structural.manifests.hls || doc.structural.manifests.dash)
@@ -296,7 +294,6 @@ export function fromAssetDocument(doc: AssetDocument, workspaceId: string): Asse
 
   return {
     id: doc._id,
-    workspaceId,
     name: doc.descriptive.title,
     description: doc.descriptive.description,
     status: doc.state as AssetStatus,

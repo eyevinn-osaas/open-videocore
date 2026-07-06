@@ -35,7 +35,6 @@
 
 import type { Client as MinioClient } from 'minio';
 import type { AssetRepository } from '../data/asset-repo.js';
-import { assertValidWorkspaceId } from '../data/guard.js';
 
 // Logger surface we depend on (subset of Fastify's logger). Injected so the
 // service stays decoupled from Fastify and is trivial to stub in tests.
@@ -62,31 +61,22 @@ export function watchFolderEnabled(): boolean {
   return process.env['WATCH_FOLDER_ENABLED'] === 'true';
 }
 
-// Object keys created by the direct-upload route live under `<ws>/sources/...`
+// Object keys created by the direct-upload route live under `sources/...`
 // (see routes/asset-upload.sourceObjectKey). Those already have an asset
 // record, so the watch-folder ignores them to avoid duplicating assets for
 // objects the API itself wrote.
 const API_MANAGED_LOCAL_PREFIX = 'sources/';
 
-// Parse a fully-namespaced bucket object key into its workspaceId + local key.
-// Returns undefined for a key that does not match the `<workspaceId>/<rest>`
-// shape or carries an invalid workspaceId. Pure + exported for unit testing.
+// Validate a bucket object key. Objects are stored directly under their local
+// key (OSC provides structural isolation — no workspace prefix). Rejects
+// leading/trailing slashes (folder markers). Pure + exported for unit testing.
 export function parseObjectKey(
   fullKey: string
-): { workspaceId: string; localKey: string } | undefined {
-  const slash = fullKey.indexOf('/');
-  if (slash <= 0 || slash === fullKey.length - 1) {
-    // No prefix, leading slash, or trailing slash (a "folder" marker).
+): { localKey: string } | undefined {
+  if (fullKey.length === 0 || fullKey.startsWith('/') || fullKey.endsWith('/')) {
     return undefined;
   }
-  const workspaceId = fullKey.slice(0, slash);
-  const localKey = fullKey.slice(slash + 1);
-  try {
-    assertValidWorkspaceId(workspaceId);
-  } catch {
-    return undefined;
-  }
-  return { workspaceId, localKey };
+  return { localKey: fullKey };
 }
 
 export type WatchFolderOptions = {
@@ -96,7 +86,7 @@ export type WatchFolderOptions = {
   log: WatchFolderLogger;
   // Same callback the upload route fires post-upload (issue #6 ffprobe). When
   // provided, a newly ingested object triggers fire-and-forget extraction.
-  onObjectStored?: (workspaceId: string, assetId: string, objectKey: string) => void;
+  onObjectStored?: (assetId: string, objectKey: string) => void;
   // Polling cadence; defaults to the env-derived value.
   pollIntervalMs?: number;
   // Injectable timers for fast, deterministic tests.
@@ -110,7 +100,6 @@ export class WatchFolderService {
   private readonly repo: AssetRepository;
   private readonly log: WatchFolderLogger;
   private readonly onObjectStored?: (
-    workspaceId: string,
     assetId: string,
     objectKey: string
   ) => void;
@@ -297,16 +286,16 @@ export class WatchFolderService {
 
     try {
       const name = parsed.localKey.split('/').pop() || parsed.localKey;
-      const asset = await this.repo.create(parsed.workspaceId, {
+      const asset = await this.repo.create({
         name,
         objectKey: parsed.localKey
       });
       // Advance to processing and fire metadata extraction, mirroring the
       // upload route's post-upload behaviour.
-      await this.repo.update(parsed.workspaceId, asset.id, { status: 'processing' });
-      this.onObjectStored?.(parsed.workspaceId, asset.id, parsed.localKey);
+      await this.repo.update(asset.id, { status: 'processing' });
+      this.onObjectStored?.(asset.id, parsed.localKey);
       this.log.info(
-        { workspaceId: parsed.workspaceId, assetId: asset.id, objectKey: parsed.localKey },
+        { assetId: asset.id, objectKey: parsed.localKey },
         'watch-folder: ingested direct-drop object'
       );
     } catch (err) {

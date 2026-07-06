@@ -24,29 +24,19 @@ export class AuthError extends Error {
 }
 
 // The single, deployment-wide resource context. A deployed instance is one
-// tenant's workspace (ADR-003), so all data lives in one context. This constant
-// is the stable key handed to the backing-stack resolver and repositories; it is
-// NOT a tenant identifier derived from the request.
+// stack (ADR-003), so all data lives in one context. This constant is the stable
+// token embedded in encoreJobIds (for the auto-scaler's Valkey pool keying) and
+// the stack resolver's cache key; it is NOT a tenant/workspace identifier derived
+// from the request.
 export const DEPLOYMENT_CONTEXT = 'default';
 
-// Gate an inbound request. Returns the fixed deployment context when a bearer
-// token is present (the OSC auth wall has already authenticated it upstream);
-// throws AuthError when no token is present so anonymous traffic is rejected.
-//
-// Retains the historical name `resolveWorkspaceId` for callers and test doubles,
-// but it no longer resolves a tenant — it is a pure presence gate. The token is
-// intentionally not inspected for identity.
-export async function resolveWorkspaceId(token: string | undefined): Promise<string> {
-  if (process.env['DEV_WORKSPACE_ID']) {
-    return process.env['DEV_WORKSPACE_ID'] as string;
-  }
+// Gate an inbound request: resolve to true when a bearer token is present (the
+// OSC auth wall has already authenticated it upstream); throw AuthError when no
+// token is present so anonymous traffic is rejected. It is a pure presence gate —
+// the token is intentionally not inspected for identity, and nothing is scoped.
+export async function requireAuth(token: string | undefined): Promise<boolean> {
   if (!token || token.trim().length === 0) {
     throw new AuthError('missing access token');
   }
-  return DEPLOYMENT_CONTEXT;
-}
-
-// Test-only no-op retained for source compatibility (no resolution cache exists).
-export function _clearWorkspaceCache(): void {
-  // nothing to clear: no tenant resolution / cache exists.
+  return true;
 }

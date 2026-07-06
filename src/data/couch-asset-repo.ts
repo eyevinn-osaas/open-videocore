@@ -44,21 +44,19 @@ import {
   toAssetDocument,
   type AssetDocument
 } from './asset-document.js';
-import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
-import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
+import type { StoredDoc, StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'asset';
 
-// A factory so the repo can build a WorkspaceCouch bound to the caller's
-// workspace for each request, reusing one shared CouchDB connection (nano
-// ServerScope). This keeps the repo stateless w.r.t. workspace identity.
-export type CouchFactory = (workspaceId: string) => WorkspaceCouch;
+// A factory returning the stack's StackCouch, reusing one shared CouchDB
+// connection (nano ServerScope).
+export type CouchFactory = () => StackCouch;
 
 export class CouchAssetRepository implements AssetRepository {
   constructor(private readonly couchFor: CouchFactory) {}
 
-  async create(workspaceId: string, input: CreateAssetInput): Promise<Asset> {
-    const couch = this.couchFor(workspaceId);
+  async create(input: CreateAssetInput): Promise<Asset> {
+    const couch = this.couchFor();
     if (input.parentId) {
       const parent = await couch.get(input.parentId);
       if (!parent || parent.resourceType !== RESOURCE_TYPE) {
@@ -71,7 +69,6 @@ export class CouchAssetRepository implements AssetRepository {
     const method = input.sourceMethod ?? 'upload';
     const asset: Asset = {
       id: localId,
-      workspaceId,
       name: input.name,
       description: input.description,
       status: 'uploading',
@@ -90,8 +87,8 @@ export class CouchAssetRepository implements AssetRepository {
     return asset;
   }
 
-  async get(workspaceId: string, id: string): Promise<Asset | undefined> {
-    const couch = this.couchFor(workspaceId);
+  async get(id: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       return undefined;
@@ -99,8 +96,8 @@ export class CouchAssetRepository implements AssetRepository {
     return fromDoc(doc);
   }
 
-  async list(workspaceId: string, opts: ListOptions = {}): Promise<ListResult> {
-    const couch = this.couchFor(workspaceId);
+  async list(opts: ListOptions = {}): Promise<ListResult> {
+    const couch = this.couchFor();
     const limit = clampLimit(opts.limit);
     const offset = Math.max(0, opts.offset ?? 0);
     const selector = buildSelector(opts);
@@ -115,12 +112,11 @@ export class CouchAssetRepository implements AssetRepository {
     return { items, limit, offset, total };
   }
 
-  async search(workspaceId: string, query: string): Promise<Asset[]> {
-    // Substring match over name/description via Mango regex, scoped to the
-    // workspace partition. Full-text search proper is delegated to the
-    // PostgreSQL index in a later issue; this keeps parity with the in-memory
-    // repo for now.
-    const couch = this.couchFor(workspaceId);
+  async search(query: string): Promise<Asset[]> {
+    // Substring match over name/description via Mango regex. Full-text search
+    // proper is delegated to the PostgreSQL index in a later issue; this keeps
+    // parity with the in-memory repo for now.
+    const couch = this.couchFor();
     const docs = await couch.find({ resourceType: RESOURCE_TYPE }, { limit: MAX_LIMIT });
     const q = query.toLowerCase();
     return docs
@@ -133,11 +129,10 @@ export class CouchAssetRepository implements AssetRepository {
   }
 
   async update(
-    workspaceId: string,
     id: string,
     patch: UpdateAssetInput
   ): Promise<Asset | undefined> {
-    const couch = this.couchFor(workspaceId);
+    const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       return undefined;
@@ -197,14 +192,14 @@ export class CouchAssetRepository implements AssetRepository {
     return next;
   }
 
-  async countChildren(workspaceId: string, id: string): Promise<number> {
-    const couch = this.couchFor(workspaceId);
+  async countChildren(id: string): Promise<number> {
+    const couch = this.couchFor();
     return couch.count({ resourceType: RESOURCE_TYPE, derivedFrom: id });
   }
 
-  async remove(workspaceId: string, id: string): Promise<Asset | undefined> {
+  async remove(id: string): Promise<Asset | undefined> {
     // Soft delete (see file header): archive rather than destroy.
-    return this.update(workspaceId, id, { status: 'archived' });
+    return this.update(id, { status: 'archived' });
   }
 }
 
@@ -247,9 +242,7 @@ function fromDoc(doc: StoredDoc): Asset {
     type: 'asset',
     schemaVersion: 1
   });
-  // #64: workspace scoping removed — the synthesized workspaceId on the model
-  // is the fixed deployment context (OSC provides structural tenant isolation).
-  return fromAssetDocument(document, DEPLOYMENT_CONTEXT);
+  return fromAssetDocument(document);
 }
 
 // `<workspaceId>:<localId>` -> `<localId>`.

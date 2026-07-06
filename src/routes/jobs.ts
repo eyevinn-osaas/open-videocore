@@ -14,7 +14,6 @@ const errorSchema = z.object({ error: z.string(), message: z.string().optional()
 
 const jobSchema = z.object({
   id: z.string(),
-  workspaceId: z.string(),
   type: z.enum(JOB_TYPES),
   status: z.enum(JOB_STATUSES),
   assetId: z.string(),
@@ -57,7 +56,7 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       }
     },
     async (request) => {
-      return repo.list(request.workspaceId, request.query);
+      return repo.list(request.query);
     }
   );
 
@@ -73,9 +72,9 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       }
     },
     async (request, reply) => {
-      const job = await repo.get(request.workspaceId, request.params.id);
+      const job = await repo.get(request.params.id);
       if (!job) return reply.code(404).send({ error: 'not_found' });
-      const updated = await repo.update(request.workspaceId, request.params.id, {
+      const updated = await repo.update(request.params.id, {
         status: 'failed',
         error: 'cancelled by operator'
       });
@@ -93,7 +92,7 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       }
     },
     async (request, reply) => {
-      const job = await repo.get(request.workspaceId, request.params.id);
+      const job = await repo.get(request.params.id);
       if (!job) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -106,7 +105,7 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
           try {
             const encoreStatus = await encore.getJobStatus(job.encoreInternalJobId) as JobStatus | undefined;
             if (encoreStatus && encoreStatus !== job.status) {
-              const updated = await repo.update(request.workspaceId, job.id, { status: encoreStatus });
+              const updated = await repo.update(job.id, { status: encoreStatus });
               return reply.code(200).send(updated ?? job);
             }
           } catch {

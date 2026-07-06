@@ -60,8 +60,8 @@ import {
 
 declare module 'fastify' {
   interface FastifyRequest {
-    // Backing-service connections for this request's workspace, resolved by the
-    // global preHandler hook. Null on unauthenticated routes (no workspaceId).
+    // Backing-service connections for the resolved stack, set by the global
+    // preHandler hook. Null on unauthenticated routes.
     connections: WorkspaceConnections | null;
   }
 }
@@ -188,10 +188,10 @@ const stackResolver = new WorkspaceStackResolver({
 // below) can read them synchronously.
 app.decorateRequest('connections', null);
 app.addHook('preHandler', async (request) => {
-  if (request.workspaceId) {
+  if (request.authenticated) {
     const stackHeader = request.headers['x-stack-name'];
     const stackName = typeof stackHeader === 'string' && stackHeader.length > 0 ? stackHeader : undefined;
-    request.connections = await stackResolver.resolve(request.workspaceId, stackName);
+    request.connections = await stackResolver.resolve(stackName);
   }
 });
 
@@ -204,7 +204,7 @@ await app.register(provisionRouter, {
   operationStore,
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
-  onStackChange: (workspaceId: string) => stackResolver.invalidate(workspaceId)
+  onStackChange: () => stackResolver.invalidate()
 });
 
 // Workspace-scoped resource repositories. These hold NO connection of their
@@ -225,12 +225,12 @@ const collectionRepository = new PerWorkspaceCollectionRepository(stackResolver)
 // the resolved stack has no object storage (in-memory fallback) it throws — the
 // routes only call this when the asset has an objectKey, and upload routes are
 // gated by `storageAvailable` below.
-const storageFor: StorageFactory = (workspaceId: string): WorkspaceStorage => {
-  const conns = stackResolver.resolveCached(workspaceId);
+const storageFor: StorageFactory = (): WorkspaceStorage => {
+  const conns = stackResolver.resolveCached();
   if (!conns?.storageFor) {
-    throw new Error('object storage is not configured for this workspace');
+    throw new Error('object storage is not configured for this stack');
   }
-  return conns.storageFor(workspaceId);
+  return conns.storageFor();
 };
 
 // Whether any object storage is reachable at all (explicit env override OR a
@@ -351,7 +351,7 @@ const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-pack
 // provisioned multi-stack case s3:// pull is unsupported (http/https pull still
 // works); this is tracked for follow-up route plumbing.
 const envMinioClient = process.env['MINIO_URL']
-  ? (await stackResolver.resolve('__env_probe__')).storageClient
+  ? (await stackResolver.resolve()).storageClient
   : undefined;
 const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : undefined;
 
@@ -418,10 +418,10 @@ await app.register(internalRouter, {
 // resolver cache is warm and the sync storageFor() can read it.
 const onObjectStored =
   storageAvailable && probe
-    ? (workspaceId: string, assetId: string, objectKey: string, storage?: WorkspaceStorage) =>
+    ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) =>
         void extractTechnicalMetadata(
-          { workspaceId, assetId, objectKey },
-          { assets: assetRepository, storage: storage ?? storageFor(workspaceId), probe }
+          { assetId, objectKey },
+          { assets: assetRepository, storage: storage ?? storageFor(), probe }
         )
     : undefined;
 

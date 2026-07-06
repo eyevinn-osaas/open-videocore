@@ -28,7 +28,6 @@ export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 
 export type WebhookRegistration = {
   id: string;
-  workspaceId: string;
   url: string;
   events: string[];
   // Optional shared secret. When set, deliveries are signed with an
@@ -45,7 +44,7 @@ export type CreateWebhookInput = {
 };
 
 export interface WebhookRepository {
-  create(workspaceId: string, input: CreateWebhookInput): Promise<WebhookRegistration>;
-  list(workspaceId: string): Promise<WebhookRegistration[]>;
-  delete(workspaceId: string, id: string): Promise<void>;
+  create(input: CreateWebhookInput): Promise<WebhookRegistration>;
+  list(): Promise<WebhookRegistration[]>;
+  delete(id: string): Promise<void>;
 }

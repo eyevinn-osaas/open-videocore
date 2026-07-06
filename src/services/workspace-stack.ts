@@ -12,7 +12,7 @@
 import nano from 'nano';
 import { Client as MinioClient } from 'minio';
 import type { ParamStore, StackConfig } from './param-store.js';
-import { couchServer, WorkspaceCouch } from '../data/couchdb.js';
+import { couchServer, StackCouch } from '../data/couchdb.js';
 import { WorkspaceStorage } from '../data/storage.js';
 import { CouchAssetRepository } from '../data/couch-asset-repo.js';
 import { CouchJobRepository } from '../data/couch-job-repo.js';
@@ -52,7 +52,6 @@ type CacheEntry = { connections: WorkspaceConnections; expiresAt: number };
 
 function buildConnectionsFromStack(
   config: StackConfig,
-  workspaceId: string,
   minioPassword: string,
   couchPassword: string,
   oscContext: Context
@@ -62,7 +61,7 @@ function buildConnectionsFromStack(
     /^(https?:\/\/)/, `$1admin:${couchPassword}@`
   );
   const server = couchServer(couchUrl);
-  const wc = (wid: string) => new WorkspaceCouch(wid, server, dbName);
+  const wc = () => new StackCouch(server, dbName);
 
   const url = new URL(config.minioEndpoint);
   const useSSL = url.protocol === 'https:';
@@ -80,8 +79,8 @@ function buildConnectionsFromStack(
   const webhooks = new CouchWebhookRepository(wc);
   const collections = new CouchCollectionRepository(wc);
 
-  const storageFor: StorageFactory = (wid: string) =>
-    new WorkspaceStorage(wid, minioClient, config.sourceBucket);
+  const storageFor: StorageFactory = () =>
+    new WorkspaceStorage(minioClient, config.sourceBucket);
 
   const encore = config.encoreUrl
     ? makeHttpEncoreClient({
@@ -129,7 +128,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
     const server = couchServer(couchUrl);
-    const wc = (wid: string) => new WorkspaceCouch(wid, server, dbName);
+    const wc = () => new StackCouch(server, dbName);
     assets = new CouchAssetRepository(wc);
     jobs = new CouchJobRepository(wc);
     search = new CouchSearchRepository(wc);
@@ -159,7 +158,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
       secretKey
     });
     const client = storageClient;
-    storageFor = (wid: string) => new WorkspaceStorage(wid, client, sourceBucket);
+    storageFor = () => new WorkspaceStorage(client, sourceBucket);
   }
 
   const encoreUrl = process.env['ENCORE_URL'];
@@ -196,6 +195,8 @@ function buildInMemoryConnections(): WorkspaceConnections {
   };
 }
 
+export const STACK_CONFIG_NAMESPACE = "default";
+
 export class WorkspaceStackResolver {
   private cache = new Map<string, CacheEntry>();
   private paramStore: ParamStore | undefined;
@@ -220,8 +221,8 @@ export class WorkspaceStackResolver {
   // instead of the workspace's default (first provisioned) stack — letting a
   // client switch between multiple provisioned stacks. The explicit env-var
   // override, when active, wins regardless of stackName.
-  async resolve(workspaceId: string, stackName?: string): Promise<WorkspaceConnections> {
-    const cacheKey = stackName ? `${workspaceId} ${stackName}` : workspaceId;
+  async resolve(stackName?: string): Promise<WorkspaceConnections> {
+    const cacheKey = stackName ?? '';
     const cached = this.cache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.connections;
 
@@ -243,11 +244,11 @@ export class WorkspaceStackResolver {
     let config: StackConfig | undefined;
     try {
       if (stackName) {
-        config = await ps.loadStackConfig(workspaceId, stackName);
+        config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
       } else {
-        const names = await ps.listStackNames(workspaceId);
+        const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
         if (names.length > 0) {
-          config = await ps.loadStackConfig(workspaceId, names[0]);
+          config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
         }
       }
     } catch {
@@ -255,7 +256,7 @@ export class WorkspaceStackResolver {
     }
 
     const connections = config
-      ? buildConnectionsFromStack(config, workspaceId, this.minioPassword, this.couchPassword, this.oscContext)
+      ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext)
       : buildInMemoryConnections();
 
     this.cache.set(cacheKey, { connections, expiresAt: Date.now() + CACHE_TTL_MS });
@@ -267,8 +268,8 @@ export class WorkspaceStackResolver {
   // preHandler hook warms the cache with `resolve()` before any handler runs,
   // so a handler-time synchronous factory (e.g. the sync StorageFactory the
   // asset routers expect) can read the connections without re-awaiting.
-  resolveCached(workspaceId: string, stackName?: string): WorkspaceConnections | undefined {
-    const cacheKey = stackName ? `${workspaceId} ${stackName}` : workspaceId;
+  resolveCached(stackName?: string): WorkspaceConnections | undefined {
+    const cacheKey = stackName ?? "";
     const cached = this.cache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.connections;
     return undefined;
@@ -276,11 +277,7 @@ export class WorkspaceStackResolver {
 
   // Invalidate all cached connections for a workspace (default + every named
   // stack), so a freshly provisioned/torn-down stack is picked up immediately.
-  invalidate(workspaceId: string): void {
-    this.cache.delete(workspaceId);
-    const prefix = `${workspaceId} `;
-    for (const key of this.cache.keys()) {
-      if (key.startsWith(prefix)) this.cache.delete(key);
-    }
+  invalidate(): void {
+    this.cache.clear();
   }
 }

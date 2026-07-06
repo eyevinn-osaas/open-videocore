@@ -55,10 +55,10 @@ export function rewrapUrlTtlSeconds(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_REWRAP_URL_TTL_SECONDS;
 }
 
-// Build the workspace-local destination object key for a re-wrapped output. The
-// extension determines the output container, so it must be the target format.
-export function rewrapObjectKey(workspaceId: string, newAssetId: string, format: RewrapFormat): string {
-  return `${workspaceId}/exports/${newAssetId}.${format}`;
+// Build the destination object key for a re-wrapped output. The extension
+// determines the output container, so it must be the target format.
+export function rewrapObjectKey(newAssetId: string, format: RewrapFormat): string {
+  return `exports/${newAssetId}.${format}`;
 }
 
 // Runs the OSC ffmpeg job: download the source GET URL, remux with `-c copy`,
@@ -68,9 +68,8 @@ export function rewrapObjectKey(workspaceId: string, newAssetId: string, format:
 export type RewrapRunner = (sourceUrl: string, putUrl: string) => Promise<void>;
 
 export type RewrapParams = {
-  workspaceId: string;
   sourceAssetId: string;
-  // The source asset's stored object key (workspace-local).
+  // The source asset's stored object key.
   objectKey: string;
   targetFormat: RewrapFormat;
   // Optional name for the child asset; defaults to `<source name> [<format>]`.
@@ -95,7 +94,7 @@ export type RewrapDeps = {
 // is observable) and the error is re-thrown for the route to map to a 502. The
 // source asset is never mutated — an export is a pure read of the source.
 export async function rewrap(params: RewrapParams, deps: RewrapDeps): Promise<Asset> {
-  const { workspaceId, sourceAssetId, objectKey, targetFormat, outputName } = params;
+  const { sourceAssetId, objectKey, targetFormat, outputName } = params;
 
   if (!isRewrapFormat(targetFormat)) {
     throw new UnsupportedFormatError(targetFormat);
@@ -103,19 +102,19 @@ export async function rewrap(params: RewrapParams, deps: RewrapDeps): Promise<As
 
   const ttl = deps.ttlSeconds ?? rewrapUrlTtlSeconds();
 
-  const source = await deps.assets.get(workspaceId, sourceAssetId);
+  const source = await deps.assets.get(sourceAssetId);
   const baseName = source?.name ?? sourceAssetId;
 
   // Create the child asset first so its id determines the output object key.
-  const child = await deps.assets.create(workspaceId, {
+  const child = await deps.assets.create({
     name: outputName ?? `${baseName} [${targetFormat}]`,
     parentId: sourceAssetId
   });
 
-  const outputKey = rewrapObjectKey(workspaceId, child.id, targetFormat);
+  const outputKey = rewrapObjectKey(child.id, targetFormat);
 
   // uploading -> processing while the job runs.
-  await deps.assets.update(workspaceId, child.id, { status: 'processing' });
+  await deps.assets.update(child.id, { status: 'processing' });
 
   try {
     const sourceUrl = await deps.storage.presignedGet(objectKey, ttl);
@@ -123,15 +122,15 @@ export async function rewrap(params: RewrapParams, deps: RewrapDeps): Promise<As
     await deps.runner(sourceUrl, putUrl);
   } catch (err) {
     // Surface the partial export as a failed child asset, then re-throw.
-    await deps.assets.update(workspaceId, child.id, { status: 'failed' });
+    await deps.assets.update(child.id, { status: 'failed' });
     throw err;
   }
 
   // Output object has landed: record the key and advance to ready.
-  await deps.assets.update(workspaceId, child.id, { objectKey: outputKey });
-  const ready = await deps.assets.update(workspaceId, child.id, { status: 'ready' });
+  await deps.assets.update(child.id, { objectKey: outputKey });
+  const ready = await deps.assets.update(child.id, { status: 'ready' });
   // `update` returns the full asset; fall back to a re-read defensively.
-  return ready ?? (await deps.assets.get(workspaceId, child.id))!;
+  return ready ?? (await deps.assets.get(child.id))!;
 }
 
 // Service wrapper mirroring PackagingService — exposes rewrap as a method so the

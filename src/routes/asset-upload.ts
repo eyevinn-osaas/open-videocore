@@ -32,7 +32,7 @@ import { uploadUrlTtlSeconds, SourceTooLargeError, type CompletedPart, type Work
 // Factory so production wires a real MinIO-backed WorkspaceStorage per request
 // (bound to the caller's workspace) while tests inject a fake. Mirrors the
 // repository-injection pattern used by the assets router.
-export type StorageFactory = (workspaceId: string) => WorkspaceStorage;
+export type StorageFactory = () => WorkspaceStorage;
 
 export type AssetUploadRouterOptions = {
   repository: AssetRepository;
@@ -45,7 +45,7 @@ export type AssetUploadRouterOptions = {
   // workspace storage (which carries the correct stack) rather than trying to
   // re-resolve it from the cache, which may not have a bare-workspaceId entry
   // when the request came in with an X-Stack-Name header.
-  onObjectStored?: (workspaceId: string, assetId: string, objectKey: string, storage?: WorkspaceStorage) => void;
+  onObjectStored?: (assetId: string, objectKey: string, storage?: WorkspaceStorage) => void;
 };
 
 // Deterministic object key for an asset's source payload. Workspace scoping is
@@ -119,10 +119,9 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
 
   const guarded = { onRequest: app.authenticate };
 
-  // Look the asset up in the caller's workspace. Returns undefined (-> 404) for
-  // a missing or foreign asset so existence is never leaked.
-  async function loadAsset(workspaceId: string, id: string) {
-    return repo.get(workspaceId, id);
+  // Look the asset up. Returns undefined (-> 404) for a missing asset.
+  async function loadAsset(id: string) {
+    return repo.get(id);
   }
 
     // --- Proxied upload: PUT /:id/upload -----------------------------------
@@ -141,11 +140,11 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 413: errorSchema } }
     },
     async (request, reply) => {
-      const asset = await loadAsset(request.workspaceId, request.params.id);
+      const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      const storage = storageFor(request.workspaceId);
+      const storage = storageFor();
       const objectKey = sourceObjectKey(asset.id);
       const contentLength = request.headers['content-length']
         ? Number(request.headers['content-length'])
@@ -164,8 +163,8 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
         throw err;
       }
 
-      await repo.update(request.workspaceId, asset.id, { objectKey, status: 'processing' });
-      opts.onObjectStored?.(request.workspaceId, asset.id, objectKey, storage);
+      await repo.update(asset.id, { objectKey, status: 'processing' });
+      opts.onObjectStored?.(asset.id, objectKey, storage);
       return reply.code(200).send({ id: asset.id, status: 'processing' });
     }
   );
@@ -175,12 +174,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     '/:id/upload-url',
     { ...guarded, schema: { params: idParams, response: { 200: urlResponse, 404: errorSchema } } },
     async (request, reply) => {
-      const asset = await loadAsset(request.workspaceId, request.params.id);
+      const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
       const ttl = uploadUrlTtlSeconds();
-      const storage = storageFor(request.workspaceId);
+      const storage = storageFor();
       const objectKey = sourceObjectKey(asset.id);
       const url = await storage.presignedPut(objectKey, ttl);
       return reply.code(200).send({ url, objectKey, method: 'PUT', expiresInSeconds: ttl });
@@ -195,11 +194,11 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       schema: { params: idParams, response: { 200: initiateResponse, 404: errorSchema } }
     },
     async (request, reply) => {
-      const asset = await loadAsset(request.workspaceId, request.params.id);
+      const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      const storage = storageFor(request.workspaceId);
+      const storage = storageFor();
       const objectKey = sourceObjectKey(asset.id);
       const uploadId = await storage.initiateMultipartUpload(objectKey);
       return reply
@@ -220,12 +219,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       }
     },
     async (request, reply) => {
-      const asset = await loadAsset(request.workspaceId, request.params.id);
+      const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
       const ttl = uploadUrlTtlSeconds();
-      const storage = storageFor(request.workspaceId);
+      const storage = storageFor();
       const objectKey = sourceObjectKey(asset.id);
       const url = await storage.presignedUploadPart(
         objectKey,
@@ -251,17 +250,17 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       }
     },
     async (request, reply) => {
-      const asset = await loadAsset(request.workspaceId, request.params.id);
+      const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      const storage = storageFor(request.workspaceId);
+      const storage = storageFor();
       const objectKey = sourceObjectKey(asset.id);
       const parts: CompletedPart[] = request.body.parts;
       await storage.completeMultipartUpload(objectKey, request.params.uploadId, parts);
       // Persist the object key on the asset; the explicit upload-complete call
       // performs the lifecycle transition.
-      await repo.update(request.workspaceId, asset.id, { objectKey });
+      await repo.update(asset.id, { objectKey });
       return reply.code(200).send({ id: asset.id, status: asset.status });
     }
   );
@@ -274,11 +273,11 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       schema: { params: multipartParams, response: { 204: z.null(), 404: errorSchema } }
     },
     async (request, reply) => {
-      const asset = await loadAsset(request.workspaceId, request.params.id);
+      const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      const storage = storageFor(request.workspaceId);
+      const storage = storageFor();
       const objectKey = sourceObjectKey(asset.id);
       await storage.abortMultipartUpload(objectKey, request.params.uploadId);
       return reply.code(204).send(null);
@@ -296,11 +295,11 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema } }
     },
     async (request, reply) => {
-      const existing = await loadAsset(request.workspaceId, request.params.id);
+      const existing = await loadAsset(request.params.id);
       if (!existing) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      const updated = await repo.update(request.workspaceId, request.params.id, {
+      const updated = await repo.update(request.params.id, {
         status: 'processing'
       });
       if (!updated) {
@@ -309,8 +308,8 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       // Trigger technical metadata extraction against the stored object
       // (issue #6). Fire-and-forget; does not affect this response.
       const objectKey = existing.objectKey ?? sourceObjectKey(updated.id);
-      const storage = storageFor(request.workspaceId);
-      opts.onObjectStored?.(request.workspaceId, updated.id, objectKey, storage);
+      const storage = storageFor();
+      opts.onObjectStored?.(updated.id, objectKey, storage);
       return reply.code(200).send({ id: updated.id, status: updated.status });
     }
   );

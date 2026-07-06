@@ -33,7 +33,7 @@ export interface SearchResult {
 }
 
 export interface SearchRepository {
-  search(workspaceId: string, query: SearchQuery): Promise<SearchResult>;
+  search(query: SearchQuery): Promise<SearchResult>;
 }
 
 // Tags are stored as an optional, loosely-typed field on the asset document.

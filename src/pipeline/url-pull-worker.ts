@@ -61,7 +61,6 @@ function isPermanent(err: unknown): boolean {
 }
 
 export type PullParams = {
-  workspaceId: string;
   jobId: string;
   assetId: string;
   objectKey: string;
@@ -79,16 +78,16 @@ export async function runPull(
     storage: WorkspaceStorage;
   } & PullDeps
 ): Promise<void> {
-  const { workspaceId, jobId, assetId, objectKey, sourceUrl } = params;
+  const { jobId, assetId, objectKey, sourceUrl } = params;
   const sleep = deps.sleep ?? defaultSleep;
   const baseBackoff = deps.baseBackoffMs ?? BASE_BACKOFF_MS;
   const cap = deps.maxBytes ?? maxSourceBytes();
 
-  await deps.jobs.update(workspaceId, jobId, { status: 'running' });
+  await deps.jobs.update(jobId, { status: 'running' });
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    await deps.jobs.update(workspaceId, jobId, { attempts: attempt });
+    await deps.jobs.update(jobId, { attempts: attempt });
     try {
       const parsed = parseSource(sourceUrl);
       if (parsed.scheme === 'http' || parsed.scheme === 'https') {
@@ -105,7 +104,7 @@ export async function runPull(
           if (now - lastWrite < PROGRESS_INTERVAL_MS) return;
           lastWrite = now;
           const progress = total && total > 0 ? (transferred / total) * 100 : 0;
-          void deps.jobs.update(workspaceId, jobId, {
+          void deps.jobs.update(jobId, {
             bytesTransferred: transferred,
             totalBytes: total,
             progress
@@ -114,13 +113,13 @@ export async function runPull(
       });
 
       // Success: finalize job at 100% and advance the asset to processing.
-      await deps.jobs.update(workspaceId, jobId, {
+      await deps.jobs.update(jobId, {
         status: 'done',
         bytesTransferred,
         totalBytes: opened.totalBytes ?? bytesTransferred,
         progress: 100
       });
-      await deps.assets.update(workspaceId, assetId, { status: 'processing' });
+      await deps.assets.update(assetId, { status: 'processing' });
       return;
     } catch (err) {
       lastError = err;
@@ -135,6 +134,6 @@ export async function runPull(
 
   // Terminal failure: record the error on the job and move the asset to failed.
   const message = lastError instanceof Error ? lastError.message : String(lastError);
-  await deps.jobs.update(workspaceId, jobId, { status: 'failed', error: message });
-  await deps.assets.update(workspaceId, assetId, { status: 'failed' });
+  await deps.jobs.update(jobId, { status: 'failed', error: message });
+  await deps.assets.update(assetId, { status: 'failed' });
 }
