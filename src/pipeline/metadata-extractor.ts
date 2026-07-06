@@ -104,7 +104,6 @@ export function parseFfprobe(result: FfprobeResult, now: string): TechnicalMetad
 }
 
 export type ExtractParams = {
-  workspaceId: string;
   assetId: string;
   objectKey: string;
 };
@@ -129,7 +128,7 @@ export async function extractTechnicalMetadata(
   params: ExtractParams,
   deps: ExtractDeps
 ): Promise<void> {
-  const { workspaceId, assetId, objectKey } = params;
+  const { assetId, objectKey } = params;
   try {
     const ttl = deps.ttlSeconds ?? probeUrlTtlSeconds();
     const presignedUrl = await deps.storage.presignedGet(objectKey, ttl);
@@ -137,7 +136,7 @@ export async function extractTechnicalMetadata(
     const metadata = parseFfprobe(result, new Date().toISOString());
     // Extraction annotates the asset only; it never drives the lifecycle state
     // machine (the ingest/transcode paths own status transitions).
-    await deps.assets.update(workspaceId, assetId, { technicalMetadata: metadata });
+    await deps.assets.update(assetId, { technicalMetadata: metadata });
   } catch (err) {
     deps.onError?.(err);
     const message = err instanceof Error ? err.message : String(err);
@@ -145,7 +144,7 @@ export async function extractTechnicalMetadata(
     // more we can do from a detached task; we still must not throw. A missing
     // probe result is not fatal and never changes the asset's lifecycle state.
     try {
-      await deps.assets.update(workspaceId, assetId, {
+      await deps.assets.update(assetId, {
         technicalMetadata: null,
         technicalMetadataError: message
       });

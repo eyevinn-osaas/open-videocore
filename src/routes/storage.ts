@@ -21,7 +21,6 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { BucketItem } from 'minio';
 import { z } from 'zod';
-import { objectPrefix } from '../data/guard.js';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
 import type { WatchFolderService } from '../pipeline/watch-folder.js';
 
@@ -246,18 +245,13 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
           .send({ error: 'forbidden', message: 'bucket is not owned by this workspace' });
       }
 
-      const wsPrefix = objectPrefix(request.workspaceId);
       const localPrefix = request.query.prefix ?? '';
       const limit = request.query.limit ?? MAX_OBJECTS;
-      // Force the listing under the workspace namespace so a workspace can only
-      // ever enumerate its own objects.
-      const scopedPrefix = `${wsPrefix}${localPrefix}`;
 
       const objects = await listBounded(
         conns.storageClient,
         bucket,
-        scopedPrefix,
-        wsPrefix,
+        localPrefix,
         limit
       );
 
@@ -297,8 +291,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
       if (localKey.includes('..')) {
         return reply.code(403).send({ error: 'forbidden', message: 'invalid object key' });
       }
-      const scopedKey = `${objectPrefix(request.workspaceId)}${localKey}`;
-      await conns.storageClient.removeObject(bucket, scopedKey);
+      await conns.storageClient.removeObject(bucket, localKey);
       return reply.code(204).send(null);
     }
   );
@@ -312,19 +305,17 @@ function isBucketExistsError(err: unknown): boolean {
   return code === 'BucketAlreadyOwnedByYou' || code === 'BucketAlreadyExists';
 }
 
-// List up to `limit` objects under `scopedPrefix` non-recursively, returning
-// workspace-local keys (the `wsPrefix` namespace stripped). CommonPrefixes are
+// List up to `limit` objects under `prefix` non-recursively. CommonPrefixes are
 // surfaced as `isPrefix` entries. Bounds the stream to `limit` results then
 // destroys it so a huge bucket cannot stream unbounded.
 function listBounded(
   client: import('minio').Client,
   bucket: string,
-  scopedPrefix: string,
-  wsPrefix: string,
+  prefix: string,
   limit: number
 ): Promise<Array<z.infer<typeof objectSchema>>> {
   const out: Array<z.infer<typeof objectSchema>> = [];
-  const stream = client.listObjectsV2(bucket, scopedPrefix, false);
+  const stream = client.listObjectsV2(bucket, prefix, false);
   return new Promise((resolve, reject) => {
     const finish = () => resolve(out);
     stream.on('data', (item: BucketItem) => {
@@ -335,11 +326,11 @@ function listBounded(
       }
       // CommonPrefix entries carry `prefix`; real objects carry `name`.
       const rawKey = item.prefix ?? item.name;
-      if (!rawKey || !rawKey.startsWith(wsPrefix)) {
+      if (!rawKey) {
         return;
       }
       out.push({
-        key: rawKey.slice(wsPrefix.length),
+        key: rawKey,
         size: item.size ?? 0,
         lastModified: item.lastModified ? item.lastModified.toISOString() : undefined,
         isPrefix: Boolean(item.prefix)

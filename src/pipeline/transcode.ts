@@ -29,6 +29,9 @@ import type { EncoreClient } from './encore-client.js';
 export const PACKAGED_OUTPUT_PREFIX = 'transcode';
 
 export type SubmitTranscodeParams = {
+  // Context token embedded in the encoreJobId so the unauthenticated Encore
+  // callback + the auto-scaler's Valkey pool keying can resolve the job. This is
+  // the fixed deployment context, not a request-derived workspace.
   workspaceId: string;
   sourceAssetId: string;
   sourceObjectKey: string;
@@ -54,7 +57,7 @@ export async function submitTranscode(
   const profile = resolveProfile(params.preset, params.customProfile);
 
   // Create the job first so we have a local id to embed in the Encore job id.
-  const job = await deps.jobs.create(params.workspaceId, {
+  const job = await deps.jobs.create({
     type: 'transcode',
     assetId: params.sourceAssetId,
     profile: profile.name
@@ -70,8 +73,8 @@ export async function submitTranscode(
   // Record the encore job id and advance the job to running + the source asset
   // to processing before we submit, so a callback that races back finds a
   // resolvable job.
-  await deps.jobs.update(params.workspaceId, job.id, { encoreJobId, status: 'running' });
-  await deps.assets.update(params.workspaceId, params.sourceAssetId, { status: 'processing' });
+  await deps.jobs.update(job.id, { encoreJobId, status: 'running' });
+  await deps.assets.update(params.sourceAssetId, { status: 'processing' });
 
   let encoreInternalJobId: string | undefined;
   try {
@@ -83,13 +86,13 @@ export async function submitTranscode(
     const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile, progressCallbackUri });
     encoreInternalJobId = result.encoreInternalId || undefined;
     if (encoreInternalJobId) {
-      await deps.jobs.update(params.workspaceId, job.id, { encoreInternalJobId });
+      await deps.jobs.update(job.id, { encoreInternalJobId });
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await deps.jobs.update(params.workspaceId, job.id, { status: 'failed', error: message });
+    await deps.jobs.update(job.id, { status: 'failed', error: message });
     // Best-effort revert: the source could not be transcoded.
-    await deps.assets.update(params.workspaceId, params.sourceAssetId, { status: 'failed' });
+    await deps.assets.update(params.sourceAssetId, { status: 'failed' });
     throw err;
   }
 
@@ -105,7 +108,6 @@ export type CallbackRendition = {
 };
 
 export type CompleteTranscodeParams = {
-  workspaceId: string;
   jobId: string;
   sourceAssetId: string;
   // 'SUCCESSFUL' | 'FAILED' from Encore's status, normalised by the route.
@@ -127,7 +129,7 @@ export async function completeTranscode(
   params: CompleteTranscodeParams,
   deps: { jobs: JobRepository; assets: AssetRepository }
 ): Promise<CompleteTranscodeResult> {
-  const job = await deps.jobs.get(params.workspaceId, params.jobId);
+  const job = await deps.jobs.get(params.jobId);
   if (!job) {
     return { applied: false, renditionAssetIds: [] };
   }
@@ -137,30 +139,30 @@ export async function completeTranscode(
   }
 
   if (!params.success) {
-    await deps.jobs.update(params.workspaceId, params.jobId, {
+    await deps.jobs.update(params.jobId, {
       status: 'failed',
       error: params.error ?? 'transcode failed'
     });
-    await deps.assets.update(params.workspaceId, params.sourceAssetId, { status: 'failed' });
+    await deps.assets.update(params.sourceAssetId, { status: 'failed' });
     return { applied: true, renditionAssetIds: [] };
   }
 
   // Success: materialise each rendition as a ready child asset of the source.
-  const source = await deps.assets.get(params.workspaceId, params.sourceAssetId);
+  const source = await deps.assets.get(params.sourceAssetId);
   const baseName = source?.name ?? params.sourceAssetId;
   const renditionAssetIds: string[] = [];
   const renditions: Rendition[] = [];
 
   for (const r of params.renditions) {
-    const child = await deps.assets.create(params.workspaceId, {
+    const child = await deps.assets.create({
       name: `${baseName} [${r.label}]`,
       parentId: params.sourceAssetId,
       objectKey: r.objectKey
     });
     // A freshly created asset is `uploading`; the rendition payload already
     // exists, so advance it straight to ready (uploading -> processing -> ready).
-    await deps.assets.update(params.workspaceId, child.id, { status: 'processing' });
-    await deps.assets.update(params.workspaceId, child.id, { status: 'ready' });
+    await deps.assets.update(child.id, { status: 'processing' });
+    await deps.assets.update(child.id, { status: 'ready' });
     renditionAssetIds.push(child.id);
     renditions.push({
       assetId: child.id,
@@ -172,13 +174,13 @@ export async function completeTranscode(
   }
 
   // Record renditions on the source and finalise the job.
-  await deps.assets.update(params.workspaceId, params.sourceAssetId, { renditions });
+  await deps.assets.update(params.sourceAssetId, { renditions });
   // The source asset itself returns to `ready` now that renditions exist.
-  const refreshed = await deps.assets.get(params.workspaceId, params.sourceAssetId);
+  const refreshed = await deps.assets.get(params.sourceAssetId);
   if (refreshed?.status === 'processing') {
-    await deps.assets.update(params.workspaceId, params.sourceAssetId, { status: 'ready' });
+    await deps.assets.update(params.sourceAssetId, { status: 'ready' });
   }
-  await deps.jobs.update(params.workspaceId, params.jobId, {
+  await deps.jobs.update(params.jobId, {
     status: 'done',
     progress: 100,
     renditionAssetIds

@@ -28,7 +28,6 @@ const errorSchema = z.object({ error: z.string(), message: z.string().optional()
 
 const registrationSchema = z.object({
   id: z.string(),
-  workspaceId: z.string(),
   url: z.string(),
   events: z.array(z.string()),
   secret: z.string().optional(),
@@ -67,7 +66,7 @@ export const webhooksRouter: FastifyPluginAsync<WebhooksRouterOptions> = async (
       }
     },
     async (request, reply) => {
-      const registration = await repo.create(request.workspaceId, request.body);
+      const registration = await repo.create(request.body);
       return reply.code(201).send(registration);
     }
   );
@@ -81,7 +80,7 @@ export const webhooksRouter: FastifyPluginAsync<WebhooksRouterOptions> = async (
       }
     },
     async (request, reply) => {
-      const webhooks = await repo.list(request.workspaceId);
+      const webhooks = await repo.list();
       return reply.code(200).send({ webhooks });
     }
   );
@@ -98,7 +97,7 @@ export const webhooksRouter: FastifyPluginAsync<WebhooksRouterOptions> = async (
     async (request, reply) => {
       // Delete is idempotent and never leaks existence across workspaces: an
       // unknown / foreign id is a silent no-op that still answers 204.
-      await repo.delete(request.workspaceId, request.params.id);
+      await repo.delete(request.params.id);
       return reply.code(204).send(null);
     }
   );

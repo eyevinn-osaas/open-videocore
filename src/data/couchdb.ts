@@ -16,13 +16,13 @@ export type StoredDoc = {
   [key: string]: unknown;
 };
 
-// Class name retained for call-site compatibility; it no longer carries any
-// workspace identity. The first constructor argument is the deployment context
-// key, kept only so the existing per-stack factory signature stays stable.
-export class WorkspaceCouch {
+// CouchDB access for a single stack's database. OSC provisions a dedicated
+// CouchDB instance per stack, so there is no workspace partitioning: documents
+// are stored under their flat local id.
+export class StackCouch {
   private readonly db: DocumentScope<StoredDoc>;
 
-  constructor(_contextId: string, server: ServerScope, dbName: string) {
+  constructor(server: ServerScope, dbName: string) {
     this.db = server.use<StoredDoc>(dbName);
   }
 

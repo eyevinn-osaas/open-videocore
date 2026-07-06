@@ -56,7 +56,6 @@ const renditionSchema = z.object({
 
 const assetSchema = z.object({
   id: z.string(),
-  workspaceId: z.string(),
   name: z.string(),
   description: z.string().optional(),
   status: z.string(),
@@ -152,7 +151,7 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
     async (request) => {
       const { q, tags, mimeType, page, pageSize } = request.query;
       const metadata = extractMetadataFilter(request.query as Record<string, unknown>);
-      return repo.search(request.workspaceId, { q, tags, mimeType, metadata, page, pageSize });
+      return repo.search({ q, tags, mimeType, metadata, page, pageSize });
     }
   );
 };

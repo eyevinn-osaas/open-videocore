@@ -9,8 +9,7 @@
 // than failing the request when no text index is available.
 
 import { type Asset, type AssetStatus, MAX_LIMIT } from './asset-repo.js';
-import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
-import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
+import type { StoredDoc, StackCouch } from './couchdb.js';
 import {
   clampPage,
   clampPageSize,
@@ -22,13 +21,13 @@ import {
 
 const RESOURCE_TYPE = 'asset';
 
-export type CouchFactory = (workspaceId: string) => WorkspaceCouch;
+export type CouchFactory = () => StackCouch;
 
 export class CouchSearchRepository implements SearchRepository {
   constructor(private readonly couchFor: CouchFactory) {}
 
-  async search(workspaceId: string, query: SearchQuery): Promise<SearchResult> {
-    const couch = this.couchFor(workspaceId);
+  async search(query: SearchQuery): Promise<SearchResult> {
+    const couch = this.couchFor();
     const page = clampPage(query.page);
     const pageSize = clampPageSize(query.pageSize);
 
@@ -72,7 +71,6 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
 function fromDoc(doc: StoredDoc): Asset {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: DEPLOYMENT_CONTEXT,
     name: String(doc['name'] ?? ''),
     description: doc['description'] as string | undefined,
     status: doc['status'] as AssetStatus,

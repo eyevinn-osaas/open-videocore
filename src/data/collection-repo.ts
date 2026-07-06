@@ -18,7 +18,6 @@
 
 export type Collection = {
   id: string;
-  workspaceId: string;
   name: string;
   assetIds: string[];
   createdAt: string;
@@ -30,12 +29,12 @@ export type CreateCollectionInput = {
 };
 
 export interface CollectionRepository {
-  create(workspaceId: string, input: CreateCollectionInput): Promise<Collection>;
-  list(workspaceId: string): Promise<Collection[]>;
-  get(workspaceId: string, id: string): Promise<Collection | undefined>;
-  addAsset(workspaceId: string, id: string, assetId: string): Promise<Collection>;
-  removeAsset(workspaceId: string, id: string, assetId: string): Promise<Collection>;
-  delete(workspaceId: string, id: string): Promise<void>;
+  create(input: CreateCollectionInput): Promise<Collection>;
+  list(): Promise<Collection[]>;
+  get(id: string): Promise<Collection | undefined>;
+  addAsset(id: string, assetId: string): Promise<Collection>;
+  removeAsset(id: string, assetId: string): Promise<Collection>;
+  delete(id: string): Promise<void>;
 }
 
 // Raised when a collection id does not exist in the caller's workspace and the

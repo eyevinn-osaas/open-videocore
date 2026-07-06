@@ -8,7 +8,6 @@ import {
   createInstance,
   getInstance,
   getPortsForInstance,
-  listSubscriptions,
   saveSecret,
   waitForInstanceReady
 } from '@osaas/client-core';
@@ -23,6 +22,7 @@ import {
   type StackConfig,
   stripCredentials
 } from '../services/param-store.js';
+import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { STACK_SERVICES } from '../services/stack.js';
 import type { OperationStore } from '../services/operation-store.js';
 
@@ -190,20 +190,13 @@ async function redisUrlFrom(
 }
 
 // Derive the deployment's own workspace (tenant) id from the OSC Context.
-// These routes are not caller-authenticated: the middleware authenticates to
-// OSC with its own OSC_ACCESS_TOKEN, so there is no per-caller bearer token to
-// resolve a workspace from. The deployment's tenant IS the workspace used to
-// scope the parameter store. All subscriptions for a single token belong to the
-// same tenant, so the tenantId of any one of them is the deployment's workspace.
-async function deriveWorkspaceId(osc: Context): Promise<string> {
-  const subscriptions = await listSubscriptions(osc);
-  const tenantId = subscriptions.find(
-    (s) => typeof s.tenantId === 'string' && s.tenantId.length > 0
-  )?.tenantId;
-  if (!tenantId) {
-    throw new Error('OSC context is not associated with a workspace (tenant)');
-  }
-  return tenantId;
+// The deployment context key used to namespace stacks in the parameter store.
+// One deployment = one tenant (ADR-003), so a fixed constant is sufficient.
+// DEV_WORKSPACE_ID is kept for local dev so existing stacks stored under that
+// key are still found during the transition.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+async function deriveWorkspaceId(_osc: Context): Promise<string> {
+  return process.env['DEV_WORKSPACE_ID'] ?? 'default';
 }
 
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (

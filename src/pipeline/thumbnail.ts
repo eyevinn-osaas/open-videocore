@@ -59,7 +59,6 @@ export function thumbnailObjectKey(assetId: string, timecodeSeconds: number): st
 }
 
 export type ExtractThumbnailsParams = {
-  workspaceId: string;
   assetId: string;
   objectKey: string;
   timecodes: number[];
@@ -82,7 +81,7 @@ export async function extractThumbnails(
   params: ExtractThumbnailsParams,
   deps: ExtractThumbnailsDeps
 ): Promise<string[]> {
-  const { workspaceId, assetId, objectKey, timecodes } = params;
+  const { assetId, objectKey, timecodes } = params;
   const ttl = deps.ttlSeconds ?? thumbnailUrlTtlSeconds();
 
   const seen = new Set<string>();
@@ -114,6 +113,6 @@ export async function extractThumbnails(
   // One extraction call covers every requested frame.
   await deps.extractor(sourceUrl, frames);
 
-  await deps.assets.update(workspaceId, assetId, { thumbnails: keys });
+  await deps.assets.update(assetId, { thumbnails: keys });
   return keys;
 }

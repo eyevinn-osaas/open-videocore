@@ -29,7 +29,6 @@
 // the OSC catalog — see docs/osc-feedback/incoming-issue9-packaging.md.
 
 import type { AssetRepository, ManifestUrls } from '../data/asset-repo.js';
-import { assertValidWorkspaceId } from '../data/guard.js';
 
 // The bucket the packager writes streaming output into (mirrors PACKAGED_BUCKET
 // in routes/provision.ts and the packager's OutputFolder).
@@ -41,38 +40,26 @@ export function packagedBucket(): string {
 
 // A correlation id carried through the queue + packager callback so a
 // completion event can be mapped back to the originating asset. It is the
-// workspace-namespaced asset id, so it cannot collide across workspaces and
-// leaks no more than the asset id already does to its owner.
-export function packagingId(workspaceId: string, assetId: string): string {
-  assertValidWorkspaceId(workspaceId);
-  return `${workspaceId}:${assetId}`;
+// asset id (OSC provides structural isolation, so no workspace namespace).
+export function packagingId(assetId: string): string {
+  return assetId;
 }
 
 // Parse a packagingId back into its parts. Returns undefined for a malformed
 // value so a forged callback payload cannot crash the handler.
 export function parsePackagingId(
   id: string
-): { workspaceId: string; assetId: string } | undefined {
-  const idx = id.indexOf(':');
-  if (idx <= 0 || idx === id.length - 1) {
+): { assetId: string } | undefined {
+  if (!id || id.length === 0) {
     return undefined;
   }
-  const workspaceId = id.slice(0, idx);
-  const assetId = id.slice(idx + 1);
-  try {
-    assertValidWorkspaceId(workspaceId);
-  } catch {
-    return undefined;
-  }
-  return { workspaceId, assetId };
+  return { assetId: id };
 }
 
 // The deterministic output prefix (inside the packaged bucket) where the
-// packager writes this asset's CMAF segments + manifests. Workspace-prefixed so
-// packaged output is partitioned the same way source objects are.
-export function outputPrefix(workspaceId: string, assetId: string): string {
-  assertValidWorkspaceId(workspaceId);
-  return `${workspaceId}/packaged/${assetId}`;
+// packager writes this asset's CMAF segments + manifests.
+export function outputPrefix(assetId: string): string {
+  return `packaged/${assetId}`;
 }
 
 // Build the public manifest URLs for an asset's packaged output. CMAF means HLS
@@ -80,8 +67,8 @@ export function outputPrefix(workspaceId: string, assetId: string): string {
 // the manifest filenames differ. `baseUrl` is the publicly reachable MinIO/CDN
 // origin for the packaged bucket (config via env). When the packager reports
 // explicit manifest paths in its callback we prefer those (see handleCallback).
-export function manifestUrlsFor(workspaceId: string, assetId: string, baseUrl: string): ManifestUrls {
-  const base = `${baseUrl.replace(/\/+$/, '')}/${outputPrefix(workspaceId, assetId)}`;
+export function manifestUrlsFor(assetId: string, baseUrl: string): ManifestUrls {
+  const base = `${baseUrl.replace(/\/+$/, '')}/${outputPrefix(assetId)}`;
   return {
     hls: `${base}/index.m3u8`,
     dash: `${base}/manifest.mpd`
@@ -101,7 +88,6 @@ export type EncoreOutput = {
 // The job enqueued onto the Valkey queue for the packager to consume.
 export type PackagingJob = {
   packagingId: string;
-  workspaceId: string;
   assetId: string;
   // Where the packager should write CMAF output (inside the packaged bucket).
   outputPrefix: string;
@@ -122,7 +108,6 @@ export interface PackageQueue {
 // never needs to know how packaging is wired.
 export interface PackagingTrigger {
   triggerPackaging(
-    workspaceId: string,
     assetId: string,
     encoreOutputs: EncoreOutput[]
   ): Promise<void>;
@@ -168,16 +153,14 @@ export class PackagingService implements PackagingTrigger {
   // the job is keyed by packagingId so a redelivered transcode callback
   // re-enqueues the same deterministic job/output rather than forking output.
   async triggerPackaging(
-    workspaceId: string,
     assetId: string,
     encoreOutputs: EncoreOutput[]
   ): Promise<void> {
     try {
       const job: PackagingJob = {
-        packagingId: packagingId(workspaceId, assetId),
-        workspaceId,
+        packagingId: packagingId(assetId),
         assetId,
-        outputPrefix: outputPrefix(workspaceId, assetId),
+        outputPrefix: outputPrefix(assetId),
         inputs: encoreOutputs
       };
       await this.deps.queue.enqueue(job);
@@ -185,7 +168,7 @@ export class PackagingService implements PackagingTrigger {
       this.deps.onError?.(err);
       const message = err instanceof Error ? err.message : String(err);
       try {
-        await this.deps.assets.update(workspaceId, assetId, {
+        await this.deps.assets.update(assetId, {
           packagingError: `failed to enqueue packaging job: ${message}`
         });
       } catch {
@@ -204,14 +187,14 @@ export class PackagingService implements PackagingTrigger {
     if (!parsed) {
       return false;
     }
-    const { workspaceId, assetId } = parsed;
-    const asset = await this.deps.assets.get(workspaceId, assetId);
+    const { assetId } = parsed;
+    const asset = await this.deps.assets.get(assetId);
     if (!asset) {
       return false;
     }
 
     if (payload.status === 'failed') {
-      await this.deps.assets.update(workspaceId, assetId, {
+      await this.deps.assets.update(assetId, {
         packagingError: payload.error ?? 'packaging failed'
       });
       return true;
@@ -220,7 +203,7 @@ export class PackagingService implements PackagingTrigger {
     // Success: prefer explicit manifest paths from the packager; otherwise fall
     // back to the deterministic CMAF manifest names under the output prefix.
     const base = this.deps.publicBaseUrl ?? packagingPublicBaseUrl();
-    const fallback = manifestUrlsFor(workspaceId, assetId, base);
+    const fallback = manifestUrlsFor(assetId, base);
     const origin = base.replace(/\/+$/, '');
     const manifestUrls: ManifestUrls = {
       hls: payload.hlsManifest ? `${origin}/${stripLeadingSlash(payload.hlsManifest)}` : fallback.hls,
@@ -228,7 +211,7 @@ export class PackagingService implements PackagingTrigger {
         ? `${origin}/${stripLeadingSlash(payload.dashManifest)}`
         : fallback.dash
     };
-    await this.deps.assets.update(workspaceId, assetId, { manifestUrls });
+    await this.deps.assets.update(assetId, { manifestUrls });
     return true;
   }
 }

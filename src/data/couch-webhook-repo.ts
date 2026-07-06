@@ -6,8 +6,7 @@
 // caller's partition, so an id from another workspace resolves to undefined
 // (existence is not leaked) and is never read or deleted cross-workspace.
 
-import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
-import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
+import type { StoredDoc, StackCouch } from './couchdb.js';
 import type {
   CreateWebhookInput,
   WebhookRegistration,
@@ -16,18 +15,17 @@ import type {
 
 const RESOURCE_TYPE = 'webhook';
 
-export type CouchFactory = (workspaceId: string) => WorkspaceCouch;
+export type CouchFactory = () => StackCouch;
 
 export class CouchWebhookRepository implements WebhookRepository {
   constructor(private readonly couchFor: CouchFactory) {}
 
-  async create(workspaceId: string, input: CreateWebhookInput): Promise<WebhookRegistration> {
-    const couch = this.couchFor(workspaceId);
+  async create(input: CreateWebhookInput): Promise<WebhookRegistration> {
+    const couch = this.couchFor();
     const now = new Date().toISOString();
     const localId = `webhook-${cryptoId()}`;
     const registration: WebhookRegistration = {
       id: localId,
-      workspaceId,
       url: input.url,
       events: [...input.events],
       secret: input.secret,
@@ -37,16 +35,16 @@ export class CouchWebhookRepository implements WebhookRepository {
     return registration;
   }
 
-  async list(workspaceId: string): Promise<WebhookRegistration[]> {
-    const couch = this.couchFor(workspaceId);
+  async list(): Promise<WebhookRegistration[]> {
+    const couch = this.couchFor();
     const docs = await couch.find({ resourceType: RESOURCE_TYPE }, { limit: 1000 });
     return docs
       .map(fromDoc)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   }
 
-  async delete(workspaceId: string, id: string): Promise<void> {
-    const couch = this.couchFor(workspaceId);
+  async delete(id: string): Promise<void> {
+    const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       return;
@@ -69,7 +67,6 @@ function toDoc(registration: WebhookRegistration): Record<string, unknown> {
 function fromDoc(doc: StoredDoc): WebhookRegistration {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: DEPLOYMENT_CONTEXT,
     url: String(doc['url'] ?? ''),
     events: (doc['events'] as string[] | undefined) ?? [],
     secret: doc['secret'] as string | undefined,

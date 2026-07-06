@@ -155,7 +155,6 @@ export type SubtitleTrack = {
 
 export type Asset = {
   id: string;
-  workspaceId: string;
   name: string;
   description?: string;
   status: AssetStatus;
@@ -322,16 +321,16 @@ export const MAX_LIMIT = 200;
 // ---------------------------------------------------------------------------
 
 export interface AssetRepository {
-  create(workspaceId: string, input: CreateAssetInput): Promise<Asset>;
-  get(workspaceId: string, id: string): Promise<Asset | undefined>;
-  list(workspaceId: string, opts?: ListOptions): Promise<ListResult>;
-  search(workspaceId: string, query: string): Promise<Asset[]>;
-  update(workspaceId: string, id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
+  create(input: CreateAssetInput): Promise<Asset>;
+  get(id: string): Promise<Asset | undefined>;
+  list(opts?: ListOptions): Promise<ListResult>;
+  search(query: string): Promise<Asset[]>;
+  update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
   // Returns the count of direct children of an asset (for delete-blocking).
-  countChildren(workspaceId: string, id: string): Promise<number>;
+  countChildren(id: string): Promise<number>;
   // Soft-delete: transitions the asset to `archived`. Returns the archived
-  // asset, or undefined if it does not exist in this workspace.
-  remove(workspaceId: string, id: string): Promise<Asset | undefined>;
+  // asset, or undefined if it does not exist.
+  remove(id: string): Promise<Asset | undefined>;
 }
 
 // Build the initial status history entry for a freshly created asset.
@@ -429,12 +428,13 @@ export function normalizeTags(tags: readonly string[]): string[] {
 // ---------------------------------------------------------------------------
 
 export class InMemoryAssetRepository implements AssetRepository {
-  // Keyed by fully namespaced id `<workspaceId>:<localId>`.
+  // Keyed by the asset's local id. OSC provides structural isolation, so there
+  // is no workspace namespacing on the key.
   private readonly store = new Map<string, Asset>();
 
-  async create(workspaceId: string, input: CreateAssetInput): Promise<Asset> {
+  async create(input: CreateAssetInput): Promise<Asset> {
     if (input.parentId) {
-      const parent = await this.get(workspaceId, input.parentId);
+      const parent = await this.get(input.parentId);
       if (!parent) {
         throw new ParentNotFoundError(input.parentId);
       }
@@ -445,7 +445,6 @@ export class InMemoryAssetRepository implements AssetRepository {
     const method = input.sourceMethod ?? 'upload';
     const asset: Asset = {
       id: localId,
-      workspaceId,
       name: input.name,
       description: input.description,
       status: 'uploading',
@@ -464,17 +463,15 @@ export class InMemoryAssetRepository implements AssetRepository {
     return { ...asset };
   }
 
-  async get(workspaceId: string, id: string): Promise<Asset | undefined> {
+  async get(id: string): Promise<Asset | undefined> {
     const asset = this.store.get(id);
     if (!asset) {
-      // Existence is not leaked: a foreign id is indistinguishable from a miss.
       return undefined;
     }
-    // Defence in depth: re-check ownership even though the key is namespaced.
     return { ...asset };
   }
 
-  async list(workspaceId: string, opts: ListOptions = {}): Promise<ListResult> {
+  async list(opts: ListOptions = {}): Promise<ListResult> {
     const limit = clampLimit(opts.limit);
     const offset = Math.max(0, opts.offset ?? 0);
     let all = [...this.store.values()];
@@ -489,9 +486,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     return { items, limit, offset, total: all.length };
   }
 
-  async search(workspaceId: string, query: string): Promise<Asset[]> {
+  async search(query: string): Promise<Asset[]> {
     const q = query.toLowerCase();
-    const { items } = await this.list(workspaceId, { limit: MAX_LIMIT });
+    const { items } = await this.list({ limit: MAX_LIMIT });
     return items.filter(
       (a) =>
         a.name.toLowerCase().includes(q) ||
@@ -500,7 +497,6 @@ export class InMemoryAssetRepository implements AssetRepository {
   }
 
   async update(
-    workspaceId: string,
     id: string,
     patch: UpdateAssetInput
   ): Promise<Asset | undefined> {
@@ -563,14 +559,14 @@ export class InMemoryAssetRepository implements AssetRepository {
     return { ...next };
   }
 
-  async countChildren(workspaceId: string, id: string): Promise<number> {
+  async countChildren(id: string): Promise<number> {
     return [...this.store.values()].filter((a) => a.parentId === id).length;
   }
 
-  async remove(workspaceId: string, id: string): Promise<Asset | undefined> {
+  async remove(id: string): Promise<Asset | undefined> {
     // Soft delete: transition to `archived` (see couch-asset-repo.ts for the
     // delete-strategy rationale). The route blocks if children exist.
-    return this.update(workspaceId, id, { status: 'archived' });
+    return this.update(id, { status: 'archived' });
   }
 }
 

@@ -27,6 +27,7 @@ import {
   type SubtitleTrack
 } from '../data/asset-repo.js';
 import { WorkspaceAccessError } from '../data/guard.js';
+import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import {
   SourceTooLargeError,
@@ -263,7 +264,6 @@ const tracksSchema = z.object({
 
 const assetSchema = z.object({
   id: z.string(),
-  workspaceId: z.string(),
   name: z.string(),
   description: z.string().optional(),
   status: statusSchema,
@@ -304,9 +304,9 @@ const listSchema = z.object({
   total: z.number()
 });
 
-// A workspace-scoped MinIO wrapper factory, supplied by app wiring. Absent in a
-// bare local run, in which case URL-pull ingest is disabled (501).
-export type StorageFactory = (workspaceId: string) => WorkspaceStorage;
+// A MinIO wrapper factory, supplied by app wiring. Absent in a bare local run,
+// in which case URL-pull ingest is disabled (501).
+export type StorageFactory = () => WorkspaceStorage;
 
 type AssetsRouterOptions = {
   // Injectable for tests; defaults to the in-memory repository.
@@ -385,15 +385,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
   // configured. Returns true when an extraction was actually kicked off.
-  function triggerExtraction(workspaceId: string, assetId: string, objectKey: string): boolean {
+  function triggerExtraction(assetId: string, objectKey: string): boolean {
     if (!opts.probe || !storageFor) {
       return false;
     }
     void extractRunner(
-      { workspaceId, assetId, objectKey },
+      { assetId, objectKey },
       {
         assets: repo,
-        storage: storageFor(workspaceId),
+        storage: storageFor(),
         probe: opts.probe,
         ...opts.extractDeps
       }
@@ -433,7 +433,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     '/',
     { ...guarded, schema: { body: createSchema, response: { 201: assetSchema } } },
     async (request, reply) => {
-      const asset = await repo.create(request.workspaceId, request.body);
+      const asset = await repo.create(request.body);
       return reply.code(201).send(asset);
     }
   );
@@ -471,15 +471,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         decodeURIComponent(parsed.url.pathname.split('/').filter(Boolean).pop() ?? '') ||
         parsed.url.hostname;
 
-      const asset = await repo.create(request.workspaceId, {
+      const asset = await repo.create({
         name: name ?? fallbackName,
         description
       });
-      // Destination object key inside the workspace prefix.
       const objectKey = `ingest/${asset.id}`;
-      await repo.update(request.workspaceId, asset.id, { objectKey });
+      await repo.update(asset.id, { objectKey });
 
-      const job = await jobs.create(request.workspaceId, {
+      const job = await jobs.create({
         type: 'ingest-url',
         assetId: asset.id,
         sourceUrl
@@ -490,14 +489,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // reaches a terminal state we fire-and-forget technical metadata
       // extraction against the now-stored object (issue #6); we only extract if
       // the asset actually advanced to `processing` (pull succeeded).
-      const ws = request.workspaceId;
       void runner(
-        { workspaceId: ws, jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
-        { jobs, assets: repo, storage: storageFor(ws), ...opts.pullDeps }
+        { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
+        { jobs, assets: repo, storage: storageFor(), ...opts.pullDeps }
       ).then(async () => {
-        const settled = await repo.get(ws, asset.id);
+        const settled = await repo.get(asset.id);
         if (settled?.status === 'processing') {
-          triggerExtraction(ws, asset.id, objectKey);
+          triggerExtraction(asset.id, objectKey);
         }
       });
 
@@ -509,7 +507,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     '/',
     { ...guarded, schema: { querystring: listQuerySchema, response: { 200: listSchema } } },
     async (request) => {
-      return repo.list(request.workspaceId, request.query);
+      return repo.list(request.query);
     }
   );
 
@@ -523,7 +521,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request) => {
-      const items = await repo.search(request.workspaceId, request.query.q);
+      const items = await repo.search(request.query.q);
       return { items };
     }
   );
@@ -538,7 +536,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -569,7 +567,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -594,7 +592,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             message: 'object storage is not configured'
           });
         }
-        const source = await storageFor(request.workspaceId).presignedGet(asset.objectKey, ttl);
+        const source = await storageFor().presignedGet(asset.objectKey, ttl);
         return reply.code(200).send({ assetId: asset.id, urls: { source }, expiresAt });
       }
 
@@ -628,7 +626,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -644,7 +642,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'technical metadata extraction is not configured'
         });
       }
-      triggerExtraction(request.workspaceId, asset.id, asset.objectKey);
+      triggerExtraction(asset.id, asset.objectKey);
       return reply.code(202).send({ assetId: asset.id, status: 'extracting' });
     }
   );
@@ -676,7 +674,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -695,7 +693,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       try {
         const result = await submitTranscode(
           {
-            workspaceId: request.workspaceId,
+            workspaceId: DEPLOYMENT_CONTEXT,
             sourceAssetId: asset.id,
             sourceObjectKey: asset.objectKey,
             preset: request.body.profile,
@@ -739,7 +737,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -767,14 +765,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       try {
         const thumbnails = await thumbnailRunner(
           {
-            workspaceId: request.workspaceId,
             assetId: asset.id,
             objectKey: asset.objectKey,
             timecodes: request.body.timecodes
           },
           {
             assets: repo,
-            storage: storageFor(request.workspaceId),
+            storage: storageFor(),
             extractor: resolvedExtractor,
             ...opts.thumbnailDeps
           }
@@ -816,7 +813,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -835,7 +832,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       try {
         const child = await rewrapRunner(
           {
-            workspaceId: request.workspaceId,
             sourceAssetId: asset.id,
             objectKey: asset.objectKey,
             targetFormat: request.body.targetFormat,
@@ -843,7 +839,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           },
           {
             assets: repo,
-            storage: storageFor(request.workspaceId),
+            storage: storageFor(),
             runner: opts.rewrapRunner,
             ...opts.rewrapDeps
           }
@@ -874,7 +870,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -893,7 +889,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       try {
         const child = await clipRunnerOrchestrator(
           {
-            workspaceId: request.workspaceId,
             sourceAssetId: asset.id,
             objectKey: asset.objectKey,
             startSeconds: request.body.startSeconds,
@@ -902,7 +897,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           },
           {
             assets: repo,
-            storage: storageFor(request.workspaceId),
+            storage: storageFor(),
             runner: opts.clipRunner,
             ...opts.clipDeps
           }
@@ -932,7 +927,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -961,14 +956,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     },
     async (request, reply) => {
       if (!storageFor) return reply.code(501).send({ error: 'not_configured' });
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) return reply.code(404).send({ error: 'not_found' });
       const keys = asset.thumbnails ?? [];
       const idx = parseInt(request.params.index, 10);
       if (isNaN(idx) || idx < 0 || idx >= keys.length) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      const storage = storageFor(request.workspaceId);
+      const storage = storageFor();
       const stream = await storage.getObject(keys[idx]);
       return reply
         .header('Content-Type', 'image/jpeg')
@@ -994,7 +989,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const updated = await repo.update(request.workspaceId, request.params.id, {
+      const updated = await repo.update(request.params.id, {
         metadata: request.body,
         replaceMetadata: true
       });
@@ -1036,7 +1031,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -1064,7 +1059,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -1077,7 +1072,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         default: request.body.default
       };
       const audioTracks = [...(asset.audioTracks ?? []), track];
-      await repo.update(request.workspaceId, asset.id, { audioTracks });
+      await repo.update(asset.id, { audioTracks });
       return reply.code(201).send({ audioTracks });
     }
   );
@@ -1095,7 +1090,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -1104,7 +1099,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (audioTracks.length === existing.length) {
         return reply.code(404).send({ error: 'not_found', message: 'audio track not found' });
       }
-      await repo.update(request.workspaceId, asset.id, { audioTracks });
+      await repo.update(asset.id, { audioTracks });
       return reply.code(204).send(null);
     }
   );
@@ -1129,7 +1124,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -1140,7 +1135,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       let uploadUrl: string | undefined;
       if (storageFor) {
-        uploadUrl = await storageFor(request.workspaceId).presignedPut(objectKey);
+        uploadUrl = await storageFor().presignedPut(objectKey);
       }
 
       const track: SubtitleTrack = {
@@ -1154,7 +1149,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         default: request.body.default
       };
       const subtitleTracks = [...(asset.subtitleTracks ?? []), track];
-      await repo.update(request.workspaceId, asset.id, { subtitleTracks });
+      await repo.update(asset.id, { subtitleTracks });
       return reply.code(201).send(uploadUrl ? { track, uploadUrl } : { track });
     }
   );
@@ -1173,7 +1168,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -1182,7 +1177,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (subtitleTracks.length === existing.length) {
         return reply.code(404).send({ error: 'not_found', message: 'subtitle track not found' });
       }
-      await repo.update(request.workspaceId, asset.id, { subtitleTracks });
+      await repo.update(asset.id, { subtitleTracks });
       return reply.code(204).send(null);
     }
   );
@@ -1201,12 +1196,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
       const merged = normalizeTags([...(asset.tags ?? []), ...request.body.tags]);
-      const updated = await repo.update(request.workspaceId, request.params.id, { tags: merged });
+      const updated = await repo.update(request.params.id, { tags: merged });
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -1227,12 +1222,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.workspaceId, request.params.id);
+      const asset = await repo.get(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
       const remaining = (asset.tags ?? []).filter((t) => t !== request.params.tag);
-      const updated = await repo.update(request.workspaceId, request.params.id, {
+      const updated = await repo.update(request.params.id, {
         tags: remaining
       });
       if (!updated) {
@@ -1253,7 +1248,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
-      const updated = await repo.update(request.workspaceId, request.params.id, request.body);
+      const updated = await repo.update(request.params.id, request.body);
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -1272,12 +1267,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     },
     async (request, reply) => {
       // Block deletion while children (renditions) still reference this asset.
-      const childCount = await repo.countChildren(request.workspaceId, request.params.id);
+      const childCount = await repo.countChildren(request.params.id);
       if (childCount > 0) {
         throw new HasChildrenError(request.params.id);
       }
       // Soft delete: archive rather than destroy (see asset-repo / couch-asset-repo).
-      const removed = await repo.remove(request.workspaceId, request.params.id);
+      const removed = await repo.remove(request.params.id);
       if (!removed) {
         return reply.code(404).send({ error: 'not_found' });
       }

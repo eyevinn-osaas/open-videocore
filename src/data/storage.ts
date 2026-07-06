@@ -1,18 +1,11 @@
-// Workspace-scoped object storage (MinIO).
+// Object storage (MinIO).
 //
-// Partitioning strategy: a shared bucket with a per-workspace key prefix
-// `<workspaceId>/`. Every object key handled by route logic is forced under the
-// caller's prefix, and listings are bounded to that prefix, so one workspace
-// can neither read, write, nor enumerate another workspace's objects.
-//
-// A shared-bucket-with-prefix model is preferred over a bucket-per-workspace
-// model because it avoids per-tenant provisioning on OSC: the source and
-// packaged buckets are created once at provision time and reused for all
-// workspaces (see ADR-001 / provision route).
+// OSC provisions dedicated MinIO buckets per stack, so there is no per-workspace
+// key prefix: objects are stored directly under their local key (e.g.
+// `sources/<assetId>`). The source and packaged buckets belong to the stack.
 
 import type { Client as MinioClient } from 'minio';
 import { PassThrough, type Readable } from 'node:stream';
-import { assertValidWorkspaceId, objectPrefix } from './guard.js';
 
 // Raised when a streamed source exceeds the configured byte cap. The route maps
 // this to 413 and the URL-pull worker records it as a job failure (issue #5).
@@ -69,28 +62,21 @@ export type CompletedPart = {
 };
 
 export class WorkspaceStorage {
-  private readonly prefix: string;
-
   constructor(
-    private readonly workspaceId: string,
     private readonly client: MinioClient,
     private readonly bucket: string
-  ) {
-    assertValidWorkspaceId(workspaceId);
-    this.prefix = objectPrefix(workspaceId);
-  }
+  ) {}
 
-  // Resolve a caller-supplied local key to its fully namespaced object key.
-  // Reject inputs that try to escape the prefix (absolute keys, traversal).
+  // Normalise a caller-supplied object key. Reject traversal / absolute keys.
   private scopedKey(localKey: string): string {
     const normalized = localKey.replace(/^\/+/, '');
     if (normalized.includes('..')) {
       throw new Error('invalid object key');
     }
-    return `${this.prefix}${normalized}`;
+    return normalized;
   }
 
-  // A presigned PUT URL for direct upload, scoped to this workspace's prefix.
+  // A presigned PUT URL for direct upload.
   async presignedPut(
     localKey: string,
     expirySeconds: number = uploadUrlTtlSeconds()
@@ -221,15 +207,14 @@ export class WorkspaceStorage {
     return { etag: result.etag, bytesTransferred: transferred };
   }
 
-  // List object keys for this workspace only, returned WITHOUT the workspace
-  // prefix so callers see workspace-local keys.
+  // List object keys in the bucket.
   async list(): Promise<string[]> {
     const keys: string[] = [];
-    const stream = this.client.listObjectsV2(this.bucket, this.prefix, true);
+    const stream = this.client.listObjectsV2(this.bucket, '', true);
     return await new Promise<string[]>((resolve, reject) => {
       stream.on('data', (obj) => {
-        if (obj.name && obj.name.startsWith(this.prefix)) {
-          keys.push(obj.name.slice(this.prefix.length));
+        if (obj.name) {
+          keys.push(obj.name);
         }
       });
       stream.on('end', () => resolve(keys));

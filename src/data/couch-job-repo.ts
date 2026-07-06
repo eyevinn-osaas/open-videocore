@@ -16,23 +16,21 @@ import {
   type JobType,
   type UpdateJobInput
 } from './job-repo.js';
-import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
-import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
+import type { StoredDoc, StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'job';
 
-export type CouchFactory = (workspaceId: string) => WorkspaceCouch;
+export type CouchFactory = () => StackCouch;
 
 export class CouchJobRepository implements JobRepository {
   constructor(private readonly couchFor: CouchFactory) {}
 
-  async create(workspaceId: string, input: CreateJobInput): Promise<Job> {
-    const couch = this.couchFor(workspaceId);
+  async create(input: CreateJobInput): Promise<Job> {
+    const couch = this.couchFor();
     const now = new Date().toISOString();
     const localId = `job-${cryptoId()}`;
     const job: Job = {
       id: localId,
-      workspaceId,
       type: input.type,
       status: 'pending',
       assetId: input.assetId,
@@ -49,8 +47,8 @@ export class CouchJobRepository implements JobRepository {
     return job;
   }
 
-  async get(workspaceId: string, id: string): Promise<Job | undefined> {
-    const couch = this.couchFor(workspaceId);
+  async get(id: string): Promise<Job | undefined> {
+    const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       return undefined;
@@ -58,8 +56,8 @@ export class CouchJobRepository implements JobRepository {
     return fromDoc(doc);
   }
 
-  async list(workspaceId: string, opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
-    const couch = this.couchFor(workspaceId);
+  async list(opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
+    const couch = this.couchFor();
     const limit = opts?.limit ?? 50;
     const skip = opts?.offset ?? 0;
     const docs = await couch.find({ resourceType: RESOURCE_TYPE }, { limit, skip });
@@ -74,12 +72,12 @@ export class CouchJobRepository implements JobRepository {
   // through the normal workspace-scoped path — no cross-partition scan.
   async findByEncoreJobId(
     encoreJobId: string
-  ): Promise<{ workspaceId: string; job: Job } | undefined> {
+  ): Promise<{ job: Job } | undefined> {
     const decoded = decodeEncoreJobId(encoreJobId);
     if (!decoded) {
       return undefined;
     }
-    const couch = this.couchFor(decoded.workspaceId);
+    const couch = this.couchFor();
     const doc = await couch.get(decoded.jobLocalId);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       return undefined;
@@ -88,15 +86,14 @@ export class CouchJobRepository implements JobRepository {
     if (job.encoreJobId !== encoreJobId) {
       return undefined;
     }
-    return { workspaceId: decoded.workspaceId, job };
+    return { job };
   }
 
   async update(
-    workspaceId: string,
     id: string,
     patch: UpdateJobInput
   ): Promise<Job | undefined> {
-    const couch = this.couchFor(workspaceId);
+    const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       return undefined;
@@ -133,7 +130,6 @@ function toDoc(job: Job): Record<string, unknown> {
 function fromDoc(doc: StoredDoc): Job {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: DEPLOYMENT_CONTEXT,
     type: doc['type'] as JobType,
     status: doc['status'] as JobStatus,
     assetId: String(doc['assetId'] ?? ''),

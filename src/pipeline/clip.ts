@@ -50,7 +50,6 @@ export function clipObjectKey(assetId: string): string {
 }
 
 export type ClipParams = {
-  workspaceId: string;
   sourceAssetId: string;
   objectKey: string;
   startSeconds: number;
@@ -74,16 +73,16 @@ export type ClipDeps = {
 // runner failure after marking the child `failed`, so the route maps it to a
 // 502 while the child record preserves the failure for inspection.
 export async function clip(params: ClipParams, deps: ClipDeps): Promise<Asset> {
-  const { workspaceId, sourceAssetId, objectKey, startSeconds, endSeconds, outputName } = params;
+  const { sourceAssetId, objectKey, startSeconds, endSeconds, outputName } = params;
   const ttl = deps.ttlSeconds ?? clipUrlTtlSeconds();
 
   // Create the child asset first so its id seeds the destination object key.
-  const child = await deps.assets.create(workspaceId, {
+  const child = await deps.assets.create({
     name: outputName ?? `clip-${startSeconds}-${endSeconds}`,
     parentId: sourceAssetId
   });
   const destKey = clipObjectKey(child.id);
-  await deps.assets.update(workspaceId, child.id, { objectKey: destKey, status: 'processing' });
+  await deps.assets.update(child.id, { objectKey: destKey, status: 'processing' });
 
   const sourceUrl = await deps.storage.presignedGet(objectKey, ttl);
   const putUrl = await deps.storage.presignedPut(destKey, ttl);
@@ -91,11 +90,11 @@ export async function clip(params: ClipParams, deps: ClipDeps): Promise<Asset> {
   try {
     await deps.runner(sourceUrl, putUrl, startSeconds, endSeconds);
   } catch (err) {
-    await deps.assets.update(workspaceId, child.id, { status: 'failed' });
+    await deps.assets.update(child.id, { status: 'failed' });
     throw err;
   }
 
-  const ready = await deps.assets.update(workspaceId, child.id, { status: 'ready' });
+  const ready = await deps.assets.update(child.id, { status: 'ready' });
   // `update` returns undefined only if the child vanished mid-flight; fall back
   // to the last known record so the caller always gets the new asset.
   return ready ?? child;

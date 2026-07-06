@@ -7,8 +7,7 @@
 // resolves to undefined (existence is not leaked) and is never read or mutated
 // cross-workspace.
 
-import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
-import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
+import type { StoredDoc, StackCouch } from './couchdb.js';
 import {
   CollectionNotFoundError,
   addAssetId,
@@ -20,18 +19,17 @@ import {
 
 const RESOURCE_TYPE = 'collection';
 
-export type CouchFactory = (workspaceId: string) => WorkspaceCouch;
+export type CouchFactory = () => StackCouch;
 
 export class CouchCollectionRepository implements CollectionRepository {
   constructor(private readonly couchFor: CouchFactory) {}
 
-  async create(workspaceId: string, input: CreateCollectionInput): Promise<Collection> {
-    const couch = this.couchFor(workspaceId);
+  async create(input: CreateCollectionInput): Promise<Collection> {
+    const couch = this.couchFor();
     const now = new Date().toISOString();
     const localId = `collection-${cryptoId()}`;
     const collection: Collection = {
       id: localId,
-      workspaceId,
       name: input.name,
       assetIds: [],
       createdAt: now,
@@ -41,8 +39,8 @@ export class CouchCollectionRepository implements CollectionRepository {
     return collection;
   }
 
-  async list(workspaceId: string): Promise<Collection[]> {
-    const couch = this.couchFor(workspaceId);
+  async list(): Promise<Collection[]> {
+    const couch = this.couchFor();
     const docs = await couch.find({ resourceType: RESOURCE_TYPE }, { limit: 1000 });
     return docs
       .filter((d) => d.resourceType === RESOURCE_TYPE)
@@ -50,8 +48,8 @@ export class CouchCollectionRepository implements CollectionRepository {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   }
 
-  async get(workspaceId: string, id: string): Promise<Collection | undefined> {
-    const couch = this.couchFor(workspaceId);
+  async get(id: string): Promise<Collection | undefined> {
+    const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       return undefined;
@@ -59,16 +57,16 @@ export class CouchCollectionRepository implements CollectionRepository {
     return fromDoc(doc);
   }
 
-  async addAsset(workspaceId: string, id: string, assetId: string): Promise<Collection> {
-    return this.mutate(workspaceId, id, (c) => addAssetId(c.assetIds, assetId));
+  async addAsset(id: string, assetId: string): Promise<Collection> {
+    return this.mutate(id, (c) => addAssetId(c.assetIds, assetId));
   }
 
-  async removeAsset(workspaceId: string, id: string, assetId: string): Promise<Collection> {
-    return this.mutate(workspaceId, id, (c) => removeAssetId(c.assetIds, assetId));
+  async removeAsset(id: string, assetId: string): Promise<Collection> {
+    return this.mutate(id, (c) => removeAssetId(c.assetIds, assetId));
   }
 
-  async delete(workspaceId: string, id: string): Promise<void> {
-    const couch = this.couchFor(workspaceId);
+  async delete(id: string): Promise<void> {
+    const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       return;
@@ -77,11 +75,10 @@ export class CouchCollectionRepository implements CollectionRepository {
   }
 
   private async mutate(
-    workspaceId: string,
     id: string,
     next: (c: Collection) => string[]
   ): Promise<Collection> {
-    const couch = this.couchFor(workspaceId);
+    const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
       throw new CollectionNotFoundError(id);
@@ -112,7 +109,6 @@ function toDoc(collection: Collection): Record<string, unknown> {
 function fromDoc(doc: StoredDoc): Collection {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: DEPLOYMENT_CONTEXT,
     name: String(doc['name'] ?? ''),
     assetIds: (doc['assetIds'] as string[] | undefined) ?? [],
     createdAt: String(doc['createdAt'] ?? ''),

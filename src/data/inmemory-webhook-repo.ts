@@ -13,16 +13,14 @@ import type {
 } from './webhook-repo.js';
 
 export class InMemoryWebhookRepository implements WebhookRepository {
-  // Keyed by fully namespaced id `<workspaceId>:<localId>`.
   private readonly store = new Map<string, WebhookRegistration>();
   private counter = 0;
 
-  async create(workspaceId: string, input: CreateWebhookInput): Promise<WebhookRegistration> {
+  async create(input: CreateWebhookInput): Promise<WebhookRegistration> {
     const now = new Date().toISOString();
     const localId = `webhook-${++this.counter}`;
     const registration: WebhookRegistration = {
       id: localId,
-      workspaceId,
       url: input.url,
       events: [...input.events],
       secret: input.secret,
@@ -32,21 +30,13 @@ export class InMemoryWebhookRepository implements WebhookRepository {
     return { ...registration };
   }
 
-  async list(workspaceId: string): Promise<WebhookRegistration[]> {
+  async list(): Promise<WebhookRegistration[]> {
     return [...this.store.values()]
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
       .map((w) => ({ ...w }));
   }
 
-  async delete(workspaceId: string, id: string): Promise<void> {
-    const key = id;
-    const existing = this.store.get(key);
-    if (!existing) {
-      // A foreign / unknown id is indistinguishable from a miss: existence is
-      // not leaked across workspaces.
-      return;
-    }
-    // Defence in depth: re-check ownership even though the key is namespaced.
-    this.store.delete(key);
+  async delete(id: string): Promise<void> {
+    this.store.delete(id);
   }
 }

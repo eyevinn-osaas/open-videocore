@@ -17,10 +17,10 @@ import {
 export class InMemorySearchRepository implements SearchRepository {
   constructor(private readonly assets: AssetRepository) {}
 
-  async search(workspaceId: string, query: SearchQuery): Promise<SearchResult> {
+  async search(query: SearchQuery): Promise<SearchResult> {
     const page = clampPage(query.page);
     const pageSize = clampPageSize(query.pageSize);
-    const { items } = await this.assets.list(workspaceId, { limit: MAX_LIMIT });
+    const { items } = await this.assets.list({ limit: MAX_LIMIT });
     const matched = items.filter((a) => matchesQuery(a, query));
     const start = (page - 1) * pageSize;
     return {

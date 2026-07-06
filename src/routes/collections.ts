@@ -33,7 +33,6 @@ const errorSchema = z.object({ error: z.string(), message: z.string().optional()
 
 const collectionSchema = z.object({
   id: z.string(),
-  workspaceId: z.string(),
   name: z.string(),
   assetIds: z.array(z.string()),
   createdAt: z.string(),
@@ -84,7 +83,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       schema: { body: createBodySchema, response: { 201: collectionSchema, 400: errorSchema } }
     },
     async (request, reply) => {
-      const collection = await repo.create(request.workspaceId, request.body);
+      const collection = await repo.create(request.body);
       return reply.code(201).send(collection);
     }
   );
@@ -96,7 +95,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       schema: { response: { 200: z.object({ collections: z.array(collectionSchema) }) } }
     },
     async (request, reply) => {
-      const collections = await repo.list(request.workspaceId);
+      const collections = await repo.list();
       return reply.code(200).send({ collections });
     }
   );
@@ -111,13 +110,13 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       }
     },
     async (request, reply) => {
-      const collection = await repo.get(request.workspaceId, request.params.id);
+      const collection = await repo.get(request.params.id);
       if (!collection) {
         return reply.code(404).send({ error: 'not_found' });
       }
       // Resolve membership to live assets, dropping ids that no longer resolve.
       const resolved = await Promise.all(
-        collection.assetIds.map((assetId) => assets.get(request.workspaceId, assetId))
+        collection.assetIds.map((assetId) => assets.get(assetId))
       );
       const liveAssets = resolved.filter((a): a is Asset => a !== undefined);
       return reply.code(200).send({ ...collection, assets: liveAssets });
@@ -136,7 +135,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     async (request, reply) => {
       // Delete is idempotent and never leaks existence across workspaces: an
       // unknown / foreign id is a silent no-op that still answers 204.
-      await repo.delete(request.workspaceId, request.params.id);
+      await repo.delete(request.params.id);
       return reply.code(204).send(null);
     }
   );
@@ -154,7 +153,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       // Reject membership for an asset that does not exist in this workspace so
       // collections never accumulate dangling ids. A foreign asset id resolves
       // to a miss here (existence not leaked) -> 422.
-      const asset = await assets.get(request.workspaceId, request.params.assetId);
+      const asset = await assets.get(request.params.assetId);
       if (!asset) {
         return reply.code(422).send({
           error: 'asset_not_found',
@@ -162,9 +161,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
         });
       }
       // mutate throws CollectionNotFoundError (-> 404) for an unknown collection.
-      const collection = await repo.addAsset(
-        request.workspaceId,
-        request.params.id,
+      const collection = await repo.addAsset(request.params.id,
         request.params.assetId
       );
       return reply.code(200).send(collection);
@@ -183,9 +180,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     async (request, reply) => {
       // Removing an absent asset id is a no-op (still 200). An unknown
       // collection id throws CollectionNotFoundError (-> 404).
-      const collection = await repo.removeAsset(
-        request.workspaceId,
-        request.params.id,
+      const collection = await repo.removeAsset(request.params.id,
         request.params.assetId
       );
       return reply.code(200).send(collection);

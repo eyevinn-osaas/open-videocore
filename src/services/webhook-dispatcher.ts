@@ -64,19 +64,19 @@ export class WebhookDispatcher {
   // Returns a promise that resolves when all delivery attempts have settled.
   // Callers SHOULD NOT await it on the request hot path (fire-and-forget); it
   // is exposed so tests can deterministically wait for delivery to complete.
-  dispatch(workspaceId: string, event: WebhookEvent): Promise<void> {
-    return this.deliver(workspaceId, event).catch((err) => {
+  dispatch(event: WebhookEvent): Promise<void> {
+    return this.deliver(event).catch((err) => {
       // The lookup itself failed (e.g. CouchDB unreachable). Best-effort: log
       // and swallow so the originating request is never affected.
       this.log.error(
-        { err: errMessage(err), workspaceId, eventType: event.type },
+        { err: errMessage(err), eventType: event.type },
         'webhook dispatch lookup failed'
       );
     });
   }
 
-  private async deliver(workspaceId: string, event: WebhookEvent): Promise<void> {
-    const registrations = await this.repository.list(workspaceId);
+  private async deliver(event: WebhookEvent): Promise<void> {
+    const registrations = await this.repository.list();
     const matching = registrations.filter((r) => r.events.includes(event.type));
     if (matching.length === 0) {
       return;
