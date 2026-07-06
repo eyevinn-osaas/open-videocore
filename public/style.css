@@ -575,6 +575,109 @@ pre.code-block {
   text-decoration: underline;
 }
 
+/* Pipeline visualization */
+.pipeline {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  flex-wrap: wrap;
+  overflow-x: auto;
+  padding: 4px 2px 8px;
+  margin-bottom: 4px;
+}
+
+.pipeline-node {
+  flex: 0 0 auto;
+  width: 160px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-muted);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pipeline-node-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.pipeline-node-detail {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: 'Courier New', monospace;
+}
+
+.pipeline-badge {
+  display: inline-block;
+  align-self: flex-start;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pipeline-arrow {
+  flex: 0 0 auto;
+  align-self: center;
+  color: var(--text-muted);
+  font-size: 18px;
+  padding: 0 2px;
+  user-select: none;
+}
+
+/* Status colours */
+.pipeline-node--completed { border-left-color: var(--success); }
+.pipeline-badge--completed {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--success);
+}
+
+.pipeline-node--running { border-left-color: var(--accent); }
+.pipeline-badge--running {
+  background: rgba(99, 102, 241, 0.15);
+  color: var(--accent);
+  animation: pipeline-pulse 1.4s ease-in-out infinite;
+}
+
+.pipeline-node--pending { border-left-color: var(--text-muted); }
+.pipeline-badge--pending {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-muted);
+}
+
+.pipeline-node--failed { border-left-color: var(--danger); }
+.pipeline-badge--failed {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--danger);
+}
+
+.pipeline-node--warning { border-left-color: var(--warning); }
+.pipeline-badge--warning {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+}
+
+@keyframes pipeline-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pipeline-badge--running { animation: none; }
+}
+
+/* Wrap gracefully on narrow screens */
+@media (max-width: 640px) {
+  .pipeline-node { width: 100%; }
+  .pipeline-arrow { transform: rotate(90deg); align-self: center; }
+}
+
 /* Utility */
 .mt8 { margin-top: 8px; }
 .mt12 { margin-top: 12px; }

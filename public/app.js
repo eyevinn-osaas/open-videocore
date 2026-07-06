@@ -134,6 +134,117 @@ function renderTags(tags) {
   return tags.map(function(t) { return '<span class="tag">' + escHtml(t) + '</span>'; }).join(' ');
 }
 
+// ─── Pipeline visualization framework ─────────────────────────────────────────
+// Reusable: renders a horizontal row of status nodes connected by arrows.
+// Each stage: { label: string, status: 'pending'|'running'|'completed'|'failed'|'warning', detail?: string }
+// Returns a DOM element. All server-derived text is inserted via textContent.
+function renderPipeline(stages) {
+  const PIPELINE_STATUSES = ['pending', 'running', 'completed', 'failed', 'warning'];
+  const STATUS_LABEL = {
+    pending: 'Pending',
+    running: 'Running',
+    completed: 'Completed',
+    failed: 'Failed',
+    warning: 'Warning'
+  };
+
+  const wrap = document.createElement('div');
+  wrap.className = 'pipeline';
+  wrap.setAttribute('role', 'list');
+  wrap.setAttribute('aria-label', 'Pipeline stages');
+
+  (stages || []).forEach(function(stage, i) {
+    const status = PIPELINE_STATUSES.indexOf(stage && stage.status) !== -1 ? stage.status : 'pending';
+
+    const node = document.createElement('div');
+    node.className = 'pipeline-node pipeline-node--' + status;
+    node.setAttribute('role', 'listitem');
+
+    const label = document.createElement('div');
+    label.className = 'pipeline-node-label';
+    label.textContent = stage && stage.label != null ? String(stage.label) : '';
+    node.appendChild(label);
+
+    const badge = document.createElement('span');
+    badge.className = 'pipeline-badge pipeline-badge--' + status;
+    badge.textContent = STATUS_LABEL[status];
+    if (status === 'running') {
+      badge.setAttribute('aria-live', 'polite');
+    }
+    node.appendChild(badge);
+
+    if (stage && stage.detail != null && stage.detail !== '') {
+      const detail = document.createElement('div');
+      detail.className = 'pipeline-node-detail';
+      detail.textContent = String(stage.detail);
+      node.appendChild(detail);
+    }
+
+    wrap.appendChild(node);
+
+    if (i < (stages || []).length - 1) {
+      const arrow = document.createElement('div');
+      arrow.className = 'pipeline-arrow';
+      arrow.setAttribute('aria-hidden', 'true');
+      arrow.textContent = '→'; // →
+      wrap.appendChild(arrow);
+    }
+  });
+
+  return wrap;
+}
+
+// Derive the transcode pipeline stages from a job + (optional) source asset.
+// Contract sources:
+//   src/data/job-repo.ts   — JobStatus = 'pending'|'running'|'done'|'failed'; JobType includes 'transcode'
+//   src/data/asset-repo.ts — AssetStatus = 'uploading'|'processing'|'ready'|'failed'|'archived'; Asset.renditions?: Rendition[]
+function buildTranscodePipeline(job, asset) {
+  const jobStatus = job && job.status;
+  const hasRenditions = !!(asset && Array.isArray(asset.renditions) && asset.renditions.length);
+  const assetReady = !!(asset && asset.status === 'ready');
+
+  // Upload — the asset exists if the job exists.
+  const upload = { label: 'Upload', status: 'completed' };
+
+  // Transcode (Encore)
+  let transcode;
+  if (jobStatus === 'running') {
+    transcode = {
+      label: 'Transcode (Encore)',
+      status: 'running',
+      detail: (job && job.progress != null) ? job.progress + '%' : undefined
+    };
+  } else if (jobStatus === 'done') {
+    transcode = { label: 'Transcode (Encore)', status: 'completed' };
+  } else if (jobStatus === 'failed') {
+    transcode = { label: 'Transcode (Encore)', status: 'failed' };
+  } else {
+    transcode = { label: 'Transcode (Encore)', status: 'pending' };
+  }
+
+  const transcodeDone = jobStatus === 'done';
+
+  // Package
+  let pkg;
+  if (hasRenditions) {
+    pkg = { label: 'Package', status: 'completed' };
+  } else if (transcodeDone && asset && asset.status === 'processing') {
+    pkg = { label: 'Package', status: 'running' };
+  } else if (jobStatus === 'failed') {
+    pkg = { label: 'Package', status: 'pending' };
+  } else {
+    pkg = { label: 'Package', status: 'pending' };
+  }
+
+  // Ready
+  const ready = {
+    label: 'Ready',
+    status: (assetReady && hasRenditions) ? 'completed' : 'pending'
+  };
+
+  return [upload, transcode, pkg, ready];
+}
+
 function showMsg(container, text, type) {
   type = type || 'info';
   const el = document.createElement('div');
@@ -638,6 +749,22 @@ async function renderJobsTab(container) {
     try {
       const job = await apiFetch('/jobs/' + encodeURIComponent(jobId));
       loader.remove();
+
+      // Transcode pipeline visualization. For transcode jobs, fetch the source
+      // asset to resolve the Package/Ready stages (renditions live on the asset).
+      if (job && job.type === 'transcode') {
+        let asset = null;
+        if (job.assetId) {
+          try {
+            asset = await apiFetch('/assets/' + encodeURIComponent(job.assetId));
+          } catch (_) { /* asset may be gone; pipeline degrades gracefully */ }
+        }
+        const pipelineTitle = document.createElement('div');
+        pipelineTitle.className = 'section-title';
+        pipelineTitle.textContent = 'Transcode pipeline';
+        resultEl.appendChild(pipelineTitle);
+        resultEl.appendChild(renderPipeline(buildTranscodePipeline(job, asset)));
+      }
 
       const kvRows = [
         ['ID', '<span class="text-mono">' + escHtml(job.id) + '</span>'],
@@ -1837,6 +1964,134 @@ async function renderProvisionTab(container) {
       showMsg(resultEl, 'Error: ' + err.message, 'error');
     }
   });
+
+  // ─── Scaler status ───────────────────────────────────────────────────────
+  const scalerSection = document.createElement('div');
+  scalerSection.className = 'section';
+  const scalerTitle = document.createElement('div');
+  scalerTitle.className = 'section-title';
+  scalerTitle.textContent = 'Scaler status';
+  scalerSection.appendChild(scalerTitle);
+
+  const scalerBody = document.createElement('div');
+  scalerBody.className = 'mt8';
+  scalerSection.appendChild(scalerBody);
+  container.appendChild(scalerSection);
+
+  // Show a muted single-line message, reusing the node if possible.
+  const showScalerMessage = function(text) {
+    let msg = scalerBody.querySelector('.scaler-msg');
+    if (!scalerBody.firstChild || !msg) {
+      scalerBody.textContent = '';
+      msg = document.createElement('div');
+      msg.className = 'scaler-msg text-muted';
+      scalerBody.appendChild(msg);
+    }
+    msg.textContent = text;
+  };
+
+  const buildWorkspaceStages = function(ws) {
+    const queueDepth = (ws && typeof ws.queueDepth === 'number') ? ws.queueDepth : 0;
+    const inflightDepth = (ws && typeof ws.inflightDepth === 'number') ? ws.inflightDepth : 0;
+    const instances = (ws && Array.isArray(ws.instances)) ? ws.instances : [];
+    const anyActive = instances.some(function(i) { return i && i.activeJobs > 0; });
+
+    let instStatus;
+    if (instances.length === 0) instStatus = 'pending';
+    else if (anyActive) instStatus = 'running';
+    else instStatus = 'warning';
+
+    return [
+      {
+        label: 'Queue',
+        status: queueDepth > 0 ? 'running' : 'completed',
+        detail: queueDepth + ' waiting'
+      },
+      {
+        label: 'Inflight',
+        status: inflightDepth > 0 ? 'running' : 'completed',
+        detail: inflightDepth + ' active'
+      },
+      {
+        label: 'Instances',
+        status: instStatus,
+        detail: instances.length + '/' + maxInstances
+      }
+    ];
+  };
+
+  // maxInstances captured per render for the closure above.
+  let maxInstances = 0;
+
+  const renderScaler = function(data) {
+    if (!data || data.scalerActive !== true) {
+      showScalerMessage('Scaler not configured (set REDIS_URL)');
+      return;
+    }
+    const workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
+    if (workspaces.length === 0) {
+      showScalerMessage('Scaler active — no jobs running');
+      return;
+    }
+
+    maxInstances = (typeof data.maxInstances === 'number') ? data.maxInstances : 0;
+
+    // Build/update one pipeline block per workspace, keyed by workspaceId.
+    const seen = {};
+    workspaces.forEach(function(ws) {
+      const wsId = (ws && ws.workspaceId != null) ? String(ws.workspaceId) : '';
+      seen[wsId] = true;
+
+      let block = scalerBody.querySelector('[data-ws-block="' + cssEscape(wsId) + '"]');
+      if (!block) {
+        block = document.createElement('div');
+        block.className = 'mt12';
+        block.setAttribute('data-ws-block', wsId);
+        const label = document.createElement('div');
+        label.className = 'section-title';
+        label.style.fontSize = '12px';
+        label.setAttribute('data-ws-label', '');
+        label.textContent = wsId;
+        block.appendChild(label);
+        scalerBody.appendChild(block);
+      }
+
+      // Replace the pipeline in-place (leave the label untouched).
+      const oldPipe = block.querySelector('.pipeline');
+      const newPipe = renderPipeline(buildWorkspaceStages(ws));
+      if (oldPipe) block.replaceChild(newPipe, oldPipe);
+      else block.appendChild(newPipe);
+    });
+
+    // Remove any stale message node and stale workspace blocks.
+    const staleMsg = scalerBody.querySelector('.scaler-msg');
+    if (staleMsg) staleMsg.remove();
+
+    Array.prototype.slice.call(scalerBody.querySelectorAll('[data-ws-block]')).forEach(function(block) {
+      if (!seen[block.getAttribute('data-ws-block')]) block.remove();
+    });
+  };
+
+  const pollScaler = async function() {
+    // Stop polling if this tab's DOM has been detached.
+    if (!scalerSection.isConnected) return;
+    try {
+      const data = await apiFetch('/scaler/status');
+      if (scalerSection.isConnected) renderScaler(data);
+    } catch (e) {
+      if (scalerSection.isConnected) showScalerMessage('Scaler status unavailable: ' + e.message);
+    }
+    if (scalerSection.isConnected) setTimeout(pollScaler, 5000);
+  };
+
+  showScalerMessage('Loading scaler status…');
+  pollScaler();
+}
+
+// Minimal CSS attribute-selector escaper for workspace IDs.
+function cssEscape(value) {
+  if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(value);
+  return String(value).replace(/["\\\]\[]/g, '\\$&');
 }
 
 // ─── Tab renderer registry ───────────────────────────────────────────────────
