@@ -539,13 +539,21 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         }
       }
     },
-    async (_request, reply) => {
+    async (request, reply) => {
       if (!opts.paramStore) {
         return reply.code(501).send({ error: 'parameter store not configured (set PARAMETER_STORE_URL and PARAMETER_STORE_API_KEY)' });
       }
-      const workspaceId = await deriveWorkspaceId(osc);
-      const names = await opts.paramStore.listStackNames(workspaceId);
-      return reply.send(names);
+      try {
+        const workspaceId = await deriveWorkspaceId(osc);
+        const names = await opts.paramStore.listStackNames(workspaceId);
+        return reply.send(names);
+      } catch (err) {
+        // Parameter store is temporarily unavailable — return an empty list
+        // rather than an error so the UI degrades gracefully instead of
+        // showing an error page. The issue is logged for operator visibility.
+        request.log.warn({ err }, 'parameter store unavailable, returning empty stack list');
+        return reply.send([]);
+      }
     }
   );
 
