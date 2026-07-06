@@ -191,12 +191,11 @@ async function redisUrlFrom(
 
 // Derive the deployment's own workspace (tenant) id from the OSC Context.
 // The deployment context key used to namespace stacks in the parameter store.
-// One deployment = one tenant (ADR-003), so a fixed constant is sufficient.
-// DEV_WORKSPACE_ID is kept for local dev so existing stacks stored under that
-// key are still found during the transition.
+// Must match STACK_CONFIG_NAMESPACE in workspace-stack.ts so provision and
+// resolver agree on where configs are stored and found.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 async function deriveWorkspaceId(_osc: Context): Promise<string> {
-  return process.env['DEV_WORKSPACE_ID'] ?? 'default';
+  return STACK_CONFIG_NAMESPACE;
 }
 
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
