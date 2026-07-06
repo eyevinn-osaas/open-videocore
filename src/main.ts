@@ -43,6 +43,7 @@ import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
 import { internalRouter } from './routes/internal.js';
 import { adminRouter } from './routes/admin.js';
+import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
@@ -69,6 +70,21 @@ const app = Fastify({ logger: true });
 
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
+
+// Pass binary/media upload bodies through as a stream for PUT /:id/upload.
+// Registered before plugins so child scopes inherit these parsers.
+// The route handler reads request.body as a Readable and pipes it to MinIO.
+for (const ct of [
+  'application/octet-stream',
+  'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
+  'video/webm', 'video/mpeg', 'video/ogg', 'video/3gpp',
+  'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/flac',
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+]) {
+  app.addContentTypeParser(ct, (_req, payload, done) => {
+    done(null, payload);
+  });
+}
 
 await app.register(fastifySwagger, {
   openapi: {
@@ -438,6 +454,16 @@ const watchFolder =
 // Operational status (issue #16). Unauthenticated; reports background service
 // state without exposing workspace data.
 await app.register(adminRouter, { prefix: '/api/v1/admin', watchFolder });
+
+// Encore auto-scaler status (ADR-006). Unauthenticated read-only introspection
+// of the per-workspace scaler pool for the ops UI. `sharedRedis` is undefined
+// when the scaler is off (no REDIS_URL); the endpoint then reports
+// scalerActive:false with an empty workspace list.
+await app.register(scalerRouter, {
+  prefix: '/api/v1/scaler',
+  redis: sharedRedis,
+  maxInstances: encoreMaxInstances
+});
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
 

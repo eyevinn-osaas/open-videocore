@@ -23,10 +23,11 @@
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
+import type { Readable } from 'node:stream';
 import { z } from 'zod';
 import { InvalidStateTransitionError, type AssetRepository } from '../data/asset-repo.js';
 import { WorkspaceAccessError } from '../data/guard.js';
-import { uploadUrlTtlSeconds, type CompletedPart, type WorkspaceStorage } from '../data/storage.js';
+import { uploadUrlTtlSeconds, SourceTooLargeError, type CompletedPart, type WorkspaceStorage } from '../data/storage.js';
 
 // Factory so production wires a real MinIO-backed WorkspaceStorage per request
 // (bound to the caller's workspace) while tests inject a fake. Mirrors the
@@ -97,6 +98,8 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   fastify,
   opts
 ) => {
+  // Pass any non-JSON body through as a stream so PUT /:id/upload can pipe it
+  // to MinIO. Scoped to this plugin — does not affect other routers.
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const { repository: repo, storageFor } = opts;
 
@@ -118,7 +121,52 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     return repo.get(workspaceId, id);
   }
 
-  // --- Single-part: presigned PUT URL ------------------------------------
+    // --- Proxied upload: PUT /:id/upload -----------------------------------
+  // The client streams the file body directly to the API; the API pipes it
+  // to MinIO. This avoids exposing MinIO presigned URLs to the browser and
+  // means no S3 CORS configuration is required on the bucket.
+  //
+  // The Content-Length header is forwarded to MinIO so it can pre-allocate
+  // the multipart threshold correctly. When the browser omits Content-Length
+  // (e.g. chunked transfer) MinIO still accepts the stream but may buffer.
+  app.put(
+    '/:id/upload',
+    {
+      ...guarded,
+      bodyLimit: 10 * 1024 * 1024 * 1024, // 10 GiB — body is streamed, not buffered
+      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 413: errorSchema } }
+    },
+    async (request, reply) => {
+      const asset = await loadAsset(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const storage = storageFor(request.workspaceId);
+      const objectKey = sourceObjectKey(asset.id);
+      const contentLength = request.headers['content-length']
+        ? Number(request.headers['content-length'])
+        : undefined;
+
+      const maxBytes = 10 * 1024 * 1024 * 1024; // 10 GiB cap
+      try {
+        await storage.putStream(objectKey, request.body as Readable, {
+          maxBytes,
+          totalBytes: contentLength
+        });
+      } catch (err) {
+        if (err instanceof SourceTooLargeError) {
+          return reply.code(413).send({ error: 'payload_too_large', message: err.message });
+        }
+        throw err;
+      }
+
+      await repo.update(request.workspaceId, asset.id, { objectKey, status: 'processing' });
+      opts.onObjectStored?.(request.workspaceId, asset.id, objectKey);
+      return reply.code(200).send({ id: asset.id, status: 'processing' });
+    }
+  );
+
+  // --- Single-part: presigned PUT URL (kept for server-to-server use) ----
   app.post(
     '/:id/upload-url',
     { ...guarded, schema: { params: idParams, response: { 200: urlResponse, 404: errorSchema } } },
