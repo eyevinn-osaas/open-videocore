@@ -47,7 +47,6 @@ type WebhooksRouterOptions = {
 export const webhooksRouter: FastifyPluginAsync<WebhooksRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository;
-  const guarded = { onRequest: app.authenticate };
 
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof WorkspaceAccessError) {
@@ -59,7 +58,7 @@ export const webhooksRouter: FastifyPluginAsync<WebhooksRouterOptions> = async (
   app.post(
     '/',
     {
-      ...guarded,
+      
       schema: {
         body: createBodySchema,
         response: { 201: registrationSchema, 400: errorSchema }
@@ -74,7 +73,7 @@ export const webhooksRouter: FastifyPluginAsync<WebhooksRouterOptions> = async (
   app.get(
     '/',
     {
-      ...guarded,
+      
       schema: {
         response: { 200: z.object({ webhooks: z.array(registrationSchema) }) }
       }
@@ -88,7 +87,7 @@ export const webhooksRouter: FastifyPluginAsync<WebhooksRouterOptions> = async (
   app.delete(
     '/:id',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 204: z.null(), 404: errorSchema }

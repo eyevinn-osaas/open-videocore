@@ -427,11 +427,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     throw err;
   });
 
-  const guarded = { onRequest: app.authenticate };
 
   app.post(
     '/',
-    { ...guarded, schema: { body: createSchema, response: { 201: assetSchema } } },
+    { schema: { body: createSchema, response: { 201: assetSchema } } },
     async (request, reply) => {
       const asset = await repo.create(request.body);
       return reply.code(201).send(asset);
@@ -446,7 +445,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/ingest-url',
     {
-      ...guarded,
+      
       schema: {
         body: ingestUrlSchema,
         response: { 202: ingestAcceptedSchema, 400: errorSchema, 413: errorSchema, 501: errorSchema }
@@ -505,7 +504,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
   app.get(
     '/',
-    { ...guarded, schema: { querystring: listQuerySchema, response: { 200: listSchema } } },
+    { schema: { querystring: listQuerySchema, response: { 200: listSchema } } },
     async (request) => {
       return repo.list(request.query);
     }
@@ -514,7 +513,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.get(
     '/search',
     {
-      ...guarded,
+      
       schema: {
         querystring: z.object({ q: z.string().min(1) }),
         response: { 200: z.object({ items: z.array(assetSchema) }) }
@@ -529,7 +528,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.get(
     '/:id',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 200: assetSchema, 404: errorSchema }
@@ -560,7 +559,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.get(
     '/:id/delivery',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 200: deliverySchema, 404: errorSchema, 501: errorSchema }
@@ -614,7 +613,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/:id/extract-metadata',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: {
@@ -660,7 +659,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/:id/transcode',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         body: transcodeBodySchema,
@@ -723,7 +722,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/:id/thumbnails',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         body: thumbnailsBodySchema,
@@ -798,7 +797,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/:id/export',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         body: exportBodySchema,
@@ -855,7 +854,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/:id/clip',
     {
-      onRequest: app.authenticate,
       schema: {
         params: z.object({ id: z.string() }),
         body: clipBodySchema,
@@ -917,7 +915,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.get(
     '/:id/thumbnails',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: {
@@ -951,7 +949,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.get(
     '/:id/thumbnails/:index',
     {
-      ...guarded,
+      
       schema: { params: z.object({ id: z.string(), index: z.string() }) }
     },
     async (request, reply) => {
@@ -981,7 +979,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.put(
     '/:id/metadata',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         body: metadataSchema,
@@ -1024,7 +1022,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.get(
     '/:id/tracks',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 200: tracksSchema, 404: errorSchema }
@@ -1048,7 +1046,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/:id/audio-tracks',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         body: addAudioTrackSchema,
@@ -1083,7 +1081,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.delete(
     '/:id/audio-tracks/:trackId',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string(), trackId: z.string() }),
         response: { 204: z.null(), 404: errorSchema }
@@ -1113,7 +1111,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/:id/subtitle-tracks',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         body: addSubtitleTrackSchema,
@@ -1161,7 +1159,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.delete(
     '/:id/subtitle-tracks/:trackId',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string(), trackId: z.string() }),
         response: { 204: z.null(), 404: errorSchema }
@@ -1188,7 +1186,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.post(
     '/:id/tags',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         body: z.object({ tags: z.array(tagSchema).min(1).max(128) }),
@@ -1215,7 +1213,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.delete(
     '/:id/tags/:tag',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string(), tag: z.string().min(1) }),
         response: { 200: assetSchema, 404: errorSchema }
@@ -1240,7 +1238,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.patch(
     '/:id',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         body: updateSchema,
@@ -1259,7 +1257,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.delete(
     '/:id',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 204: z.null(), 404: errorSchema, 409: errorSchema }

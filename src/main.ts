@@ -14,7 +14,7 @@ import {
 } from 'fastify-type-provider-zod';
 import { provisionRouter } from './routes/provision.js';
 import { OperationStore } from './services/operation-store.js';
-import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.js';import { registerAuth } from './auth/middleware.js';
+import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
@@ -137,21 +137,9 @@ await app.register(helmet, {
 // On OSC this is injected at runtime; locally set it in .env.
 const oscContext = new Context();
 
-// Auth: decorate request.workspaceId and register the `authenticate`
-// preHandler. Workspace-scoped routers attach it via { onRequest: app.authenticate }.
-registerAuth(app);
-
 // Health endpoints are intentionally unauthenticated for liveness probing.
 app.get('/health', async () => ({ status: 'ok', service: 'open-videocore-api' }));
 app.get('/healthz', async () => ({ status: 'ok' }));
-
-// Dev config: expose the local OSC token so the UI can authenticate against the
-// local server without requiring the OSC auth wall. Only returned when
-// OSC_ACCESS_TOKEN is set (i.e. local dev). In production the auth wall is in
-// front of this process and this endpoint is irrelevant.
-app.get('/api/v1/dev-config', async () => ({
-  token: process.env['OSC_ACCESS_TOKEN'] ?? ''
-}));
 
 // OSC parameter store (issue #31, ADR-002). Persists provisioned stack
 // coordinates so the API can rediscover a named stack at runtime. Configured
@@ -189,18 +177,13 @@ const stackResolver = new WorkspaceStackResolver({
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? ''
 });
 
-// Resolve per-request connections AFTER authentication. The auth preHandler
-// (attached per-router via { onRequest: app.authenticate }) sets
-// request.workspaceId; this global preHandler then warms the resolver cache and
-// attaches the resolved connections so handlers (and the sync StorageFactory
-// below) can read them synchronously.
+// Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
+// the app trusts every request that reaches it.
 app.decorateRequest('connections', null);
 app.addHook('preHandler', async (request) => {
-  if (request.authenticated) {
-    const stackHeader = request.headers['x-stack-name'];
-    const stackName = typeof stackHeader === 'string' && stackHeader.length > 0 ? stackHeader : undefined;
-    request.connections = await stackResolver.resolve(stackName);
-  }
+  const stackHeader = request.headers['x-stack-name'];
+  const stackName = typeof stackHeader === 'string' && stackHeader.length > 0 ? stackHeader : undefined;
+  request.connections = await stackResolver.resolve(stackName);
 });
 
 const operationStore = new OperationStore();

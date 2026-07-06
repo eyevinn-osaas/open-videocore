@@ -92,14 +92,13 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const { stackResolver, watchFolder } = opts;
 
-  const guarded = { onRequest: app.authenticate };
 
   // List the two configured buckets for the caller's workspace.
   //   200 — [{ name, role }, ...]
   //   501 — object storage not configured on this workspace's stack
   app.get(
     '/buckets',
-    { ...guarded, schema: { response: { 200: bucketsSchema, 501: errorSchema } } },
+    {  schema: { response: { 200: bucketsSchema, 501: errorSchema } } },
     async (request, reply) => {
       const conns = request.connections;
       if (!conns?.storageClient) {
@@ -121,7 +120,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   app.post(
     '/buckets',
     {
-      ...guarded,
+      
       schema: {
         body: createBucketSchema,
         response: { 201: createdBucketSchema, 409: errorSchema, 501: errorSchema }
@@ -158,7 +157,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   app.get(
     '/buckets/:bucket/watch-folder',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ bucket: z.string().min(1).max(256) }),
         response: { 200: watchFolderBucketSchema }
@@ -183,7 +182,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   app.post(
     '/buckets/:bucket/watch-folder/toggle',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ bucket: z.string().min(1).max(256) }),
         response: { 200: watchFolderBucketSchema, 501: errorSchema }
@@ -224,7 +223,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   app.get(
     '/buckets/:bucket/objects',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ bucket: z.string().min(1).max(256) }),
         querystring: listQuerySchema,
@@ -267,7 +266,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   app.delete(
     '/buckets/:bucket/objects/*',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ bucket: z.string().min(1).max(256), '*': z.string().min(1).max(1024) }),
         response: { 204: z.null(), 403: errorSchema, 501: errorSchema }

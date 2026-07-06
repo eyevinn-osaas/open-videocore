@@ -19,21 +19,6 @@ function escHtml(str) {
     .replace(/'/g, '&#39;');
 }
 
-// ─── Dev auth token ──────────────────────────────────────────────────────────
-// Fetched once at startup from /api/v1/dev-config (unauthenticated). In
-// production the OSC auth wall is upstream and this endpoint is a no-op.
-
-let _devToken = '';
-(async function fetchDevToken() {
-  try {
-    const res = await fetch('/api/v1/dev-config');
-    if (res.ok) {
-      const cfg = await res.json();
-      _devToken = cfg.token || '';
-    }
-  } catch (_) { /* ignore — running behind OSC auth wall */ }
-})();
-
 // ─── Stack selector ──────────────────────────────────────────────────────────
 
 const STACK_KEY = 'ovc_stack';
@@ -90,7 +75,6 @@ async function apiFetch(path, options = {}) {
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
-    ...(_devToken ? { 'Authorization': 'Bearer ' + _devToken } : {}),
     ...(options.headers || {}),
   };
   const res = await fetch(API_BASE + path, { ...options, headers });
@@ -381,8 +365,7 @@ async function renderAssetsTab(container) {
         headers: {
           'Content-Type': file.type || 'application/octet-stream',
           'Content-Length': String(file.size),
-          'X-Stack-Name': getActiveStack(),
-          ...(_devToken ? { 'Authorization': 'Bearer ' + _devToken } : {})
+          'X-Stack-Name': getActiveStack()
         }
       });
       if (!uploadRes.ok) {

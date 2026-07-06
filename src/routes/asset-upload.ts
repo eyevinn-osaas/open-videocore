@@ -117,7 +117,6 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     throw err;
   });
 
-  const guarded = { onRequest: app.authenticate };
 
   // Look the asset up. Returns undefined (-> 404) for a missing asset.
   async function loadAsset(id: string) {
@@ -135,7 +134,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   app.put(
     '/:id/upload',
     {
-      ...guarded,
+      
       bodyLimit: 10 * 1024 * 1024 * 1024, // 10 GiB — body is streamed, not buffered
       schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 413: errorSchema } }
     },
@@ -172,7 +171,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   // --- Single-part: presigned PUT URL (kept for server-to-server use) ----
   app.post(
     '/:id/upload-url',
-    { ...guarded, schema: { params: idParams, response: { 200: urlResponse, 404: errorSchema } } },
+    {  schema: { params: idParams, response: { 200: urlResponse, 404: errorSchema } } },
     async (request, reply) => {
       const asset = await loadAsset(request.params.id);
       if (!asset) {
@@ -190,7 +189,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   app.post(
     '/:id/multipart/initiate',
     {
-      ...guarded,
+      
       schema: { params: idParams, response: { 200: initiateResponse, 404: errorSchema } }
     },
     async (request, reply) => {
@@ -211,7 +210,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   app.get(
     '/:id/multipart/:uploadId/part-url',
     {
-      ...guarded,
+      
       schema: {
         params: multipartParams,
         querystring: z.object({ partNumber: partNumberSchema }),
@@ -242,7 +241,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   app.post(
     '/:id/multipart/:uploadId/complete',
     {
-      ...guarded,
+      
       schema: {
         params: multipartParams,
         body: completeBody,
@@ -269,7 +268,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   app.delete(
     '/:id/multipart/:uploadId',
     {
-      ...guarded,
+      
       schema: { params: multipartParams, response: { 204: z.null(), 404: errorSchema } }
     },
     async (request, reply) => {
@@ -291,7 +290,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   app.post(
     '/:id/upload-complete',
     {
-      ...guarded,
+      
       schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema } }
     },
     async (request, reply) => {

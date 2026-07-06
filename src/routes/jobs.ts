@@ -39,12 +39,11 @@ type JobsRouterOptions = {
 export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository ?? new InMemoryJobRepository();
-  const guarded = { onRequest: app.authenticate };
 
   app.get(
     '/',
     {
-      ...guarded,
+      
       schema: {
         querystring: z.object({
           limit: z.coerce.number().min(1).max(100).default(50),
@@ -65,7 +64,7 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
   app.delete(
     '/:id',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 200: jobSchema, 404: errorSchema }
@@ -85,7 +84,7 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
   app.get(
     '/:id',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 200: jobSchema, 404: errorSchema }

@@ -64,7 +64,6 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository;
   const assets = opts.assetRepository;
-  const guarded = { onRequest: app.authenticate };
 
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof WorkspaceAccessError) {
@@ -79,7 +78,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   app.post(
     '/',
     {
-      ...guarded,
+      
       schema: { body: createBodySchema, response: { 201: collectionSchema, 400: errorSchema } }
     },
     async (request, reply) => {
@@ -91,7 +90,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   app.get(
     '/',
     {
-      ...guarded,
+      
       schema: { response: { 200: z.object({ collections: z.array(collectionSchema) }) } }
     },
     async (request, reply) => {
@@ -103,7 +102,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   app.get(
     '/:id',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 200: collectionWithAssetsSchema, 404: errorSchema }
@@ -126,7 +125,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   app.delete(
     '/:id',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string() }),
         response: { 204: z.null(), 404: errorSchema }
@@ -143,7 +142,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   app.put(
     '/:id/assets/:assetId',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string(), assetId: z.string() }),
         response: { 200: collectionSchema, 404: errorSchema, 422: errorSchema }
@@ -171,7 +170,7 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   app.delete(
     '/:id/assets/:assetId',
     {
-      ...guarded,
+      
       schema: {
         params: z.object({ id: z.string(), assetId: z.string() }),
         response: { 200: collectionSchema, 404: errorSchema }

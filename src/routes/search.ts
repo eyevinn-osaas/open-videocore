@@ -142,7 +142,6 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
   app.get(
     '/',
     {
-      onRequest: app.authenticate,
       schema: {
         querystring: searchQuerySchema,
         response: { 200: searchResultSchema, 400: errorSchema }
