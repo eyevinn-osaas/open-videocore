@@ -42,6 +42,7 @@ import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
 import { internalRouter } from './routes/internal.js';
+import { InMemoryPipelineRepository } from './data/pipeline-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
@@ -355,6 +356,31 @@ const envMinioClient = process.env['MINIO_URL']
   : undefined;
 const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : undefined;
 
+// HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
+// queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs and
+// receive a completion callback. Wiring is enabled only when REDIS_URL is set
+// (the Valkey queue is the load-bearing dependency); otherwise the packaging
+// trigger and the packager-callback route respond as not-configured.
+function buildPackaging(): PackagingService | undefined {
+  if (!sharedRedis) {
+    app.log.warn('REDIS_URL not set — HLS/DASH packaging disabled');
+    return undefined;
+  }
+  return new PackagingService({
+    assets: assetRepository,
+    queue: makeOscPackagerQueue(sharedRedis),
+    publicBaseUrl: packagingPublicBaseUrl()
+  });
+}
+
+const packaging = buildPackaging();
+
+// PipelineExecution tracking (PipelineExecution feature). In-memory: executions
+// are ephemeral orchestration state advanced by OSC completion callbacks. Shared
+// between the assets router (creates executions) and the internal router
+// (advances them from transcode/package callbacks).
+const pipelineRepository = new InMemoryPipelineRepository();
+
 // Assets router also owns POST /ingest-url (issue #5) and POST /:id/transcode
 // (issue #8). It shares the same job repository so a job created here is
 // readable by the jobs router. The per-workspace storage factory + S3 reader
@@ -372,31 +398,13 @@ await app.register(assetsRouter, {
   thumbnailExtractor,
   thumbnailPublicBaseUrl: process.env['THUMBNAIL_PUBLIC_BASE_URL'],
   rewrapRunner,
-  clipRunner
+  clipRunner,
+  packaging,
+  packagingRedis: sharedRedis,
+  pipelineRepository
 });
 
 await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository, redis: sharedRedis });
-
-// HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
-// queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs and
-// receive a completion callback. Wiring is enabled only when REDIS_URL is set
-// (the Valkey queue is the load-bearing dependency); otherwise the packaging
-// trigger and the packager-callback route respond as not-configured. The
-// PackagingService is exposed to issue #8's Encore callback handler via the
-// PackagingTrigger interface so the two features stay decoupled.
-function buildPackaging(): PackagingService | undefined {
-  if (!sharedRedis) {
-    app.log.warn('REDIS_URL not set — HLS/DASH packaging disabled');
-    return undefined;
-  }
-  return new PackagingService({
-    assets: assetRepository,
-    queue: makeOscPackagerQueue(sharedRedis),
-    publicBaseUrl: packagingPublicBaseUrl()
-  });
-}
-
-const packaging = buildPackaging();
 
 // Internal OSC callbacks. Unauthenticated by design — see routes/internal.ts.
 // Hosts both the issue #9 packager-callback and the issue #8 encore-callback
@@ -407,7 +415,9 @@ await app.register(internalRouter, {
   packaging,
   jobRepository,
   repository: assetRepository,
-  webhookDispatcher
+  webhookDispatcher,
+  redis: sharedRedis,
+  pipelineRepository
 });
 
 // On object storage (upload-complete OR watch-folder ingest), fire-and-forget
