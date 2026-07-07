@@ -368,7 +368,7 @@ function loadingEl() {
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
 
-const TABS = ['assets', 'jobs', 'pipelines', 'collections', 'search', 'webhooks', 'storage', 'provision'];
+const TABS = ['assets', 'jobs', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
@@ -799,21 +799,43 @@ async function showAssetDetail(id, detailPanel) {
     ].join('');
     body.appendChild(actionsDiv);
 
-    runDiv.querySelector('#btn-run-pipeline').addEventListener('click', async function() {
+    var runBtn = runDiv.querySelector('#btn-run-pipeline');
+    runBtn.addEventListener('click', async function() {
       actionMsg.innerHTML = '';
       var pipeline = pipelineSel.value;
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipeline) !== -1;
       var body2 = { pipeline: pipeline };
       if (hasTranscode) body2.profile = profileSel.value;
+
+      // Loading state: disable the button (and selects) and show progress so the
+      // user gets immediate feedback that the dispatch is in flight.
+      var prevLabel = runBtn.textContent;
+      runBtn.disabled = true;
+      pipelineSel.disabled = true;
+      profileSel.disabled = true;
+      runBtn.textContent = 'Running…';
+      showMsg(actionMsg, 'Queuing pipeline…', 'info');
+
       try {
         var exec = await apiFetch('/assets/' + encodeURIComponent(id) + '/execute', {
           method: 'POST',
           body: JSON.stringify(body2)
         });
-        showMsg(actionMsg, 'Pipeline "' + escHtml(exec.pipelineName) + '" started (execution ' + escHtml(exec.id) + ').', 'success');
+        actionMsg.innerHTML = '';
+        // showMsg inserts via textContent, so pass the raw server strings (no escHtml).
+        showMsg(actionMsg, 'Pipeline "' + exec.pipelineName + '" queued (execution ' + exec.id + ').', 'success');
+        // Refresh the executions/status area so the queued job appears immediately.
         await renderExecutions(id, execDiv);
       } catch (err) {
+        actionMsg.innerHTML = '';
+        // err.message carries the API error detail (apiFetch extracts body.error/message).
         showMsg(actionMsg, 'Error: ' + err.message, 'error');
+      } finally {
+        runBtn.disabled = false;
+        pipelineSel.disabled = false;
+        profileSel.disabled = false;
+        runBtn.textContent = prevLabel;
+        updateProfileVisibility();
       }
     });
 
@@ -1605,6 +1627,175 @@ async function renderSearchTab(container) {
 // ─── WEBHOOKS TAB ────────────────────────────────────────────────────────────
 
 const WEBHOOK_EVENTS = ['asset.ready', 'transcode.complete', 'package.complete', 'asset.failed'];
+
+// ─── PROFILES TAB ────────────────────────────────────────────────────────────
+
+// Encore transcoding profiles (issue #84). Profiles are persisted in CouchDB
+// and served to Encore via the public GET /api/v1/profiles/index.yml. This tab
+// lets an operator list profiles, view their YAML, create new ones, seed the
+// store from the default Encore index (bootstrap), and delete profiles.
+async function renderProfilesTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Transcoding profiles';
+  container.appendChild(title);
+
+  // Create form.
+  const createSection = document.createElement('div');
+  createSection.className = 'section';
+  createSection.innerHTML = [
+    '<div class="section-title">Add profile</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="pf-name">Name</label>',
+    '    <input type="text" id="pf-name" placeholder="program" />',
+    '  </div>',
+    '</div>',
+    '<div class="form-field mt8 grow">',
+    '  <label for="pf-yaml">Profile YAML</label>',
+    '  <textarea id="pf-yaml" rows="8" placeholder="name: program&#10;description: ..." style="width:100%;font-family:monospace;"></textarea>',
+    '</div>',
+    '<button id="pf-create-btn" class="mt8">Create</button>',
+    '<div id="pf-create-msg"></div>',
+  ].join('');
+  container.appendChild(createSection);
+
+  // List + bootstrap.
+  const listSection = document.createElement('div');
+  listSection.className = 'section';
+  listSection.innerHTML = [
+    '<div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">',
+    '  <span>Configured profiles</span>',
+    '  <span>',
+    '    <button id="pf-bootstrap" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Bootstrap from default index</button>',
+    '    <button id="pf-refresh" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Refresh</button>',
+    '  </span>',
+    '</div>',
+    '<div id="pf-bootstrap-msg"></div>',
+    '<div id="pf-list-wrap"></div>',
+    '<div id="pf-yaml-view"></div>',
+  ].join('');
+  container.appendChild(listSection);
+
+  async function loadProfiles() {
+    const wrap = listSection.querySelector('#pf-list-wrap');
+    wrap.innerHTML = '';
+    const loader = loadingEl();
+    wrap.appendChild(loader);
+    let items = [];
+    try {
+      const res = await apiFetch('/profiles');
+      items = res && Array.isArray(res.items) ? res.items : [];
+    } catch (err) {
+      loader.remove();
+      showMsg(wrap, 'Failed: ' + err.message, 'error');
+      return;
+    }
+    loader.remove();
+    if (items.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No profiles configured. Use Bootstrap to seed from the default Encore index.';
+      wrap.appendChild(empty);
+      return;
+    }
+    const rows = items.map(function(p) {
+      return '<tr>' +
+        '<td class="cell-id">' + escHtml(p.name) + '</td>' +
+        '<td>' + escHtml(fmtDate(p.updatedAt)) + '</td>' +
+        '<td>' +
+        '<button class="btn-ghost pf-view-btn" data-name="' + escHtml(p.name) + '" style="font-size:12px;padding:3px 8px;">View YAML</button> ' +
+        '<button class="btn-danger pf-delete-btn" data-name="' + escHtml(p.name) + '" style="font-size:12px;padding:3px 8px;">Delete</button>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'table-wrap';
+    tableWrap.innerHTML = '<table>' +
+      '<thead><tr><th>Name</th><th>Updated</th><th>Actions</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+      '</table>';
+    wrap.appendChild(tableWrap);
+
+    tableWrap.querySelectorAll('.pf-view-btn').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        const view = listSection.querySelector('#pf-yaml-view');
+        view.innerHTML = '';
+        try {
+          const p = await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name));
+          const box = document.createElement('div');
+          box.className = 'section';
+          const pre = document.createElement('pre');
+          pre.style.whiteSpace = 'pre-wrap';
+          pre.style.fontFamily = 'monospace';
+          // textContent — never innerHTML — so YAML content cannot inject markup.
+          pre.textContent = p.yaml || '';
+          const head = document.createElement('div');
+          head.className = 'section-title';
+          head.textContent = 'YAML — ' + p.name;
+          box.appendChild(head);
+          box.appendChild(pre);
+          view.appendChild(box);
+        } catch (err) {
+          showMsg(view, 'Error: ' + err.message, 'error');
+        }
+      });
+    });
+
+    tableWrap.querySelectorAll('.pf-delete-btn').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        if (!confirm('Delete profile ' + btn.dataset.name + '?')) return;
+        try {
+          await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name), { method: 'DELETE' });
+          listSection.querySelector('#pf-yaml-view').innerHTML = '';
+          loadProfiles();
+        } catch (err) {
+          alert('Error: ' + err.message);
+        }
+      });
+    });
+  }
+
+  createSection.querySelector('#pf-create-btn').addEventListener('click', async function() {
+    const name = createSection.querySelector('#pf-name').value.trim();
+    const yaml = createSection.querySelector('#pf-yaml').value;
+    const msgEl = createSection.querySelector('#pf-create-msg');
+    msgEl.innerHTML = '';
+    if (!name) { showMsg(msgEl, 'Name is required.', 'error'); return; }
+    if (!yaml.trim()) { showMsg(msgEl, 'YAML content is required.', 'error'); return; }
+    try {
+      await apiFetch('/profiles', { method: 'POST', body: JSON.stringify({ name: name, yaml: yaml }) });
+      showMsg(msgEl, 'Profile created.', 'success');
+      createSection.querySelector('#pf-name').value = '';
+      createSection.querySelector('#pf-yaml').value = '';
+      loadProfiles();
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  listSection.querySelector('#pf-bootstrap').addEventListener('click', async function() {
+    const msgEl = listSection.querySelector('#pf-bootstrap-msg');
+    msgEl.innerHTML = '';
+    if (!confirm('Seed profiles from the default Encore profile index?')) return;
+    try {
+      const res = await apiFetch('/profiles/bootstrap', { method: 'POST' });
+      if (res && res.skipped) {
+        showMsg(msgEl, 'Profiles already exist — bootstrap skipped.', 'success');
+      } else {
+        showMsg(msgEl, 'Seeded ' + (res ? res.seeded : 0) + ' profile(s).', 'success');
+      }
+      loadProfiles();
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  listSection.querySelector('#pf-refresh').addEventListener('click', loadProfiles);
+  await loadProfiles();
+}
+
+// ─── WEBHOOKS TAB ────────────────────────────────────────────────────────────
 
 async function renderWebhooksTab(container) {
   const title = document.createElement('h2');
@@ -2546,11 +2737,150 @@ function renderPipelinesTab(container) {
   container.appendChild(wrap);
 }
 
+// ─── TRANSCODERS TAB ───────────────────────────────────────────────────────────
+
+// Human-readable relative time for a lastIdleAt epoch-ms value ("X minutes ago").
+function relativeTime(epochMs) {
+  if (epochMs == null || isNaN(epochMs)) return '—';
+  const diffMs = Date.now() - Number(epochMs);
+  if (diffMs < 0) return 'just now';
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 5) return 'just now';
+  if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's') + ' ago';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min + ' minute' + (min === 1 ? '' : 's') + ' ago';
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return hr + ' hour' + (hr === 1 ? '' : 's') + ' ago';
+  const day = Math.floor(hr / 24);
+  return day + ' day' + (day === 1 ? '' : 's') + ' ago';
+}
+
+// Derive per-instance job capacity from the pool records rather than hardcoding.
+// The scaler treats an instance as "busy" at JOBS_PER_INSTANCE (=1) but that
+// constant is not on the wire; instead we infer capacity as the highest
+// activeJobs observed across the pool, floored at 1 so a fully-idle pool still
+// reports a sane capacity of 1.
+function deriveInstanceCapacity(instances) {
+  let cap = 1;
+  (instances || []).forEach(function(inst) {
+    const a = Number(inst.activeJobs) || 0;
+    if (a > cap) cap = a;
+  });
+  return cap;
+}
+
+// Green (idle) / amber (partial) / red (at capacity) load class for an instance.
+function loadClass(activeJobs, capacity) {
+  const a = Number(activeJobs) || 0;
+  if (a <= 0) return 'load-idle';
+  if (a >= capacity) return 'load-full';
+  return 'load-partial';
+}
+
+async function renderTranscodersTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Transcoders';
+  container.appendChild(title);
+
+  const section = document.createElement('div');
+  section.className = 'section';
+  section.innerHTML = [
+    '<div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">',
+    '  <span id="tc-summary">Encore scaler pool</span>',
+    '  <button id="tc-refresh" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Refresh</button>',
+    '</div>',
+    '<div id="tc-wrap"></div>',
+  ].join('');
+  container.appendChild(section);
+
+  const summaryEl = section.querySelector('#tc-summary');
+  const wrap = section.querySelector('#tc-wrap');
+
+  async function load() {
+    wrap.innerHTML = '';
+    const loader = loadingEl();
+    wrap.appendChild(loader);
+
+    let status;
+    try {
+      status = await apiFetch('/scaler/status');
+    } catch (err) {
+      loader.remove();
+      showMsg(wrap, 'Failed to load scaler status: ' + err.message, 'error');
+      summaryEl.textContent = 'Encore scaler pool';
+      return;
+    }
+    loader.remove();
+
+    const workspaces = (status && status.workspaces) || [];
+    const maxInstances = status && typeof status.maxInstances === 'number' ? status.maxInstances : 0;
+    const scalerActive = !!(status && status.scalerActive);
+
+    // Flatten every instance across returned workspaces into one grid, keeping a
+    // reference to its owning workspaceId for context.
+    const flatInstances = [];
+    workspaces.forEach(function(ws) {
+      (ws.instances || []).forEach(function(inst) {
+        flatInstances.push({ inst: inst, workspaceId: ws.workspaceId });
+      });
+    });
+
+    // Pool-capacity context using maxInstances from the response.
+    summaryEl.textContent = flatInstances.length + ' of ' + maxInstances +
+      ' instance' + (maxInstances === 1 ? '' : 's') + ' active';
+
+    if (!scalerActive || flatInstances.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No active transcoder instances.';
+      wrap.appendChild(empty);
+      return;
+    }
+
+    const capacity = deriveInstanceCapacity(flatInstances.map(function(f) { return f.inst; }));
+
+    const grid = document.createElement('div');
+    grid.className = 'tc-grid';
+    grid.innerHTML = flatInstances.map(function(f) {
+      const inst = f.inst;
+      const active = Number(inst.activeJobs) || 0;
+      const cls = loadClass(active, capacity);
+      const label = active <= 0 ? 'idle' : (active >= capacity ? 'at capacity' : 'partial');
+      return [
+        '<div class="tc-card">',
+        '  <div class="tc-card-head">',
+        '    <span class="tc-id text-mono">' + escHtml(inst.instanceId) + '</span>',
+        '    <span class="tc-load ' + cls + '" title="' + escHtml(label) + '">',
+        '      <span class="tc-dot"></span>' + escHtml(String(active)) + ' / ' + escHtml(String(capacity)),
+        '    </span>',
+        '  </div>',
+        '  <div class="tc-row">',
+        '    <a href="' + escHtml(inst.url) + '" target="_blank" rel="noopener" class="text-mono tc-url">' + escHtml(inst.url) + '</a>',
+        '  </div>',
+        '  <div class="tc-meta">',
+        '    <span class="text-muted">Workspace</span> <span class="text-mono">' + escHtml(f.workspaceId) + '</span>',
+        '  </div>',
+        '  <div class="tc-meta">',
+        '    <span class="text-muted">Last idle</span> ' + escHtml(relativeTime(inst.lastIdleAt)),
+        '  </div>',
+        '</div>',
+      ].join('');
+    }).join('');
+    wrap.appendChild(grid);
+  }
+
+  section.querySelector('#tc-refresh').addEventListener('click', load);
+  await load();
+}
+
 // ─── Tab renderer registry ───────────────────────────────────────────────────
 
 TAB_RENDERERS['assets'] = renderAssetsTab;
 TAB_RENDERERS['jobs'] = renderJobsTab;
+TAB_RENDERERS['transcoders'] = renderTranscodersTab;
 TAB_RENDERERS['pipelines'] = renderPipelinesTab;
+TAB_RENDERERS['profiles'] = renderProfilesTab;
 TAB_RENDERERS['collections'] = renderCollectionsTab;
 TAB_RENDERERS['search'] = renderSearchTab;
 TAB_RENDERERS['webhooks'] = renderWebhooksTab;

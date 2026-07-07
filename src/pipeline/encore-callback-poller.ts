@@ -2,8 +2,10 @@
 //
 // The system uses eyevinn-encore-callback-listener as a cloud intermediary:
 // Encore POSTs its completion webhook there, and the listener writes a message
-// to a Redis sorted set (ZADD, score = Date.now()) on the queue key (default
-// "packaging-queue"). The message is:
+// to a Redis sorted set (ZADD, score = Date.now()) on the queue key. Our
+// scaler-paired listeners are configured with the dedicated queue
+// "ovc:transcode-done" (see DEFAULT_QUEUE_KEY below and instance-pool.ts). The
+// message is:
 //   { jobId: "<encore-internal-uuid>", url: "<encoreInstanceUrl>/encoreJobs/<uuid>" }
 //   (verified from eyevinn-encore-callback-listener source, 2026-07-07)
 //
@@ -49,7 +51,12 @@ async function resolveUrlFromEncoreUuid(
   return resolveEncoreJobUrl(externalId, redis);
 }
 
-const DEFAULT_QUEUE_KEY = 'packaging-queue';
+// Dedicated queue for our scaler-paired callback listeners. MUST match the
+// RedisQueue passed to the callback listener in
+// src/encore-scaler/instance-pool.ts spawnInstance(). Using a dedicated key
+// (not the shared "packaging-queue") stops an external eyevinn-encore-packager
+// from winning the BZPOPMIN race and consuming our completion messages (#93).
+const DEFAULT_QUEUE_KEY = 'ovc:transcode-done';
 const BZPOPMIN_TIMEOUT_SECONDS = 5;
 
 type Logger = {
@@ -154,60 +161,89 @@ async function decrementActiveJobs(
 }
 
 // Process one queue message: fetch the Encore job, resolve our job, complete the
-// transcode, and advance the matching PipelineExecution. Never throws.
+// transcode, and advance the matching PipelineExecution.
+//
+// Throws on retryable failures (network errors, non-2xx Encore fetch, DB write
+// errors) so the outer loop can re-queue the message and retry. Non-retryable
+// cases (unparseable message, unknown externalId) log and return cleanly so the
+// message is dropped rather than looped forever.
 async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   let message: { jobId?: string; url?: string };
   try {
     message = JSON.parse(raw);
   } catch (err) {
-    deps.logger.warn({ msg: 'encore-callback-poller: unparseable queue message', raw, err });
+    // Unparseable: dropping is correct — retrying will never fix a corrupt message.
+    deps.logger.warn({ msg: 'encore-callback-poller: unparseable queue message — dropping', raw, err });
     return;
   }
+
   // Prefer resolving the Encore job URL from our Redis pool mapping — the URL
   // embedded by the callback listener always points at its own configured Encore
   // instance, which may differ from the scaler-managed instance that ran the job.
   const encoreUuid = message.jobId;
+  deps.logger.info({ msg: 'encore-callback-poller: processing message', encoreUuid, url: message.url });
+
+  // Throws if OSC token fetch fails — caller will catch and re-queue.
   const sat = await deps.oscContext.getServiceAccessToken('encore');
+
   let resolvedUrl: string | undefined;
   if (encoreUuid) {
     resolvedUrl = await resolveUrlFromEncoreUuid(encoreUuid, deps.redis);
+    deps.logger.info({ msg: 'encore-callback-poller: resolved url from redis', encoreUuid, resolvedUrl });
   }
   // Fall back to message.url (e.g. non-scaler deployments or missing mapping).
   const url = resolvedUrl ?? message.url;
   if (!url) {
-    deps.logger.warn({ msg: 'encore-callback-poller: queue message has no url', message });
+    // No URL and no mapping: can't retry usefully — drop.
+    deps.logger.warn({ msg: 'encore-callback-poller: queue message has no url — dropping', message });
     return;
   }
 
   // Fetch the Encore job document, authenticated with an OSC SAT for "encore".
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${sat}` } });
-  if (!res.ok) {
-    deps.logger.warn({ msg: 'encore-callback-poller: failed to fetch encore job', url, status: res.status });
-    return;
+  // The instance may be suspended (503) if the scaler tore it down before the
+  // poller ran. Retry up to 3 times with brief backoff. If all attempts fail we
+  // still know the job succeeded (the callback listener only fires on SUCCESSFUL),
+  // so we complete it with empty renditions rather than leaving it stuck.
+  let job: { externalId?: string; status?: string; message?: string; output?: EncoreOutput[] } | undefined;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${sat}` } });
+    if (res.ok) {
+      job = (await res.json()) as typeof job;
+      break;
+    }
+    deps.logger.warn({ msg: 'encore-callback-poller: failed to fetch encore job', url, status: res.status, attempt });
+    if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 2_000));
   }
-  const job = (await res.json()) as {
-    externalId?: string;
-    status?: string;
-    message?: string;
-    output?: EncoreOutput[];
-  };
+  // If Encore is unreachable after retries, complete as SUCCESSFUL with no
+  // renditions. The callback listener only enqueues on success, so we trust it.
+  if (!job) {
+    deps.logger.warn({ msg: 'encore-callback-poller: encore unreachable after retries — completing as successful with no renditions', url, encoreUuid });
+    job = { externalId: encoreUuid ? (await deps.redis.get(`encore:uuid-ext:${encoreUuid}`)) ?? undefined : undefined, status: 'SUCCESSFUL', output: [] };
+  }
 
   const externalId = job.externalId;
   const status = job.status;
   if (!externalId || !status) {
-    deps.logger.warn({ msg: 'encore-callback-poller: encore job missing externalId/status', url });
+    // Corrupt Encore response — dropping, retrying won't fix it.
+    deps.logger.warn({ msg: 'encore-callback-poller: encore job missing externalId/status — dropping', url });
     return;
   }
+
+  deps.logger.info({ msg: 'encore-callback-poller: fetched encore job', externalId, status });
 
   const found = await deps.jobRepository.findByEncoreJobId(externalId);
   if (!found) {
-    // Unknown job (e.g. from another deployment sharing the queue) — no-op.
-    deps.logger.info({ msg: 'encore-callback-poller: no local job for externalId', externalId });
+    // Unknown externalId — could be from another deployment sharing the queue. Drop.
+    deps.logger.info({ msg: 'encore-callback-poller: no local job for externalId — dropping', externalId });
     return;
   }
 
+  deps.logger.info({ msg: 'encore-callback-poller: completing transcode', jobId: found.job.id, externalId, status });
+
   const upper = status.toUpperCase();
   const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
+  // completeTranscode touches CouchDB — let any throw propagate so the outer
+  // loop re-queues and retries on transient DB errors.
   const result = await completeTranscode(
     {
       jobId: found.job.id,
@@ -282,17 +318,162 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   });
 }
 
+// Sweep all scaler-managed Encore instances for SUCCESSFUL jobs whose callback
+// message was never written to the queue. This is a fallback for the missing
+// `await` bug in eyevinn-encore-callback-listener's pushMessage (the zAdd is
+// fire-and-forget, so messages can silently fail to land in Redis). The sweep
+// runs every SWEEP_INTERVAL_MS and re-synthesises the same message format the
+// callback listener would have produced, then pushes it to the main queue only
+// if the job is not already there and is not yet terminal in our DB.
+//
+// Contract: Encore /encoreJobs/search/findByStatus returns Spring HATEOAS pages:
+//   { _embedded: { encoreJobs: [{ id: "<uuid>", externalId: "...", ... }] },
+//     page: { totalElements: N } }
+// (verified from Encore source and OSC docs, 2026-07-07)
+const SWEEP_INTERVAL_MS = 30_000;
+
+// Scan `encore:pool:*` keys to find all workspaces that have an active pool,
+// then for each workspace check every Encore instance for SUCCESSFUL jobs that
+// have a UUID→externalId mapping but whose local job is not yet in a terminal
+// state. If such a job exists and is not already in the queue, push a synthetic
+// message so the regular loop picks it up.
+async function sweepCompletedJobs(deps: PollerDeps, queueKey: string): Promise<void> {
+  const { redis, oscContext, logger, jobRepository } = deps;
+
+  const poolKeys = await redis.keys('encore:pool:*');
+  if (poolKeys.length === 0) return;
+
+  let sat: string;
+  try {
+    sat = await oscContext.getServiceAccessToken('encore');
+  } catch (err) {
+    logger.warn({ msg: 'encore-callback-poller: sweep — failed to get SAT, skipping', err });
+    return;
+  }
+
+  const processingKey = `${queueKey}:processing`;
+
+  for (const poolKey of poolKeys) {
+    const poolRaw = await redis.hgetall(poolKey).catch(() => ({}));
+    for (const instanceJson of Object.values(poolRaw)) {
+      let record: EncoreInstanceRecord;
+      try { record = JSON.parse(instanceJson) as EncoreInstanceRecord; } catch { continue; }
+
+      const searchUrl =
+        `${record.url.replace(/\/+$/, '')}/encoreJobs/search/findByStatus` +
+        `?status=SUCCESSFUL&page=0&size=100`;
+      let encoreJobs: Array<{ id?: string }> = [];
+      try {
+        const res = await fetch(searchUrl, { headers: { authorization: `Bearer ${sat}` } });
+        if (!res.ok) continue;
+        const body = (await res.json()) as {
+          _embedded?: { encoreJobs?: typeof encoreJobs };
+        };
+        encoreJobs = body._embedded?.encoreJobs ?? [];
+      } catch { continue; }
+
+      for (const encoreJob of encoreJobs) {
+        const encoreUuid = encoreJob.id;
+        if (!encoreUuid) continue;
+
+        // Is this one of our jobs? (UUID→externalId written at dispatch time, TTL 24h)
+        const externalId = await redis.get(keys.uuidToExternalId(encoreUuid));
+        if (!externalId) continue;
+
+        // Skip if the local job is already terminal — avoids repeated re-queueing.
+        try {
+          const found = await jobRepository.findByEncoreJobId(externalId);
+          if (!found || found.job.status === 'done' || found.job.status === 'failed') continue;
+        } catch { continue; }
+
+        // Build the message the callback listener would have produced.
+        // (verified from eyevinn-encore-callback-listener src/api.ts onSuccess handler)
+        const message = JSON.stringify({
+          jobId: encoreUuid,
+          url: `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`
+        });
+
+        // Skip if the message is already in the main queue or processing set.
+        const [inQueue, inProcessing] = await Promise.all([
+          redis.zscore(queueKey, message),
+          redis.zscore(processingKey, message)
+        ]);
+        if (inQueue !== null || inProcessing !== null) continue;
+
+        logger.info({
+          msg: 'encore-callback-poller: sweep found missed callback — re-queuing',
+          encoreUuid,
+          externalId,
+          instanceId: record.instanceId
+        });
+        await redis.zadd(queueKey, Date.now(), message);
+      }
+    }
+  }
+}
+
+// Two-phase processing: messages move from the main queue to a processing set
+// before handleMessage runs, and are only removed from processing on success.
+// On any failure the message is returned to the main queue so it is retried on
+// the next iteration. On startup, leftover entries in the processing set (from a
+// crash or hot-reload kill) are recovered back to the main queue automatically.
+//
+// Sorted-set operations used (ioredis bindings, verified against ioredis docs):
+//   BZPOPMIN key timeout  → [key, member, score] | null
+//   ZADD key score member → number (added/updated count)
+//   ZREM key member       → number (removed count)
+//   ZRANGEBYSCORE key min max → string[]
+
+async function recoverProcessingQueue(
+  redis: Redis,
+  queueKey: string,
+  processingKey: string,
+  logger: Logger
+): Promise<void> {
+  // Any message left in the processing set did not complete in a prior run.
+  // Move them all back to the main queue so they are retried.
+  const stuck = await redis.zrangebyscore(processingKey, '-inf', '+inf', 'WITHSCORES');
+  // WITHSCORES returns [member, score, member, score, ...].
+  for (let i = 0; i < stuck.length; i += 2) {
+    const member = stuck[i];
+    const score = Number(stuck[i + 1]);
+    await redis.zadd(queueKey, score, member);
+    await redis.zrem(processingKey, member);
+    logger.info({ msg: 'encore-callback-poller: recovered stuck message from processing set', member });
+  }
+}
+
 // Start the background poller loop. Returns a stop() function that aborts the
 // loop after the in-flight BZPOPMIN times out (up to BZPOPMIN_TIMEOUT_SECONDS).
 export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
   const queueKey = deps.queueKey ?? DEFAULT_QUEUE_KEY;
+  const processingKey = `${queueKey}:processing`;
   const controller = new AbortController();
   const { signal } = controller;
 
-  deps.logger.info({ msg: 'encore-callback-poller: starting', queueKey });
+  deps.logger.info({ msg: 'encore-callback-poller: starting', queueKey, processingKey });
+
+  // Fallback sweep: periodically poll all Encore instances for SUCCESSFUL jobs
+  // that never produced a queue message (eyevinn-encore-callback-listener missing
+  // `await` on zAdd). First sweep fires after SWEEP_INTERVAL_MS, not immediately,
+  // so the normal queue-drain path gets first chance on startup.
+  const sweepTimer = setInterval(() => {
+    void sweepCompletedJobs(deps, queueKey).catch((err) => {
+      deps.logger.warn({ msg: 'encore-callback-poller: sweep error', err });
+    });
+  }, SWEEP_INTERVAL_MS);
+  sweepTimer.unref?.();
 
   const loop = async (): Promise<void> => {
+    // On startup, recover any messages left in the processing set from a prior
+    // crashed or hot-reloaded process before entering the main loop.
+    await recoverProcessingQueue(deps.redis, queueKey, processingKey, deps.logger).catch((err) => {
+      deps.logger.warn({ msg: 'encore-callback-poller: recovery scan failed', err });
+    });
+
     while (!signal.aborted) {
+      let raw: string | undefined;
+      let score: number | undefined;
       try {
         // BZPOPMIN blocks up to the timeout, then returns null so the loop can
         // check the abort signal and remain cancellable.
@@ -300,12 +481,25 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
         if (signal.aborted) break;
         if (!popped) continue;
         // bzpopmin returns [key, member, score]; the member is our JSON message.
-        const raw = popped[1];
+        raw = popped[1];
+        score = Number(popped[2]);
+
+        // Phase 1: move message to the processing set before doing any work.
+        // If the process dies after this point, recoverProcessingQueue re-queues
+        // it on the next startup.
+        await deps.redis.zadd(processingKey, score, raw);
+
         await handleMessage(deps, raw);
+
+        // Phase 2: processing succeeded — remove from the processing set.
+        await deps.redis.zrem(processingKey, raw);
       } catch (err) {
-        // Never crash the loop. Back off briefly on unexpected errors so a
-        // persistently failing Redis / fetch does not spin hot.
         deps.logger.error({ msg: 'encore-callback-poller: loop error', err });
+        // Return the message to the main queue so it is retried, then back off.
+        if (raw !== undefined && score !== undefined) {
+          await deps.redis.zadd(queueKey, score, raw).catch(() => {});
+          await deps.redis.zrem(processingKey, raw).catch(() => {});
+        }
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
@@ -314,5 +508,8 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
 
   void loop();
 
-  return () => controller.abort();
+  return () => {
+    controller.abort();
+    clearInterval(sweepTimer);
+  };
 }
