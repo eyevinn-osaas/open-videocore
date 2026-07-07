@@ -327,6 +327,8 @@ if (storageAvailable && process.env['REDIS_URL']) {
   const encoreS3SecretKey = process.env['ENCORE_S3_SECRET_KEY'] ?? process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'];
   encore = new WorkspaceEncoreScalerRegistry({
     redis: sharedRedis,
+    redisUrl: process.env['REDIS_URL']!,
+    minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] ?? '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
     idleTimeoutMs: encoreIdleTimeoutMs,

@@ -55,7 +55,7 @@ export type SubmitTranscodeResult = {
 // after marking the job failed and reverting the source asset.
 export async function submitTranscode(
   params: SubmitTranscodeParams,
-  deps: { jobs: JobRepository; assets: AssetRepository; encore: EncoreClient; encoreCallbackUrl?: string }
+  deps: { jobs: JobRepository; assets: AssetRepository; encore: EncoreClient }
 ): Promise<SubmitTranscodeResult> {
   // Profile name forwarded verbatim to Encore. Falls back to 'program' —
   // the only profile guaranteed to exist in the default Encore test-profiles set.
@@ -86,13 +86,11 @@ export async function submitTranscode(
 
   let encoreInternalJobId: string | undefined;
   try {
-    // Use the stack's encore-callback-listener URL so Encore POSTs completions
-    // to the listener, which then puts the result on the Redis queue our API reads.
-    const progressCallbackUri = deps.encoreCallbackUrl
-      ? `${deps.encoreCallbackUrl.replace(/\/$/, '')}/encoreCallback`
-      : undefined;
+    // progressCallbackUri is injected by the scaler at dispatch time, pointing
+    // at the callback listener paired with the chosen Encore instance (ADR-006),
+    // so it is not set here.
     const encoreProfile = params.customProfile ? params.customProfile.name : profileName;
-    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: encoreProfile, progressCallbackUri });
+    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: encoreProfile, progressCallbackUri: undefined });
     encoreInternalJobId = result.encoreInternalId || undefined;
     if (encoreInternalJobId) {
       await deps.jobs.update(job.id, { encoreInternalJobId });

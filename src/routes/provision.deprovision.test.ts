@@ -101,8 +101,6 @@ const STORED_CONFIG = {
   minioEndpoint: 'https://minio.example.osaas.io',
   couchdbUrl: 'https://couch.example.osaas.io',
   redisUrl: 'redis://valkey.svc.cluster.local:6379',
-  encoreUrl: 'https://encore.example.osaas.io',
-  encoreCallbackUrl: 'https://callback.example.osaas.io',
   sourceBucket: 'openvideocore-source',
   packagedBucket: 'openvideocore-packaged',
   services: [
@@ -246,8 +244,6 @@ describe('GET /api/v1/provision/:name (issue #31)', () => {
     minioEndpoint: 'https://minio.example.osaas.io',
     couchdbUrl: 'https://couch.example.osaas.io',
     redisUrl: 'redis://valkey.svc.cluster.local:6379',
-    encoreUrl: 'https://encore.example.osaas.io',
-    encoreCallbackUrl: 'https://callback.example.osaas.io',
     sourceBucket: 'openvideocore-source',
     packagedBucket: 'openvideocore-packaged',
     services: [{ serviceId: 'minio-minio', instanceName: 'mystack' }]

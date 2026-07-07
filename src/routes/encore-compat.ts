@@ -18,7 +18,7 @@
 //   - src/pipeline/encore-client.ts — the native Encore POST /encoreJobs payload
 //     shape (externalId?, inputs[].uri, outputFolder, profile?, progressCallbackUri?).
 //   - src/pipeline/transcode.ts — submitTranscode(params, deps) returns
-//     { jobId, encoreJobId }; deps = { jobs, assets, encore, encoreCallbackUrl? }.
+//     { jobId, encoreJobId }; deps = { jobs, assets, encore }.
 //   - src/data/asset-repo.ts — AssetRepository.create(CreateAssetInput):
 //     { name, sourceMethod?: 'url-pull', originUri? }.
 //   - src/data/job-repo.ts — JobRepository.findByEncoreJobId(id) returns
@@ -177,14 +177,11 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
         ? (profileName as PresetName)
         : undefined;
 
-      // NOTE: body.progressCallbackUri is intentionally NOT forwarded here.
-      // Webhook/callback integrations that rely on Encore POSTing progress to
-      // their URI would need this threaded through to the Encore submission.
-      // The internal transcode path already wires Encore's callback to the
-      // stack's encore-callback-listener via encoreCallbackUrl (ADR-006), which
-      // is what drives completion + our own webhooks. Forwarding the caller's
-      // progressCallbackUri to Encore is a follow-up; polling GET
-      // /encoreJobs/:id works today.
+      // The scaler injects progressCallbackUri at dispatch time, pointing at the
+      // callback listener paired with the chosen Encore instance (ADR-006), which
+      // drives completion + our own webhooks. A caller-supplied
+      // body.progressCallbackUri is not forwarded; polling GET /encoreJobs/:id
+      // works today.
       try {
         const result = await submitTranscode(
           {
@@ -202,8 +199,7 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
           {
             jobs,
             assets: repo,
-            encore: opts.encore,
-            encoreCallbackUrl: request.connections?.encoreCallbackUrl
+            encore: opts.encore
           }
         );
         return reply.code(200).send({

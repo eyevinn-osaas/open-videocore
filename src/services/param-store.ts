@@ -26,8 +26,6 @@ export type StackConfig = {
   // CouchDB host/URL only — no embedded password.
   couchdbUrl: string;
   redisUrl: string;
-  encoreUrl: string;
-  encoreCallbackUrl: string;
   sourceBucket: string;
   packagedBucket: string;
   // The OSC instances that make up the stack, for deprovision (#29).
@@ -97,9 +95,7 @@ function assertNoCredentials(config: StackConfig): void {
   for (const key of [
     'couchdbUrl',
     'redisUrl',
-    'minioEndpoint',
-    'encoreUrl',
-    'encoreCallbackUrl'
+    'minioEndpoint'
   ] as const) {
     if (hasCredentials(config[key])) {
       throw new Error(

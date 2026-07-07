@@ -68,6 +68,7 @@ export class EncoreScalerLoop {
 
   async tick(): Promise<void> {
     const { redis, workspaceId, maxInstances, idleTimeoutMs } = this.config;
+    const minInstances = this.config.minInstances ?? 0;
 
     // 0. Reconcile stale activeJobs counts against each instance's real
     //    in-progress job count before making any scaling/dispatch decision.
@@ -79,9 +80,15 @@ export class EncoreScalerLoop {
     // 2. Current pool.
     let instances = await listInstances(redis, workspaceId);
 
-    // 3. Scale up (one instance per tick).
+    // 3. Scale up (one instance per tick). Pre-warm to minInstances regardless
+    //    of pending work; otherwise scale up only when every instance is busy
+    //    and there is pending work.
     const allBusy = instances.every((i) => i.activeJobs >= JOBS_PER_INSTANCE);
-    if (pending > 0 && allBusy && instances.length < maxInstances) {
+    const belowMin = instances.length < minInstances;
+    if (
+      instances.length < maxInstances &&
+      (belowMin || (pending > 0 && allBusy))
+    ) {
       const spawned = await spawnInstance(this.config);
       instances = [...instances, spawned];
     }
@@ -206,13 +213,19 @@ export class EncoreScalerLoop {
     const { redis, workspaceId, getToken, onDispatched } = this.config;
     try {
       const token = await getToken();
+      // Inject the paired callback listener URL so Encore POSTs progress to the
+      // listener bound to this exact instance (ADR-006).
+      const payload = { ...job.payload };
+      if (inst.callbackListenerUrl) {
+        payload['progressCallbackUri'] = `${inst.callbackListenerUrl.replace(/\/$/, '')}/encoreCallback`;
+      }
       const res = await fetch(`${inst.url.replace(/\/$/, '')}/encoreJobs`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           authorization: `Bearer ${token}`
         },
-        body: JSON.stringify(job.payload)
+        body: JSON.stringify(payload)
       });
       if (!res.ok) return false;
 

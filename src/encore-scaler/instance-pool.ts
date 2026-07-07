@@ -26,6 +26,12 @@ import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './type
 // single constant so a future rename is a one-line change.
 export const ENCORE_SERVICE_ID = 'encore';
 
+// The callback listener paired with each scaler-managed Encore instance. It is
+// configured with the exact Encore instance URL at spawn time so its queue
+// messages never embed a wrong (static) Encore URL.
+export const ENCORE_CALLBACK_LISTENER_SERVICE_ID =
+  'eyevinn-encore-callback-listener';
+
 type OscInstance = { name?: string; url?: string } & Record<string, unknown>;
 
 function instanceUrl(instance: OscInstance): string {
@@ -113,10 +119,36 @@ export async function spawnInstance(
 
   const instanceId = instanceName(instance);
   await waitForInstanceReady(ENCORE_SERVICE_ID, instanceId, config.oscContext);
+  const encoreUrl = instanceUrl(instance);
+
+  // Pair this Encore instance with a dedicated callback listener (same name)
+  // configured with this exact Encore URL, so completion callbacks are routed
+  // to the scaler-managed instance rather than a static one. RedisQueue is set
+  // explicitly to the packaging queue so it never defaults elsewhere.
+  const callbackSat = await config.oscContext.getServiceAccessToken(
+    ENCORE_CALLBACK_LISTENER_SERVICE_ID
+  );
+  const callback = (await createInstance(
+    config.oscContext,
+    ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+    callbackSat,
+    {
+      name: instanceId,
+      RedisUrl: config.redisUrl,
+      EncoreUrl: encoreUrl,
+      RedisQueue: 'packaging-queue'
+    }
+  )) as OscInstance;
+  await waitForInstanceReady(
+    ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+    instanceId,
+    config.oscContext
+  );
 
   const record: EncoreInstanceRecord = {
     instanceId,
-    url: instanceUrl(instance),
+    url: encoreUrl,
+    callbackListenerUrl: instanceUrl(callback),
     activeJobs: 0,
     lastIdleAt: Date.now()
   };
@@ -133,6 +165,21 @@ export async function destroyInstance(
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
   try {
     await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
+    // Best-effort teardown of the paired callback listener (same name). It may
+    // already be gone, so any error is swallowed.
+    try {
+      const callbackSat = await config.oscContext.getServiceAccessToken(
+        ENCORE_CALLBACK_LISTENER_SERVICE_ID
+      );
+      await removeInstance(
+        config.oscContext,
+        ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+        instanceId,
+        callbackSat
+      );
+    } catch {
+      // Listener already removed or unreachable — nothing to do.
+    }
   } finally {
     // Always drop the pool record so a stuck instance cannot pin the pool at
     // maxInstances forever, even if the OSC removeInstance call errored.

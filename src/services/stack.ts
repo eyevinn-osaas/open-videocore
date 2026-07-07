@@ -15,15 +15,16 @@
 //   storage    — MinIO (S3-compatible object storage)
 //   database   — CouchDB (document metadata store)
 //   queue      — Valkey (Redis-compatible coordination backbone)
-//   transcode  — Encore (transcoding engine; depends on storage)
-//   transcode  — Encore callback listener (bridges Encore -> queue)
 //   packaging  — Encore packager (consumes queue, writes packaged output)
+//
+// Encore and its paired callback listener are NOT part of the provisioned
+// stack: the auto-scaler spawns each Encore instance together with a dedicated
+// callback listener pointing at that exact instance, and tears both down on
+// scale-down (ADR-006).
 export const STACK_SERVICES = [
   { serviceId: 'minio-minio', role: 'storage' },
   { serviceId: 'apache-couchdb', role: 'database' },
   { serviceId: 'valkey-io-valkey', role: 'queue' },
-  { serviceId: 'encore', role: 'transcode' },
-  { serviceId: 'eyevinn-encore-callback-listener', role: 'transcode' },
   { serviceId: 'eyevinn-encore-packager', role: 'packaging' }
 ] as const;
 
@@ -37,7 +38,7 @@ export type StackService = (typeof STACK_SERVICES)[number];
 export const FFPROBE_SERVICE_ID = 'eyevinn-ffmpeg-s3' as const;
 
 // Teardown order is the reverse of provision order: consumers are removed
-// before the producers they depend on (packager -> callback listener -> encore
-// -> queue -> database -> storage). This avoids tearing a producer out from
-// under a still-running consumer.
+// before the producers they depend on (packager -> queue -> database ->
+// storage). This avoids tearing a producer out from under a still-running
+// consumer.
 export const TEARDOWN_ORDER: readonly StackService[] = [...STACK_SERVICES].reverse();

@@ -570,7 +570,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               preset: encodeOpts?.profile,
               customProfile: encodeOpts?.customProfile
             },
-            { jobs, assets: repo, encore: opts.encore!, encoreCallbackUrl: request.connections?.encoreCallbackUrl }
+            { jobs, assets: repo, encore: opts.encore! }
           );
           stepsCopy[i] = {
             ...step,
@@ -905,7 +905,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },
-          { jobs, assets: repo, encore: opts.encore, encoreCallbackUrl: request.connections?.encoreCallbackUrl }
+          { jobs, assets: repo, encore: opts.encore }
         );
         return reply.code(202).send(result);
       } catch (err) {

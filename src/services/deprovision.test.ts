@@ -80,7 +80,7 @@ describe('deprovisionStack', () => {
   it('partial failure: a failing service is reported and others still attempted', async () => {
     getInstance.mockResolvedValue({ name: NAME });
     removeInstance.mockImplementation(async (_ctx, serviceId: string) => {
-      if (serviceId === 'encore') {
+      if (serviceId === 'eyevinn-encore-packager') {
         throw new Error('OSC 503 service unavailable');
       }
       return undefined;
@@ -89,9 +89,9 @@ describe('deprovisionStack', () => {
     const result = await deprovisionStack(osc, NAME);
 
     expect(result.status).toBe('failed');
-    const encore = result.services.find((s) => s.serviceId === 'encore');
-    expect(encore?.status).toBe('failed');
-    expect(encore?.error).toContain('503');
+    const packager = result.services.find((s) => s.serviceId === 'eyevinn-encore-packager');
+    expect(packager?.status).toBe('failed');
+    expect(packager?.error).toContain('503');
     // Every service was still attempted despite the failure.
     expect(getInstance).toHaveBeenCalledTimes(TEARDOWN_ORDER.length);
     // The other services removed successfully.

@@ -22,7 +22,10 @@ export type WorkspaceEncoreScalerConfig = {
   redis: Redis;
   oscContext: Context;
   maxInstances: number;
+  minInstances?: number;
   idleTimeoutMs: number;
+  // Redis connection string forwarded to each spawned callback listener.
+  redisUrl: string;
   tickIntervalMs?: number;
   s3Config?: import('./types.js').EncoreS3Config;
   // Forwarded to every per-workspace scaler loop: invoked after a queued job is
@@ -42,9 +45,11 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     const scalerConfig: EncoreScalerConfig = {
       workspaceId,
       maxInstances: this.config.maxInstances,
+      minInstances: this.config.minInstances,
       idleTimeoutMs: this.config.idleTimeoutMs,
       oscContext: this.config.oscContext,
       redis: this.config.redis,
+      redisUrl: this.config.redisUrl,
       getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
       s3Config: this.config.s3Config,
       onDispatched: this.config.onDispatched

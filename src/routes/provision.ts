@@ -48,9 +48,7 @@ const responseSchema = z.object({
   name: z.string(),
   minioEndpoint: z.string(),
   couchdbUrl: z.string(),
-  redisUrl: z.string(),
-  encoreUrl: z.string(),
-  encoreCallbackUrl: z.string()
+  redisUrl: z.string()
 });
 
 const provisionedEntrySchema = z.object({
@@ -133,8 +131,6 @@ const storedConfigSchema = z.object({
   minioEndpoint: z.string(),
   couchdbUrl: z.string(),
   redisUrl: z.string(),
-  encoreUrl: z.string(),
-  encoreCallbackUrl: z.string(),
   sourceBucket: z.string(),
   packagedBucket: z.string(),
   services: z.array(
@@ -453,39 +449,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         await waitForInstanceReady('valkey-io-valkey', name, osc);
         const redisUrl = await redisUrlFrom(osc, 'valkey-io-valkey', name);
 
-        // 4. Encore — transcoding engine. Uses MinIO as its S3 backend.
-        // Slowest service to become ready (Essential tier); wait before
-        // configuring the callback listener with its URL.
-        currentService = 'encore';
-        // Encore's S3 secret is the MinIO root password, scoped to the encore
-        // serviceId under the rootpassword purpose.
-        const encoreS3SecretRef = await secretRef(
-          'encore',
-          ROOTPASSWORD,
-          minioRootPassword
-        );
-        const encore = await provision('encore', {
-          s3AccessKeyId: 'admin',
-          s3SecretAccessKey: encoreS3SecretRef,
-          s3Endpoint: minioEndpoint
-        });
-        await waitForInstanceReady('encore', name, osc);
-        const encoreUrl = instanceUrl(encore);
+        // Encore and its paired callback listener are NOT provisioned here: the
+        // auto-scaler spawns each Encore instance together with a dedicated
+        // callback listener bound to that exact instance (ADR-006).
 
-        // 5. Encore callback listener — bridges Encore completion to the queue.
-        currentService = 'eyevinn-encore-callback-listener';
-        const callback = await provision('eyevinn-encore-callback-listener', {
-          RedisUrl: redisUrl,
-          EncoreUrl: encoreUrl
-        });
-        await waitForInstanceReady(
-          'eyevinn-encore-callback-listener',
-          name,
-          osc
-        );
-        const encoreCallbackUrl = instanceUrl(callback);
-
-        // 6. Encore packager — consumes the queue and produces streaming output.
+        // 4. Encore packager — consumes the queue and produces streaming output.
         currentService = 'eyevinn-encore-packager';
         const pat = osc.getPersonalAccessToken();
         if (!pat) {
@@ -525,8 +493,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             minioEndpoint,
             couchdbUrl: stripCredentials(couchdbUrl),
             redisUrl,
-            encoreUrl,
-            encoreCallbackUrl,
             sourceBucket: SOURCE_BUCKET,
             packagedBucket: PACKAGED_BUCKET,
             services: STACK_SERVICES.map((s) => ({
@@ -559,9 +525,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               name,
               minioEndpoint,
               couchdbUrl,
-              redisUrl,
-              encoreUrl,
-              encoreCallbackUrl
+              redisUrl
             }
           });
         } catch (err) {
@@ -580,8 +544,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 minioEndpoint: '',
                 couchdbUrl: '',
                 redisUrl: '',
-                encoreUrl: '',
-                encoreCallbackUrl: '',
                 sourceBucket: SOURCE_BUCKET,
                 packagedBucket: PACKAGED_BUCKET,
                 services: provisioned.map((p) => ({

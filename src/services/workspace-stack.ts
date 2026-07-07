@@ -42,7 +42,6 @@ export type WorkspaceConnections = {
   storageFor: StorageFactory | undefined;
   storageClient: MinioClient | undefined;
   encore: EncoreClient | undefined;
-  encoreCallbackUrl: string | undefined;
   sourceBucket: string;
   packagedBucket: string;
   s3Config: { endpoint: string; accessKey: string; secretKey: string } | undefined;
@@ -82,12 +81,10 @@ function buildConnectionsFromStack(
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
 
-  const encore = config.encoreUrl
-    ? makeHttpEncoreClient({
-        baseUrl: config.encoreUrl,
-        getToken: () => oscContext.getServiceAccessToken('encore')
-      })
-    : undefined;
+  // The Encore instance URL is no longer stored in the stack config: the
+  // auto-scaler manages its own Encore instances (ADR-006). main.ts wires the
+  // scaler-backed EncoreClient; the per-stack resolver leaves encore unset.
+  const encore = undefined;
 
   return {
     assets,
@@ -98,7 +95,6 @@ function buildConnectionsFromStack(
     storageFor,
     storageClient: minioClient,
     encore,
-    encoreCallbackUrl: config.encoreCallbackUrl || undefined,
     sourceBucket: config.sourceBucket,
     packagedBucket: config.packagedBucket,
     s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword }
@@ -172,7 +168,6 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   return {
     assets, jobs, search, webhooks, collections,
     storageFor, storageClient, encore,
-    encoreCallbackUrl: undefined,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined
   };
@@ -188,7 +183,6 @@ function buildInMemoryConnections(): WorkspaceConnections {
     assets, jobs, search, webhooks, collections,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
-    encoreCallbackUrl: undefined,
     sourceBucket: 'openvideocore-source',
     packagedBucket: 'openvideocore-packaged',
     s3Config: undefined

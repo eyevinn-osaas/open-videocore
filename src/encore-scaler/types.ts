@@ -31,7 +31,13 @@ export type EncoreS3Config = {
 export type EncoreScalerConfig = {
   workspaceId: string;
   maxInstances: number;
+  // Minimum instances to keep warm even when idle (default 0). When >= 1 the
+  // scaler pre-warms up to this many instances regardless of pending work.
+  minInstances?: number;
   idleTimeoutMs: number; // default 5 * 60 * 1000
+  // Redis connection string, passed to each paired callback listener so it can
+  // put completion messages on the packaging queue.
+  redisUrl: string;
   // OSC config for spawning instances.
   oscContext: import('@osaas/client-core').Context;
   // Valkey connection (IORedis instance).
@@ -56,6 +62,9 @@ export type EncoreScalerConfig = {
 export type EncoreInstanceRecord = {
   instanceId: string; // OSC instance id (its `name`)
   url: string; // HTTP base URL of the Encore instance
+  // HTTP base URL of the paired callback listener spawned alongside this
+  // Encore instance. Undefined until the listener is ready.
+  callbackListenerUrl?: string;
   activeJobs: number; // jobs currently running on this instance
   lastIdleAt: number; // epoch ms when activeJobs last reached 0
 };
