@@ -112,6 +112,34 @@ async function resolveEncoreJobUrl(
   }
 }
 
+// Decrement the running instance's activeJobs after a job completes. Mirrors in
+// reverse the increment path in scaler-loop.dispatch(): the pool hash is the
+// durable source of truth, so we read-modify-write the JSON EncoreInstanceRecord.
+// Best-effort: any failure is swallowed so completion handling is never blocked.
+async function decrementActiveJobs(
+  redis: Redis,
+  encoreJobId: string,
+  logger: Logger
+): Promise<void> {
+  try {
+    const decoded = decodeEncoreJobId(encoreJobId);
+    if (!decoded) return;
+    const { workspaceId } = decoded;
+    const instanceId = await redis.hget(keys.jobInstance(workspaceId), encoreJobId);
+    if (!instanceId) return;
+    const instanceJson = await redis.hget(keys.pool(workspaceId), instanceId);
+    if (!instanceJson) return;
+    const record = JSON.parse(instanceJson) as EncoreInstanceRecord;
+    record.activeJobs = Math.max(0, record.activeJobs - 1);
+    if (record.activeJobs === 0) {
+      record.lastIdleAt = Date.now();
+    }
+    await redis.hset(keys.pool(workspaceId), instanceId, JSON.stringify(record));
+  } catch (err) {
+    logger.warn({ msg: 'encore-callback-poller: failed to decrement activeJobs', encoreJobId, err });
+  }
+}
+
 // Process one queue message: fetch the Encore job, resolve our job, complete the
 // transcode, and advance the matching PipelineExecution. Never throws.
 async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
@@ -168,6 +196,12 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
     },
     { jobs: deps.jobRepository, assets: deps.assetRepository }
   );
+
+  // Free the slot on the Encore instance that ran this job so the scaler can
+  // reuse its capacity. Only on a terminal completion that actually applied.
+  if (result.applied) {
+    await decrementActiveJobs(deps.redis, externalId, deps.logger);
+  }
 
   // Advance the matching PipelineExecution — copied from src/routes/internal.ts
   // (the encore-callback handler). It can't be shared without a refactor.

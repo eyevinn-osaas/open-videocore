@@ -139,6 +139,35 @@ async function resolveEncoreJobUrl(
   }
 }
 
+// Decrement the running Encore instance's activeJobs after a job completes.
+// Mirrors in reverse the increment in scaler-loop.dispatch() so a completed job
+// frees its slot rather than pinning the pool at capacity forever. Best-effort:
+// the pool hash is the durable source of truth and any failure is swallowed.
+async function decrementActiveJobs(
+  encoreJobId: string,
+  redis: Redis | undefined
+): Promise<void> {
+  if (!redis) return;
+  try {
+    const decoded = decodeEncoreJobId(encoreJobId);
+    if (!decoded) return;
+    const { workspaceId } = decoded;
+    const instanceId = await redis.hget(keys.jobInstance(workspaceId), encoreJobId);
+    if (!instanceId) return;
+    const instanceJson = await redis.hget(keys.pool(workspaceId), instanceId);
+    if (!instanceJson) return;
+    const record = JSON.parse(instanceJson) as EncoreInstanceRecord;
+    record.activeJobs = Math.max(0, record.activeJobs - 1);
+    if (record.activeJobs === 0) {
+      record.lastIdleAt = Date.now();
+    }
+    await redis.hset(keys.pool(workspaceId), instanceId, JSON.stringify(record));
+  } catch {
+    // Swallowed: freeing the slot is best-effort; reconciliation will correct
+    // any drift on the next scaler tick.
+  }
+}
+
 function normaliseRenditions(
   output: z.infer<typeof callbackOutputSchema>[] | undefined
 ): CallbackRendition[] {
@@ -274,6 +303,12 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
         },
         { jobs: jobRepository, assets: repository }
       );
+
+      // Free the slot on the Encore instance that ran this job so the scaler
+      // can reuse its capacity. Only on a terminal completion that applied.
+      if (result.applied) {
+        await decrementActiveJobs(externalId, opts.redis);
+      }
 
       // Advance the matching PipelineExecution. If this transcode was part of a
       // pipeline (e.g. abr-vod / full), mark the transcode step done/failed and,

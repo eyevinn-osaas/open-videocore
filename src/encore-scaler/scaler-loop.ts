@@ -69,6 +69,10 @@ export class EncoreScalerLoop {
   async tick(): Promise<void> {
     const { redis, workspaceId, maxInstances, idleTimeoutMs } = this.config;
 
+    // 0. Reconcile stale activeJobs counts against each instance's real
+    //    in-progress job count before making any scaling/dispatch decision.
+    await this.reconcile();
+
     // 1. Pending work.
     const pending = await redis.llen(keys.queue(workspaceId));
 
@@ -125,6 +129,69 @@ export class EncoreScalerLoop {
 
         inst.activeJobs += 1;
         await updateInstance(redis, workspaceId, inst);
+      }
+    }
+  }
+
+  // Reconcile each instance's tracked activeJobs against its real IN_PROGRESS
+  // job count. Corrects drift (e.g. a completion callback that never freed the
+  // slot) so the pool can never get permanently stuck thinking every slot is
+  // full. Runs once per tick, is a no-op when the pool is empty, and skips
+  // instances already at zero (nothing to correct downward). Each instance is
+  // handled in isolation: one unreachable instance never breaks the tick.
+  async reconcile(): Promise<void> {
+    const { redis, workspaceId, getToken } = this.config;
+
+    const raw = await redis.hgetall(keys.pool(workspaceId));
+    const entries = Object.entries(raw);
+    if (entries.length === 0) return; // empty pool — nothing to reconcile
+
+    for (const [instanceId, instanceJson] of entries) {
+      try {
+        let record: EncoreInstanceRecord;
+        try {
+          record = JSON.parse(instanceJson) as EncoreInstanceRecord;
+        } catch {
+          continue; // corrupt entry — leave it for the loop to skip elsewhere
+        }
+        // Nothing to correct downward on an already-idle instance.
+        if (record.activeJobs === 0) continue;
+
+        const token = await getToken();
+        const url =
+          `${record.url.replace(/\/$/, '')}` +
+          `/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=100`;
+        const res = await fetch(url, {
+          headers: { authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) continue;
+
+        const body = (await res.json().catch(() => ({}))) as {
+          page?: { totalElements?: number };
+        };
+        const actualCount = body.page?.totalElements;
+        if (typeof actualCount !== 'number') continue;
+
+        if (record.activeJobs !== actualCount) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[encore-scaler] reconcile: correcting stale activeJobs for instance ${instanceId}: ` +
+              `tracked=${record.activeJobs} actual=${actualCount}`
+          );
+          record.activeJobs = actualCount;
+          if (record.activeJobs === 0) {
+            record.lastIdleAt = Date.now();
+          }
+          await redis.hset(
+            keys.pool(workspaceId),
+            instanceId,
+            JSON.stringify(record)
+          );
+        }
+      } catch {
+        // Swallow per-instance errors so one unreachable instance does not
+        // break reconciliation (or the tick) for the rest of the pool.
+        continue;
       }
     }
   }
