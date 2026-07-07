@@ -93,12 +93,14 @@ export class EncoreScalerLoop {
       instances = [...instances, spawned];
     }
 
-    // 4. Scale down idle instances.
+    // 4. Scale down idle instances, but never below minInstances.
     const now = Date.now();
     const survivors: EncoreInstanceRecord[] = [];
+    let activeCount = instances.length;
     for (const inst of instances) {
-      if (inst.activeJobs === 0 && now - inst.lastIdleAt > idleTimeoutMs) {
+      if (inst.activeJobs === 0 && now - inst.lastIdleAt > idleTimeoutMs && activeCount > minInstances) {
         await destroyInstance(inst.instanceId, this.config);
+        activeCount -= 1;
       } else {
         survivors.push(inst);
       }
