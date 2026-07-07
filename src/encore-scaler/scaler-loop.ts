@@ -225,6 +225,10 @@ export class EncoreScalerLoop {
       await redis.hset(keys.jobStatus(workspaceId), job.jobId, 'running');
       if (encoreUuid && encoreUuid !== job.jobId) {
         await redis.set(keys.jobUuid(job.jobId), encoreUuid, 'EX', 86_400);
+        // Reverse: lets the callback poller resolve externalId from the Encore
+        // UUID delivered by the callback listener (which always uses its own
+        // configured Encore URL, not the scaler-managed instance URL).
+        await redis.set(keys.uuidToExternalId(encoreUuid), job.jobId, 'EX', 86_400);
       }
 
       // The job has now actually left the local queue and is running on an

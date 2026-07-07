@@ -36,6 +36,19 @@ import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 
+// Resolve the correct Encore job API URL using the reverse UUID mapping stored
+// at dispatch time. The callback listener always uses its own configured Encore
+// instance URL, which differs from the scaler-managed instance that actually ran
+// the job. We look up the real instance URL from the Redis pool instead.
+async function resolveUrlFromEncoreUuid(
+  encoreUuid: string,
+  redis: Redis
+): Promise<string | undefined> {
+  const externalId = await redis.get(keys.uuidToExternalId(encoreUuid));
+  if (!externalId) return undefined;
+  return resolveEncoreJobUrl(externalId, redis);
+}
+
 const DEFAULT_QUEUE_KEY = 'packaging-queue';
 const BZPOPMIN_TIMEOUT_SECONDS = 5;
 
@@ -150,14 +163,23 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
     deps.logger.warn({ msg: 'encore-callback-poller: unparseable queue message', raw, err });
     return;
   }
-  const url = message.url;
+  // Prefer resolving the Encore job URL from our Redis pool mapping — the URL
+  // embedded by the callback listener always points at its own configured Encore
+  // instance, which may differ from the scaler-managed instance that ran the job.
+  const encoreUuid = message.jobId;
+  const sat = await deps.oscContext.getServiceAccessToken('encore');
+  let resolvedUrl: string | undefined;
+  if (encoreUuid) {
+    resolvedUrl = await resolveUrlFromEncoreUuid(encoreUuid, deps.redis);
+  }
+  // Fall back to message.url (e.g. non-scaler deployments or missing mapping).
+  const url = resolvedUrl ?? message.url;
   if (!url) {
     deps.logger.warn({ msg: 'encore-callback-poller: queue message has no url', message });
     return;
   }
 
   // Fetch the Encore job document, authenticated with an OSC SAT for "encore".
-  const sat = await deps.oscContext.getServiceAccessToken('encore');
   const res = await fetch(url, { headers: { Authorization: `Bearer ${sat}` } });
   if (!res.ok) {
     deps.logger.warn({ msg: 'encore-callback-poller: failed to fetch encore job', url, status: res.status });

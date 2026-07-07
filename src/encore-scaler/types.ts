@@ -80,5 +80,10 @@ export const keys = {
   jobStatus: (workspaceId: string) => `encore:job-status:${workspaceId}`,
   // Encore-assigned UUID for a job (stored at dispatch time, TTL 24h).
   // Keyed by our encoreJobId (externalId) across workspaces since it's unique.
-  jobUuid: (encoreJobId: string) => `encore:job-uuid:${encoreJobId}`
+  jobUuid: (encoreJobId: string) => `encore:job-uuid:${encoreJobId}`,
+  // Reverse mapping: Encore UUID → our externalId (encoreJobId). Stored at
+  // dispatch time alongside jobUuid so the callback poller can resolve the
+  // correct Encore instance URL even when the callback listener's built-in URL
+  // points at the wrong (non-scaler) instance.
+  uuidToExternalId: (encoreUuid: string) => `encore:uuid-ext:${encoreUuid}`
 };
