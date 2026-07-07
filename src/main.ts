@@ -43,6 +43,7 @@ import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
 import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
+import { profilesRouter } from './routes/profiles.js';
 import { InMemoryPipelineRepository } from './data/pipeline-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
@@ -381,6 +382,18 @@ const packaging = buildPackaging();
 // between the assets router (creates executions) and the internal router
 // (advances them from transcode/package callbacks).
 const pipelineRepository = new InMemoryPipelineRepository();
+
+// Encore transcoding profile catalogue (public metadata). Unauthenticated by
+// design — it exposes only the list of available profile names for a UI picker,
+// no workspace data. The index URL is the Encore instance's `profilesUrl`,
+// configurable via ENCORE_PROFILES_URL; defaults to the Eyevinn test profiles.
+const encoreProfilesUrl =
+  process.env['ENCORE_PROFILES_URL'] ??
+  'https://raw.githubusercontent.com/Eyevinn/encore-test-profiles/refs/heads/main/profiles.yml';
+await app.register(profilesRouter, {
+  prefix: '/api/v1/profiles',
+  profilesUrl: encoreProfilesUrl
+});
 
 // Assets router also owns POST /ingest-url (issue #5) and POST /:id/transcode
 // (issue #8). It shares the same job repository so a job created here is
