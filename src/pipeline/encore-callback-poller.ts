@@ -154,36 +154,49 @@ async function decrementActiveJobs(
 }
 
 // Process one queue message: fetch the Encore job, resolve our job, complete the
-// transcode, and advance the matching PipelineExecution. Never throws.
+// transcode, and advance the matching PipelineExecution.
+//
+// Throws on retryable failures (network errors, non-2xx Encore fetch, DB write
+// errors) so the outer loop can re-queue the message and retry. Non-retryable
+// cases (unparseable message, unknown externalId) log and return cleanly so the
+// message is dropped rather than looped forever.
 async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   let message: { jobId?: string; url?: string };
   try {
     message = JSON.parse(raw);
   } catch (err) {
-    deps.logger.warn({ msg: 'encore-callback-poller: unparseable queue message', raw, err });
+    // Unparseable: dropping is correct — retrying will never fix a corrupt message.
+    deps.logger.warn({ msg: 'encore-callback-poller: unparseable queue message — dropping', raw, err });
     return;
   }
+
   // Prefer resolving the Encore job URL from our Redis pool mapping — the URL
   // embedded by the callback listener always points at its own configured Encore
   // instance, which may differ from the scaler-managed instance that ran the job.
   const encoreUuid = message.jobId;
+  deps.logger.info({ msg: 'encore-callback-poller: processing message', encoreUuid, url: message.url });
+
+  // Throws if OSC token fetch fails — caller will catch and re-queue.
   const sat = await deps.oscContext.getServiceAccessToken('encore');
+
   let resolvedUrl: string | undefined;
   if (encoreUuid) {
     resolvedUrl = await resolveUrlFromEncoreUuid(encoreUuid, deps.redis);
+    deps.logger.info({ msg: 'encore-callback-poller: resolved url from redis', encoreUuid, resolvedUrl });
   }
   // Fall back to message.url (e.g. non-scaler deployments or missing mapping).
   const url = resolvedUrl ?? message.url;
   if (!url) {
-    deps.logger.warn({ msg: 'encore-callback-poller: queue message has no url', message });
+    // No URL and no mapping: can't retry usefully — drop.
+    deps.logger.warn({ msg: 'encore-callback-poller: queue message has no url — dropping', message });
     return;
   }
 
   // Fetch the Encore job document, authenticated with an OSC SAT for "encore".
   const res = await fetch(url, { headers: { Authorization: `Bearer ${sat}` } });
   if (!res.ok) {
-    deps.logger.warn({ msg: 'encore-callback-poller: failed to fetch encore job', url, status: res.status });
-    return;
+    // Non-2xx: throw so caller re-queues and retries (instance may be temporarily unavailable).
+    throw new Error(`encore-callback-poller: failed to fetch encore job — status ${res.status} url ${url}`);
   }
   const job = (await res.json()) as {
     externalId?: string;
@@ -195,19 +208,26 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   const externalId = job.externalId;
   const status = job.status;
   if (!externalId || !status) {
-    deps.logger.warn({ msg: 'encore-callback-poller: encore job missing externalId/status', url });
+    // Corrupt Encore response — dropping, retrying won't fix it.
+    deps.logger.warn({ msg: 'encore-callback-poller: encore job missing externalId/status — dropping', url });
     return;
   }
+
+  deps.logger.info({ msg: 'encore-callback-poller: fetched encore job', externalId, status });
 
   const found = await deps.jobRepository.findByEncoreJobId(externalId);
   if (!found) {
-    // Unknown job (e.g. from another deployment sharing the queue) — no-op.
-    deps.logger.info({ msg: 'encore-callback-poller: no local job for externalId', externalId });
+    // Unknown externalId — could be from another deployment sharing the queue. Drop.
+    deps.logger.info({ msg: 'encore-callback-poller: no local job for externalId — dropping', externalId });
     return;
   }
 
+  deps.logger.info({ msg: 'encore-callback-poller: completing transcode', jobId: found.job.id, externalId, status });
+
   const upper = status.toUpperCase();
   const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
+  // completeTranscode touches CouchDB — let any throw propagate so the outer
+  // loop re-queues and retries on transient DB errors.
   const result = await completeTranscode(
     {
       jobId: found.job.id,
