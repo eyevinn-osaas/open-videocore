@@ -48,6 +48,7 @@ import { InMemoryPipelineRepository } from './data/pipeline-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
+import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
@@ -382,6 +383,31 @@ const packaging = buildPackaging();
 // between the assets router (creates executions) and the internal router
 // (advances them from transcode/package callbacks).
 const pipelineRepository = new InMemoryPipelineRepository();
+
+// Encore completion callback poller (background). The eyevinn-encore-callback-
+// listener receives Encore's completion webhook in the cloud and writes a
+// message to a Redis sorted set; POST /api/v1/internal/encore-callback is only
+// reachable when this API is deployed publicly. This poller drains that same
+// sorted set and runs the identical completion + pipeline-advancement logic, so
+// transcode completions are applied even when the callback route is unreachable
+// (e.g. local runs). Only started when the shared Redis (same REDIS_URL the
+// listener writes to) is configured.
+let stopEncoreCallbackPoller: (() => void) | undefined;
+if (sharedRedis) {
+  stopEncoreCallbackPoller = startEncoreCallbackPoller({
+    redis: sharedRedis,
+    jobRepository,
+    assetRepository,
+    pipelineRepository,
+    packaging,
+    oscContext,
+    queueKey: process.env['ENCORE_CALLBACK_QUEUE_KEY'],
+    logger: app.log
+  });
+  app.addHook('onClose', async () => {
+    stopEncoreCallbackPoller?.();
+  });
+}
 
 // Encore transcoding profile catalogue (public metadata). Unauthenticated by
 // design — it exposes only the list of available profile names for a UI picker,
