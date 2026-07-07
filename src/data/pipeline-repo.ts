@@ -1,0 +1,134 @@
+// PipelineExecution repository (PipelineExecution feature).
+//
+// A PipelineExecution is a first-class record of a named pipeline being run
+// against a single asset. It replaces the ad-hoc pipelineStatus/
+// pipelineTranscodeJobId/pipelineError fields that previously lived on Asset.
+//
+// Each execution carries an ordered list of StepExecution entries whose status
+// advances as OSC callbacks arrive (see src/routes/internal.ts). Only an
+// in-memory implementation is provided — executions are ephemeral orchestration
+// state, not durable domain records, so no CouchDB backing is required yet.
+
+import { monotonicFactory } from 'ulid';
+import type { PipelineStepName } from '../pipeline/pipelines.js';
+
+const ulid = monotonicFactory();
+
+export type StepStatus = 'pending' | 'running' | 'done' | 'failed';
+
+export type StepExecution = {
+  name: PipelineStepName;
+  status: StepStatus;
+  jobId?: string; // internal job repo ID (transcode steps)
+  encoreJobId?: string; // Encore external job ID (transcode steps)
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+};
+
+export type PipelineExecution = {
+  id: string; // ULID
+  assetId: string;
+  pipelineName: string;
+  status: 'running' | 'done' | 'failed';
+  steps: StepExecution[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export interface PipelineRepository {
+  create(input: {
+    assetId: string;
+    pipelineName: string;
+    steps: PipelineStepName[];
+  }): Promise<PipelineExecution>;
+  get(id: string): Promise<PipelineExecution | undefined>;
+  update(
+    id: string,
+    patch: Partial<Pick<PipelineExecution, 'status' | 'steps'>>
+  ): Promise<PipelineExecution | undefined>;
+  listByAsset(assetId: string): Promise<PipelineExecution[]>;
+  // Find the most recent running execution for an asset that has the given step
+  // in 'running' state.
+  findRunningByAssetAndStep(
+    assetId: string,
+    step: PipelineStepName
+  ): Promise<PipelineExecution | undefined>;
+}
+
+export class InMemoryPipelineRepository implements PipelineRepository {
+  private readonly store = new Map<string, PipelineExecution>();
+
+  async create(input: {
+    assetId: string;
+    pipelineName: string;
+    steps: PipelineStepName[];
+  }): Promise<PipelineExecution> {
+    const now = new Date().toISOString();
+    const id = ulid();
+    const execution: PipelineExecution = {
+      id,
+      assetId: input.assetId,
+      pipelineName: input.pipelineName,
+      status: 'running',
+      steps: input.steps.map((name) => ({ name, status: 'pending' })),
+      createdAt: now,
+      updatedAt: now
+    };
+    this.store.set(id, execution);
+    return clone(execution);
+  }
+
+  async get(id: string): Promise<PipelineExecution | undefined> {
+    const found = this.store.get(id);
+    return found ? clone(found) : undefined;
+  }
+
+  async update(
+    id: string,
+    patch: Partial<Pick<PipelineExecution, 'status' | 'steps'>>
+  ): Promise<PipelineExecution | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const next: PipelineExecution = {
+      ...existing,
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.steps !== undefined ? { steps: patch.steps } : {}),
+      updatedAt: new Date().toISOString()
+    };
+    this.store.set(id, next);
+    return clone(next);
+  }
+
+  async listByAsset(assetId: string): Promise<PipelineExecution[]> {
+    return [...this.store.values()]
+      .filter((e) => e.assetId === assetId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(clone);
+  }
+
+  async findRunningByAssetAndStep(
+    assetId: string,
+    step: PipelineStepName
+  ): Promise<PipelineExecution | undefined> {
+    const candidates = [...this.store.values()]
+      .filter(
+        (e) =>
+          e.assetId === assetId &&
+          e.status === 'running' &&
+          e.steps.some((s) => s.name === step && s.status === 'running')
+      )
+      // Most recent first.
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    return candidates.length > 0 ? clone(candidates[0]) : undefined;
+  }
+}
+
+function clone(execution: PipelineExecution): PipelineExecution {
+  return {
+    ...execution,
+    steps: execution.steps.map((s) => ({ ...s }))
+  };
+}

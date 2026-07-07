@@ -30,6 +30,7 @@ import type { PackagingService } from '../pipeline/packaging.js';
 import type { JobRepository } from '../data/job-repo.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
+import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -102,7 +103,15 @@ type InternalRouterOptions = {
   webhookDispatcher?: WebhookDispatcher;
   // Redis client for looking up Encore instance URL at packaging trigger time.
   redis?: Redis;
+  // PipelineExecution tracking (PipelineExecution feature). When set, transcode/
+  // package completion callbacks advance the matching running execution.
+  pipelineRepository?: PipelineRepository;
 };
+
+// Are all steps of an execution terminal (done)? Used to close out an execution.
+function allStepsDone(steps: StepExecution[]): boolean {
+  return steps.every((s) => s.status === 'done');
+}
 
 // Build the Encore job API URL for packaging. Looks up the instance URL and
 // the Encore-assigned UUID (stored at dispatch time) from the Redis pool.
@@ -173,11 +182,23 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
       }
       const applied = await opts.packaging.handleSuccess(request.body);
       if (!applied) return reply.code(404).send({ error: 'not_found' });
-      // Advance pipeline state when packaging completes (pipeline mode).
-      if (opts.repository) {
-        const asset = await opts.repository.get(request.body.jobId);
-        if (asset?.pipelineStatus === 'packaging') {
-          await opts.repository.update(asset.id, { pipelineStatus: 'done' });
+      // Advance the matching PipelineExecution when packaging completes.
+      if (opts.pipelineRepository) {
+        const execution = await opts.pipelineRepository.findRunningByAssetAndStep(
+          request.body.jobId,
+          'package'
+        );
+        if (execution) {
+          const now = new Date().toISOString();
+          const steps = execution.steps.map((s) =>
+            s.name === 'package' && s.status === 'running'
+              ? { ...s, status: 'done' as const, completedAt: now }
+              : s
+          );
+          await opts.pipelineRepository.update(execution.id, {
+            steps,
+            status: allStepsDone(steps) ? 'done' : 'running'
+          });
         }
       }
       if (opts.webhookDispatcher) {
@@ -252,27 +273,54 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
         { jobs: jobRepository, assets: repository }
       );
 
-      // Pipeline orchestration: if this transcode was kicked off by pipeline mode
-      // (POST /assets/:id/package with no encoreJobId), auto-trigger packaging now.
-      if (result.applied && opts.packaging && opts.redis) {
-        const sourceAsset = await repository.get(found.job.assetId);
-        if (sourceAsset?.pipelineTranscodeJobId === found.job.id) {
-          if (success) {
-            const encoreJobUrl = await resolveEncoreJobUrl(externalId, opts.redis);
-            if (encoreJobUrl) {
-              await repository.update(sourceAsset.id, { pipelineStatus: 'packaging', pipelineError: undefined });
-              void opts.packaging.triggerPackaging(sourceAsset.id, encoreJobUrl);
+      // Advance the matching PipelineExecution. If this transcode was part of a
+      // pipeline (e.g. abr-vod / full), mark the transcode step done/failed and,
+      // on success, trigger the next step when it is `package`.
+      if (result.applied && opts.pipelineRepository) {
+        const execution = await opts.pipelineRepository.findRunningByAssetAndStep(
+          found.job.assetId,
+          'transcode'
+        );
+        // Match the specific execution by the encoreJobId stored on the step, so
+        // concurrent executions never advance the wrong one.
+        if (execution && execution.steps.some((s) => s.name === 'transcode' && s.encoreJobId === externalId)) {
+          const now = new Date().toISOString();
+          const steps: StepExecution[] = execution.steps.map((s) => ({ ...s }));
+          const tIdx = steps.findIndex((s) => s.name === 'transcode' && s.encoreJobId === externalId);
+
+          if (!success) {
+            steps[tIdx] = {
+              ...steps[tIdx],
+              status: 'failed',
+              error: message ?? `encore status: ${status}`,
+              completedAt: now
+            };
+            await opts.pipelineRepository.update(execution.id, { steps, status: 'failed' });
+          } else {
+            steps[tIdx] = { ...steps[tIdx], status: 'done', completedAt: now };
+            // Find the next pending step. When it is `package`, trigger packaging.
+            const nextIdx = steps.findIndex((s) => s.status === 'pending');
+            if (nextIdx >= 0 && steps[nextIdx].name === 'package' && opts.packaging && opts.redis) {
+              const encoreJobUrl = await resolveEncoreJobUrl(externalId, opts.redis);
+              if (encoreJobUrl) {
+                steps[nextIdx] = { ...steps[nextIdx], status: 'running', startedAt: now };
+                await opts.pipelineRepository.update(execution.id, { steps, status: 'running' });
+                void opts.packaging.triggerPackaging(found.job.assetId, encoreJobUrl);
+              } else {
+                steps[nextIdx] = {
+                  ...steps[nextIdx],
+                  status: 'failed',
+                  error: 'Encore instance no longer available for packaging',
+                  completedAt: now
+                };
+                await opts.pipelineRepository.update(execution.id, { steps, status: 'failed' });
+              }
             } else {
-              await repository.update(sourceAsset.id, {
-                pipelineStatus: 'failed',
-                pipelineError: 'Encore instance no longer available for packaging'
+              await opts.pipelineRepository.update(execution.id, {
+                steps,
+                status: allStepsDone(steps) ? 'done' : 'running'
               });
             }
-          } else {
-            await repository.update(sourceAsset.id, {
-              pipelineStatus: 'failed',
-              pipelineError: message ?? `encore status: ${status}`
-            });
           }
         }
       }

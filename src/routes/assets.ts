@@ -43,6 +43,12 @@ import {
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import {
+  BUILT_IN_PIPELINES,
+  PIPELINE_NAMES,
+  type PipelineStepName
+} from '../pipeline/pipelines.js';
+import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
+import {
   extractThumbnails,
   type ExtractThumbnailsDeps,
   type FrameExtractor
@@ -280,9 +286,6 @@ const assetSchema = z.object({
   // packaging completes; `packagingError` carries the last packaging failure.
   manifestUrls: manifestUrlsSchema.optional(),
   packagingError: z.string().optional(),
-  // Pipeline orchestration state (issue #9 pipeline mode).
-  pipelineStatus: z.enum(['transcoding', 'packaging', 'done', 'failed']).optional(),
-  pipelineError: z.string().optional(),
   // ABR renditions produced by transcoding (issue #8). Absent until a transcode
   // job completes; each entry links to a child asset via its assetId.
   renditions: z.array(renditionSchema).optional(),
@@ -366,7 +369,31 @@ type AssetsRouterOptions = {
   packaging?: import('../pipeline/packaging.js').PackagingService;
   // Redis for resolving Encore instance URL at packaging time.
   packagingRedis?: import('ioredis').Redis;
+  // PipelineExecution tracking (POST /:id/execute). When absent, the execute
+  // route and pipeline-mode packaging respond 501.
+  pipelineRepository?: PipelineRepository;
 };
+
+// PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
+const stepStatusSchema = z.enum(['pending', 'running', 'done', 'failed']);
+const stepExecutionSchema = z.object({
+  name: z.enum(['extract-metadata', 'thumbnail', 'transcode', 'package']),
+  status: stepStatusSchema,
+  jobId: z.string().optional(),
+  encoreJobId: z.string().optional(),
+  error: z.string().optional(),
+  startedAt: z.string().optional(),
+  completedAt: z.string().optional()
+});
+const pipelineExecutionSchema = z.object({
+  id: z.string(),
+  assetId: z.string(),
+  pipelineName: z.string(),
+  status: z.enum(['running', 'done', 'failed']),
+  steps: z.array(stepExecutionSchema),
+  createdAt: z.string(),
+  updatedAt: z.string()
+});
 
 const ingestUrlSchema = z.object({
   sourceUrl: z.string().min(1).max(4096),
@@ -433,6 +460,144 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     );
     return true;
+  }
+
+  // Fire-and-forget thumbnail extraction for a pipeline step. Uses a default
+  // poster-frame timecode (1s in). No-op when thumbnails are not configured.
+  function triggerThumbnail(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+    if (!opts.thumbnailExtractor || !storageFor) {
+      return false;
+    }
+    const s3Cfg = request.connections?.s3Config;
+    const resolvedExtractor =
+      typeof opts.thumbnailExtractor === 'function' && s3Cfg
+        ? (opts.thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)({
+            ...s3Cfg,
+            bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
+          })
+        : (opts.thumbnailExtractor as FrameExtractor);
+    void thumbnailRunner(
+      { assetId, objectKey, timecodes: [1] },
+      { assets: repo, storage: storageFor(), extractor: resolvedExtractor, ...opts.thumbnailDeps }
+    ).catch(() => {
+      /* thumbnail failures are recorded on the asset by the runner */
+    });
+    return true;
+  }
+
+  // Start a named built-in pipeline against an asset, executing the first step
+  // immediately. Returns the created PipelineExecution, or undefined after
+  // having sent an error response via `reply`. Callers must not send again when
+  // undefined is returned.
+  //
+  // Shared by POST /:id/execute and pipeline-mode POST /:id/package.
+  async function startPipelineExecution(
+    asset: NonNullable<Awaited<ReturnType<AssetRepository['get']>>>,
+    pipelineName: keyof typeof BUILT_IN_PIPELINES,
+    request: import('fastify').FastifyRequest,
+    reply: import('fastify').FastifyReply
+  ): Promise<import('../data/pipeline-repo.js').PipelineExecution | undefined> {
+    const pipelineRepo = opts.pipelineRepository;
+    if (!pipelineRepo) {
+      reply.code(501).send({ error: 'not_configured', message: 'pipeline execution not configured' });
+      return undefined;
+    }
+    const steps = BUILT_IN_PIPELINES[pipelineName];
+
+    // Reject if a pipeline is already running for this asset.
+    const existing = await pipelineRepo.listByAsset(asset.id);
+    if (existing.some((e) => e.status === 'running')) {
+      reply.code(409).send({ error: 'pipeline_running', message: 'a pipeline is already running for this asset' });
+      return undefined;
+    }
+
+    const firstStep = steps[0];
+
+    // Pre-flight the first step's requirements before creating the execution so
+    // an un-runnable pipeline never leaves a dangling running execution.
+    if (firstStep === 'transcode' || firstStep === 'package') {
+      if (firstStep === 'transcode' && (!opts.encore || !opts.sourceBucket || !opts.outputBucket)) {
+        reply.code(501).send({ error: 'not_configured', message: 'transcoding is not configured' });
+        return undefined;
+      }
+      if (firstStep === 'package' && !opts.packaging) {
+        reply.code(501).send({ error: 'not_configured', message: 'packaging is not configured' });
+        return undefined;
+      }
+      if (!asset.objectKey) {
+        reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
+        return undefined;
+      }
+    }
+    if ((firstStep === 'extract-metadata' || firstStep === 'thumbnail') && !asset.objectKey) {
+      reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
+      return undefined;
+    }
+
+    void firstStep; // pre-flight above used firstStep; execution drives the loop
+    const execution = await pipelineRepo.create({ assetId: asset.id, pipelineName, steps });
+    const now = () => new Date().toISOString();
+    const stepsCopy: StepExecution[] = execution.steps.map((s) => ({ ...s }));
+
+    // Execute steps synchronously until we hit an asynchronous step (transcode/
+    // package) which completes via an OSC callback, or run out of steps. The
+    // fire-and-forget steps (extract-metadata, thumbnail) settle immediately.
+    try {
+      for (let i = 0; i < stepsCopy.length; i++) {
+        const step = stepsCopy[i];
+        if (step.name === 'extract-metadata') {
+          triggerExtraction(asset.id, asset.objectKey as string);
+          stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          continue;
+        }
+        if (step.name === 'thumbnail') {
+          triggerThumbnail(asset.id, asset.objectKey as string, request);
+          stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          continue;
+        }
+        if (step.name === 'transcode') {
+          const result = await submitTranscode(
+            {
+              workspaceId: DEPLOYMENT_CONTEXT,
+              sourceAssetId: asset.id,
+              sourceObjectKey: asset.objectKey as string,
+              sourceBucket: opts.sourceBucket as string,
+              outputBucket: opts.outputBucket as string
+            },
+            { jobs, assets: repo, encore: opts.encore!, encoreCallbackUrl: request.connections?.encoreCallbackUrl }
+          );
+          stepsCopy[i] = {
+            ...step,
+            status: 'running',
+            jobId: result.jobId,
+            encoreJobId: result.encoreJobId,
+            startedAt: now()
+          };
+          break; // async — advanced by encore-callback
+        }
+        if (step.name === 'package') {
+          void opts.packaging!.triggerPackaging(asset.id, '');
+          stepsCopy[i] = { ...step, status: 'running', startedAt: now() };
+          break; // async — advanced by packager callback
+        }
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const idx = stepsCopy.findIndex((s) => s.status === 'pending');
+      const failIdx = idx >= 0 ? idx : stepsCopy.length - 1;
+      stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      await pipelineRepo.update(execution.id, { steps: stepsCopy, status: 'failed' });
+      reply.code(502).send({ error: 'pipeline_step_failed', message });
+      return undefined;
+    }
+
+    // All steps settled synchronously with none running/pending -> done.
+    const allDone = stepsCopy.every((s) => s.status === 'done');
+    const updated = await pipelineRepo.update(execution.id, {
+      steps: stepsCopy,
+      status: allDone ? 'done' : 'running'
+    });
+    return updated ?? { ...execution, steps: stepsCopy };
   }
 
   // Map domain errors to HTTP status codes for this router.
@@ -747,10 +912,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // HLS/DASH packaging (issue #9). Workspace-scoped and behind `authenticate`.
   // `encoreJobId` is optional:
   //   - Provided: enqueues that specific Encore job for CMAF packaging directly.
-  //   - Omitted: "pipeline mode" — submits an ABR transcode first, then auto-
-  //     triggers packaging when the transcode callback arrives. Pipeline state
-  //     is persisted on the asset (pipelineStatus) so a failed transcode can be
-  //     retried by calling this endpoint again.
+  //   - Omitted: "pipeline mode" — starts an abr-vod PipelineExecution
+  //     (transcode then package) and tracks progress there. Equivalent to
+  //     POST /:id/execute { pipeline: 'abr-vod' }.
   //
   //   202 — packaging enqueued (or pipeline started)
   //   404 — unknown/foreign asset (existence not leaked)
@@ -783,50 +947,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       const { encoreJobId } = request.body;
 
-      // Pipeline mode: auto-transcode then package.
+      // Pipeline mode: auto-transcode then package. Tracked as a first-class
+      // PipelineExecution (abr-vod = [transcode, package]) rather than ad-hoc
+      // fields on the asset.
       if (!encoreJobId) {
         if (!opts.encore) {
           return reply.code(501).send({ error: 'not_configured', message: 'transcode not configured — cannot start pipeline' });
         }
-        // Reject if a pipeline step is already running (not failed/done).
-        if (asset.pipelineStatus === 'transcoding' || asset.pipelineStatus === 'packaging') {
-          return reply.code(409).send({
-            error: 'pipeline_running',
-            message: `pipeline already in '${asset.pipelineStatus}' — wait for it to complete or check its status`
-          });
+        if (!opts.pipelineRepository) {
+          return reply.code(501).send({ error: 'not_configured', message: 'pipeline execution not configured' });
         }
-        if (!asset.objectKey) {
-          return reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to transcode' });
-        }
-        if (!opts.sourceBucket || !opts.outputBucket) {
-          return reply.code(501).send({ error: 'not_configured', message: 'transcode buckets not configured' });
-        }
-        try {
-          const result = await submitTranscode(
-            {
-              workspaceId: DEPLOYMENT_CONTEXT,
-              sourceAssetId: asset.id,
-              sourceObjectKey: asset.objectKey,
-              sourceBucket: opts.sourceBucket,
-              outputBucket: opts.outputBucket
-            },
-            {
-              jobs,
-              assets: repo,
-              encore: opts.encore,
-              encoreCallbackUrl: request.connections?.encoreCallbackUrl
-            }
-          );
-          await repo.update(asset.id, {
-            pipelineStatus: 'transcoding',
-            pipelineTranscodeJobId: result.jobId,
-            pipelineError: undefined
-          });
-          return reply.code(202).send({ ok: true, jobId: result.jobId, pipelineMode: true });
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          return reply.code(502).send({ error: 'encore_submit_failed', message });
-        }
+        const started = await startPipelineExecution(asset, 'abr-vod', request, reply);
+        if (!started) return reply; // startPipelineExecution already sent the error
+        return reply.code(202).send({ ok: true, jobId: started.steps.find((s) => s.name === 'transcode')?.jobId, pipelineMode: true });
       }
 
       // Explicit encoreJobId: enqueue for packaging immediately.
@@ -843,6 +976,91 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       void opts.packaging.triggerPackaging(asset.id, encoreJobUrl);
       return reply.code(202).send({ ok: true });
+    }
+  );
+
+  // Execute a named built-in pipeline against an asset (PipelineExecution).
+  // The primary way to process an asset: runs the pipeline's steps, tracking
+  // progress as a first-class PipelineExecution. The first step runs immediately;
+  // asynchronous steps (transcode/package) advance via OSC callbacks.
+  //   202 — pipeline execution created
+  //   404 — unknown asset
+  //   409 — a pipeline is already running / asset has no stored object
+  //   501 — pipeline execution or the required OSC service is not configured
+  //   502 — the first step's submission failed
+  app.post(
+    '/:id/execute',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: z.object({ pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]) }),
+        response: {
+          202: pipelineExecutionSchema,
+          404: z.object({ error: z.string() }),
+          409: errorSchema,
+          501: errorSchema,
+          502: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      if (!opts.pipelineRepository) {
+        return reply.code(501).send({ error: 'not_configured', message: 'pipeline execution is not configured' });
+      }
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const started = await startPipelineExecution(
+        asset,
+        request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
+        request,
+        reply
+      );
+      if (!started) return reply; // error already sent
+      return reply.code(202).send(started);
+    }
+  );
+
+  // List all pipeline executions for an asset.
+  //   200 — array of executions (possibly empty); 404 — unknown asset
+  app.get(
+    '/:id/executions',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: z.array(pipelineExecutionSchema), 404: z.object({ error: z.string() }) }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const executions = opts.pipelineRepository ? await opts.pipelineRepository.listByAsset(asset.id) : [];
+      return reply.code(200).send(executions);
+    }
+  );
+
+  // Get a single pipeline execution.
+  //   200 — the execution; 404 — unknown asset or execution
+  app.get(
+    '/:id/executions/:execId',
+    {
+      schema: {
+        params: z.object({ id: z.string(), execId: z.string() }),
+        response: { 200: pipelineExecutionSchema, 404: z.object({ error: z.string() }) }
+      }
+    },
+    async (request, reply) => {
+      if (!opts.pipelineRepository) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const execution = await opts.pipelineRepository.get(request.params.execId);
+      if (!execution || execution.assetId !== request.params.id) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(execution);
     }
   );
 

@@ -134,6 +134,54 @@ function renderTags(tags) {
   return tags.map(function(t) { return '<span class="tag">' + escHtml(t) + '</span>'; }).join(' ');
 }
 
+// Fetch and render an asset's PipelineExecution list into `container`. Each
+// execution is a small table: pipeline name + status badge, then one row per
+// step with its status badge. All server text inserted via escHtml.
+async function renderExecutions(assetId, container) {
+  container.innerHTML = '';
+  var title = document.createElement('div');
+  title.className = 'section-title';
+  title.textContent = 'Executions';
+  container.appendChild(title);
+
+  var executions;
+  try {
+    executions = await apiFetch('/assets/' + encodeURIComponent(assetId) + '/executions');
+  } catch (err) {
+    var e = document.createElement('div');
+    e.className = 'text-muted';
+    e.textContent = 'Could not load executions: ' + err.message;
+    container.appendChild(e);
+    return;
+  }
+  if (!executions || executions.length === 0) {
+    var none = document.createElement('div');
+    none.className = 'text-muted';
+    none.textContent = 'No pipeline executions yet.';
+    container.appendChild(none);
+    return;
+  }
+
+  var execBadge = function(status) {
+    var color = { running: 'var(--accent,#60a5fa)', pending: 'var(--text-muted,#9ca3af)', done: 'var(--success,#4ade80)', failed: 'var(--error,#f87171)' }[status] || '';
+    return '<span style="color:' + color + '">' + escHtml(status) + '</span>';
+  };
+
+  executions.forEach(function(exec) {
+    var wrap = document.createElement('div');
+    wrap.className = 'mt8';
+    var rows = exec.steps.map(function(s) {
+      var extra = s.error ? ' — ' + escHtml(s.error) : '';
+      return '<tr><td>' + escHtml(s.name) + '</td><td>' + execBadge(s.status) + extra + '</td></tr>';
+    }).join('');
+    wrap.innerHTML =
+      '<table class="mini-table"><thead><tr><th colspan="2">' +
+      escHtml(exec.pipelineName) + ' — ' + execBadge(exec.status) +
+      '</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    container.appendChild(wrap);
+  });
+}
+
 // ─── Pipeline visualization framework ─────────────────────────────────────────
 // Reusable: renders a horizontal row of status nodes connected by arrows.
 // Each stage: { label: string, status: 'pending'|'running'|'completed'|'failed'|'warning', detail?: string }
@@ -654,13 +702,6 @@ async function showAssetDetail(id, detailPanel) {
     } else if (asset.technicalMetadataError) {
       kvRows.push(['Tech Metadata', '<span style="color:var(--error,#f87171)">' + escHtml(asset.technicalMetadataError) + '</span>']);
     }
-    if (asset.pipelineStatus) {
-      var pipelineColor = { transcoding: 'var(--accent,#60a5fa)', packaging: 'var(--accent,#60a5fa)', done: 'var(--success,#4ade80)', failed: 'var(--error,#f87171)' }[asset.pipelineStatus] || '';
-      var pipelineText = '<span style="color:' + pipelineColor + '">' + escHtml(asset.pipelineStatus) + '</span>';
-      if (asset.pipelineError) pipelineText += ' — ' + escHtml(asset.pipelineError);
-      kvRows.push(['Pipeline', pipelineText]);
-    }
-
     const kvHtml = kvRows.map(function(r) {
       return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
     }).join('');
@@ -684,6 +725,27 @@ async function showAssetDetail(id, detailPanel) {
       body.appendChild(metaDiv);
     }
 
+    // Pipeline executions (PipelineExecution feature). Rendered as a small table
+    // per execution; refreshed by the Run Pipeline control below.
+    const execDiv = document.createElement('div');
+    execDiv.className = 'mt12';
+    execDiv.id = 'executions-area';
+    body.appendChild(execDiv);
+    await renderExecutions(id, execDiv);
+
+    // Run Pipeline control: a named-pipeline select + trigger button.
+    const runDiv = document.createElement('div');
+    runDiv.className = 'mt12 flex-gap';
+    runDiv.innerHTML = [
+      '<select id="pipeline-select" class="input">',
+      '  <option value="abr-vod">abr-vod (transcode + package)</option>',
+      '  <option value="ingest">ingest (metadata + thumbnail)</option>',
+      '  <option value="full">full (all steps)</option>',
+      '</select>',
+      '<button id="btn-run-pipeline" class="btn-ghost">Run Pipeline</button>',
+    ].join('');
+    body.appendChild(runDiv);
+
     // Action buttons — static labels, no dynamic content
     const actionsDiv = document.createElement('div');
     actionsDiv.className = 'mt12 flex-gap';
@@ -694,6 +756,21 @@ async function showAssetDetail(id, detailPanel) {
       '<button id="btn-thumbnails" class="btn-ghost">Thumbnails</button>',
     ].join('');
     body.appendChild(actionsDiv);
+
+    runDiv.querySelector('#btn-run-pipeline').addEventListener('click', async function() {
+      actionMsg.innerHTML = '';
+      var pipeline = runDiv.querySelector('#pipeline-select').value;
+      try {
+        var exec = await apiFetch('/assets/' + encodeURIComponent(id) + '/execute', {
+          method: 'POST',
+          body: JSON.stringify({ pipeline: pipeline })
+        });
+        showMsg(actionMsg, 'Pipeline "' + escHtml(exec.pipelineName) + '" started (execution ' + escHtml(exec.id) + ').', 'success');
+        await renderExecutions(id, execDiv);
+      } catch (err) {
+        showMsg(actionMsg, 'Error: ' + err.message, 'error');
+      }
+    });
 
     const actionMsg = document.createElement('div');
     actionMsg.id = 'action-msg';
