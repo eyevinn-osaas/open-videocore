@@ -734,12 +734,12 @@ async function showAssetDetail(id, detailPanel) {
     await renderExecutions(id, execDiv);
 
     // Run Pipeline control: pipeline select + optional profile select + trigger.
-    var ENCODE_PIPELINES = ['encode', 'abr-vod', 'full']; // pipelines with a transcode step
+    var ENCODE_PIPELINES = ['transcode', 'abr-vod', 'full']; // pipelines with a transcode step
     const runDiv = document.createElement('div');
     runDiv.className = 'mt12 flex-gap';
     runDiv.innerHTML = [
       '<select id="pipeline-select" class="input">',
-      '  <option value="encode">encode (transcode only)</option>',
+      '  <option value="transcode">transcode (transcode only)</option>',
       '  <option value="abr-vod">abr-vod (transcode + package)</option>',
       '  <option value="ingest">ingest (metadata + thumbnail)</option>',
       '  <option value="full">full (all steps)</option>',
@@ -2413,15 +2413,15 @@ function cssEscape(value) {
 
 var PIPELINE_CATALOG = [
   {
-    name: 'encode',
-    label: 'Encode',
-    description: 'Encode the source file using the selected profile. Profile is chosen at execution time.',
+    name: 'transcode',
+    label: 'Transcode',
+    description: 'Transcode the source file using the selected profile. Profile is chosen at execution time.',
     steps: ['transcode']
   },
   {
     name: 'abr-vod',
     label: 'ABR VOD',
-    description: 'Encode then package to HLS/DASH for streaming. Profile is chosen at execution time.',
+    description: 'Transcode then package to HLS/DASH for streaming. Profile is chosen at execution time.',
     steps: ['transcode', 'package']
   },
   {
@@ -2433,7 +2433,7 @@ var PIPELINE_CATALOG = [
   {
     name: 'full',
     label: 'Full',
-    description: 'Full pipeline: metadata extraction, thumbnails, encode, and HLS/DASH packaging.',
+    description: 'Full pipeline: metadata extraction, thumbnails, transcode, and HLS/DASH packaging.',
     steps: ['extract-metadata', 'thumbnail', 'transcode', 'package']
   }
 ];
