@@ -2439,7 +2439,7 @@ var PIPELINE_CATALOG = [
 ];
 
 // Encode profiles available for pipelines with a transcode step.
-var ENCODE_PROFILES = ['program', 'drama', 'sport', 'low-latency'];
+var ENCODE_PROFILES = ['1080p', '720p', '480p'];
 
 var STEP_ICONS = {
   'extract-metadata': '🔬',
