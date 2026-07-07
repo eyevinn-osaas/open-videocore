@@ -735,6 +735,27 @@ async function showAssetDetail(id, detailPanel) {
 
     // Run Pipeline control: pipeline select + optional profile select + trigger.
     var ENCODE_PIPELINES = ['transcode', 'abr-vod', 'full']; // pipelines with a transcode step
+
+    // Load available Encore profiles from the public GET /profiles endpoint.
+    // No auth header needed, so use a plain fetch rather than apiFetch.
+    // Fall back to the known-good 'program' profile if the fetch fails or is empty.
+    var encodeProfiles = ['program'];
+    try {
+      const profilesResp = await fetch('/profiles');
+      if (profilesResp.ok) {
+        const profilesData = await profilesResp.json();
+        if (profilesData && Array.isArray(profilesData.profiles) && profilesData.profiles.length > 0) {
+          encodeProfiles = profilesData.profiles;
+        } else {
+          console.warn('GET /profiles returned no profiles; falling back to default ["program"]');
+        }
+      } else {
+        console.warn('GET /profiles failed with status ' + profilesResp.status + '; falling back to default ["program"]');
+      }
+    } catch (e) {
+      console.warn('GET /profiles request failed; falling back to default ["program"]', e);
+    }
+
     const runDiv = document.createElement('div');
     runDiv.className = 'mt12 flex-gap';
     runDiv.innerHTML = [
@@ -745,7 +766,7 @@ async function showAssetDetail(id, detailPanel) {
       '  <option value="full">full (all steps)</option>',
       '</select>',
       '<select id="profile-select" class="input" title="Encode profile (for pipelines with a transcode step)">',
-      ENCODE_PROFILES.map(function(p) { return '<option value="' + escHtml(p) + '">' + escHtml(p) + '</option>'; }).join(''),
+      encodeProfiles.map(function(p) { return '<option value="' + escHtml(p) + '">' + escHtml(p) + '</option>'; }).join(''),
       '</select>',
       '<button id="btn-run-pipeline" class="btn-ghost">Run Pipeline</button>',
     ].join('');
@@ -2437,9 +2458,6 @@ var PIPELINE_CATALOG = [
     steps: ['extract-metadata', 'thumbnail', 'transcode', 'package']
   }
 ];
-
-// Encode profiles available for pipelines with a transcode step.
-var ENCODE_PROFILES = ['1080p', '720p', '480p'];
 
 var STEP_ICONS = {
   'extract-metadata': '🔬',
