@@ -188,9 +188,12 @@ export class EncoreScalerLoop {
               `tracked=${record.activeJobs} actual=${actualCount}`
           );
           record.activeJobs = actualCount;
-          if (record.activeJobs === 0) {
-            record.lastIdleAt = Date.now();
-          }
+          // Do NOT update lastIdleAt here. The idle clock must only advance when
+          // the callback poller confirms the completion (via decrementActiveJobs).
+          // Setting lastIdleAt during reconciliation would start the teardown
+          // countdown before the poller has had a chance to process the message,
+          // causing the instance to be destroyed while the poller is still
+          // fetching from it.
           await redis.hset(
             keys.pool(workspaceId),
             instanceId,
