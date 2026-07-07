@@ -118,7 +118,7 @@ function badgeClass(status) {
   if (!status) return 'badge-unknown';
   const s = status.toLowerCase();
   if (['ready', 'active', 'done', 'completed'].includes(s)) return 'badge-ready';
-  if (['pending', 'ingesting', 'transcoding', 'processing', 'running'].includes(s)) return 'badge-pending';
+  if (['pending', 'queued', 'ingesting', 'transcoding', 'processing', 'running'].includes(s)) return 'badge-pending';
   if (['failed', 'error', 'archived'].includes(s)) return 'badge-failed';
   return 'badge-unknown';
 }
@@ -244,7 +244,7 @@ function renderPipeline(stages) {
 
 // Derive the transcode pipeline stages from a job + (optional) source asset.
 // Contract sources:
-//   src/data/job-repo.ts   — JobStatus = 'pending'|'running'|'done'|'failed'; JobType includes 'transcode'
+//   src/data/job-repo.ts   — JobStatus = 'pending'|'queued'|'running'|'done'|'failed'; JobType includes 'transcode'
 //   src/data/asset-repo.ts — AssetStatus = 'uploading'|'processing'|'ready'|'failed'|'archived'; Asset.renditions?: Rendition[]
 function buildTranscodePipeline(job, asset) {
   const jobStatus = job && job.status;
@@ -256,7 +256,15 @@ function buildTranscodePipeline(job, asset) {
 
   // Transcode (Encore)
   let transcode;
-  if (jobStatus === 'running') {
+  if (jobStatus === 'queued') {
+    // Job is waiting in the Encore auto-scaler's local queue, not yet dispatched
+    // to an Encore instance (ADR-006). Show it as an active (amber) stage.
+    transcode = {
+      label: 'Transcode (Encore)',
+      status: 'running',
+      detail: 'Queued'
+    };
+  } else if (jobStatus === 'running') {
     transcode = {
       label: 'Transcode (Encore)',
       status: 'running',

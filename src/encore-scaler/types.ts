@@ -45,6 +45,12 @@ export type EncoreScalerConfig = {
   // MinIO S3 credentials injected into every spawned Encore instance. Required
   // for Encore to read source files from the workspace's MinIO bucket.
   s3Config?: EncoreS3Config;
+  // Invoked after a queued job is successfully dispatched to an Encore instance
+  // (after the Redis mapping/status writes). The scaler has no job repository of
+  // its own, so main.ts wires this up to advance the corresponding Job from
+  // `queued` to `running`. Best-effort: failures are swallowed so a repo hiccup
+  // never re-queues an already-dispatched job.
+  onDispatched?: (encoreJobId: string) => Promise<void>;
 };
 
 export type EncoreInstanceRecord = {

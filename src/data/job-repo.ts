@@ -11,10 +11,12 @@
 // Job model + lifecycle
 // ---------------------------------------------------------------------------
 
-// Job lifecycle. A job is created `pending`, advances to `running` once the
-// worker starts streaming bytes, and ends in either `done` or `failed`. Both
-// are terminal.
-export const JOB_STATUSES = ['pending', 'running', 'done', 'failed'] as const;
+// Job lifecycle. A job is created `pending`. Transcode jobs then sit `queued`
+// while they wait in the Encore auto-scaler's local Redis queue (ADR-006), and
+// advance to `running` once the scaler dispatches them to an Encore instance.
+// Ingest jobs advance straight to `running` once the worker starts streaming
+// bytes. Both kinds end in either `done` or `failed`; both are terminal.
+export const JOB_STATUSES = ['pending', 'queued', 'running', 'done', 'failed'] as const;
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
 // The kind of work a job performs. URL-pull ingest (issue #5) and ABR
@@ -92,7 +94,8 @@ export type UpdateJobInput = {
 };
 
 const ALLOWED_JOB_TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
-  pending: ['running', 'failed'],
+  pending: ['queued', 'running', 'failed'],
+  queued: ['running', 'failed'],
   running: ['done', 'failed', 'running'],
   done: [],
   failed: []

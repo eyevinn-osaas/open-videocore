@@ -24,6 +24,9 @@ export type WorkspaceEncoreScalerConfig = {
   idleTimeoutMs: number;
   tickIntervalMs?: number;
   s3Config?: import('./types.js').EncoreS3Config;
+  // Forwarded to every per-workspace scaler loop: invoked after a queued job is
+  // dispatched to an Encore instance so the Job record can advance queued->running.
+  onDispatched?: (encoreJobId: string) => Promise<void>;
 };
 
 export class WorkspaceEncoreScalerRegistry implements EncoreClient {
@@ -42,7 +45,8 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       oscContext: this.config.oscContext,
       redis: this.config.redis,
       getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
-      s3Config: this.config.s3Config
+      s3Config: this.config.s3Config,
+      onDispatched: this.config.onDispatched
     };
 
     const loop = new EncoreScalerLoop(scalerConfig);

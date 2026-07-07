@@ -334,7 +334,22 @@ if (storageAvailable && process.env['REDIS_URL']) {
       endpoint: encoreS3Endpoint,
       accessKeyId: encoreS3AccessKey,
       secretAccessKey: encoreS3SecretKey
-    } : undefined
+    } : undefined,
+    // When the scaler dispatches a queued job to an Encore instance, advance the
+    // Job record queued->running and the source asset to `processing`. The
+    // scaler has no repositories of its own, so we resolve the job here by the
+    // encoreJobId (our externalId) it was submitted with.
+    onDispatched: async (encoreJobId: string) => {
+      const found = await jobRepository.findByEncoreJobId(encoreJobId);
+      if (!found) return;
+      const { job } = found;
+      if (job.status === 'queued' || job.status === 'pending') {
+        await jobRepository.update(job.id, { status: 'running' });
+      }
+      if (job.assetId) {
+        await assetRepository.update(job.assetId, { status: 'processing' });
+      }
+    }
   });
   if (!encoreS3Endpoint) {
     app.log.warn('ENCORE_S3_ENDPOINT not set — Encore instances will not be able to read from MinIO; set ENCORE_S3_ENDPOINT to the MinIO URL');

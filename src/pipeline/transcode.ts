@@ -75,11 +75,14 @@ export async function submitTranscode(
   const inputUri = `s3://${params.sourceBucket}/${params.sourceObjectKey}`;
   const outputUri = `s3://${params.outputBucket}/${PACKAGED_OUTPUT_PREFIX}/${params.sourceAssetId}/${job.id}`;
 
-  // Record the encore job id and advance the job to running + the source asset
-  // to processing before we submit, so a callback that races back finds a
-  // resolvable job.
-  await deps.jobs.update(job.id, { encoreJobId, status: 'running' });
-  await deps.assets.update(params.sourceAssetId, { status: 'processing' });
+  // Record the encore job id and mark the job `queued`: submitTranscode only
+  // enqueues the job onto the Encore auto-scaler's Redis queue (ADR-006); the
+  // job is not actually running on an Encore instance until the scaler loop
+  // dispatches it. The scaler's onDispatched callback advances the job to
+  // `running` (and the source asset to `processing`) at dispatch time. We set
+  // the encoreJobId before submit so a callback that races back can resolve the
+  // job.
+  await deps.jobs.update(job.id, { encoreJobId, status: 'queued' });
 
   let encoreInternalJobId: string | undefined;
   try {

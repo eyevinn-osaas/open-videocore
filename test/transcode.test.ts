@@ -124,9 +124,13 @@ describe('transcode job management (issue #8)', () => {
       expect(h.submitted[0].outputUri).toContain('s3://out-bucket/');
       expect(h.submitted[0].externalId).toBe(encoreJobId);
 
-      // Source asset advanced to processing.
+      // The source asset is NOT advanced to `processing` at submit time: the
+      // job is only enqueued on the Encore auto-scaler's local queue (ADR-006).
+      // The scaler advances the job to `running` and the asset to `processing`
+      // via its onDispatched callback once it dispatches to an Encore instance,
+      // which the fake client here does not exercise. So the asset stays `ready`.
       const src = await h.assets.get('workspace-a', sourceId);
-      expect(src?.status).toBe('processing');
+      expect(src?.status).toBe('ready');
     });
 
     it('honours explicit preset selection (720p, 480p)', async () => {
@@ -247,7 +251,9 @@ describe('transcode job management (issue #8)', () => {
       expect(res.statusCode).toBe(200);
       const job = res.json();
       expect(job.type).toBe('transcode');
-      expect(job.status).toBe('running');
+      // Freshly submitted: the job sits `queued` in the scaler's local queue
+      // until the scaler dispatches it to an Encore instance (ADR-006).
+      expect(job.status).toBe('queued');
       expect(job.assetId).toBe(sourceId);
     });
   });

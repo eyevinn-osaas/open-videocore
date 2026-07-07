@@ -136,7 +136,7 @@ export class EncoreScalerLoop {
     inst: EncoreInstanceRecord,
     job: QueuedJob
   ): Promise<boolean> {
-    const { redis, workspaceId, getToken } = this.config;
+    const { redis, workspaceId, getToken, onDispatched } = this.config;
     try {
       const token = await getToken();
       const res = await fetch(`${inst.url.replace(/\/$/, '')}/encoreJobs`, {
@@ -158,6 +158,18 @@ export class EncoreScalerLoop {
       await redis.hset(keys.jobStatus(workspaceId), job.jobId, 'running');
       if (encoreUuid && encoreUuid !== job.jobId) {
         await redis.set(keys.jobUuid(job.jobId), encoreUuid, 'EX', 86_400);
+      }
+
+      // The job has now actually left the local queue and is running on an
+      // Encore instance: advance the Job record from `queued` to `running`.
+      // Best-effort so a repo failure never causes the caller to re-queue an
+      // already-dispatched job.
+      if (onDispatched) {
+        try {
+          await onDispatched(job.jobId);
+        } catch {
+          // Swallowed: dispatch itself succeeded.
+        }
       }
       return true;
     } catch {

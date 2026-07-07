@@ -38,7 +38,7 @@ import {
   InMemoryAssetRepository,
   type AssetRepository
 } from '../data/asset-repo.js';
-import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
+import { InMemoryJobRepository, type JobRepository, type JobStatus } from '../data/job-repo.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { PRESET_NAMES, type PresetName } from '../pipeline/encode-presets.js';
@@ -94,9 +94,9 @@ const encoreJobResponseSchema = z.object({
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
 // Map our internal Job.status to the Encore job status vocabulary the caller
-// expects. pending -> QUEUED, running -> IN_PROGRESS, done -> SUCCESSFUL,
+// expects. pending/queued -> QUEUED, running -> IN_PROGRESS, done -> SUCCESSFUL,
 // failed -> FAILED.
-function toEncoreStatus(status: 'pending' | 'running' | 'done' | 'failed'): string {
+function toEncoreStatus(status: JobStatus): string {
   switch (status) {
     case 'running':
       return 'IN_PROGRESS';
@@ -105,6 +105,7 @@ function toEncoreStatus(status: 'pending' | 'running' | 'done' | 'failed'): stri
     case 'failed':
       return 'FAILED';
     case 'pending':
+    case 'queued':
     default:
       return 'QUEUED';
   }
