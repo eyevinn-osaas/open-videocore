@@ -375,7 +375,7 @@ await app.register(assetsRouter, {
   clipRunner
 });
 
-await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository });
+await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository, redis: sharedRedis });
 
 // HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
 // queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs and
@@ -462,7 +462,13 @@ await app.register(adminRouter, { prefix: '/api/v1/admin', watchFolder });
 await app.register(scalerRouter, {
   prefix: '/api/v1/scaler',
   redis: sharedRedis,
-  maxInstances: encoreMaxInstances
+  maxInstances: encoreMaxInstances,
+  minInstances: 0,
+  onConfigChange: (cfg) => {
+    if (encore instanceof WorkspaceEncoreScalerRegistry) {
+      encore.setMaxInstances(cfg.maxInstances);
+    }
+  }
 });
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });

@@ -67,6 +67,13 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     return this.getOrCreate(decoded.workspaceId).getJobStatus(encoreJobId);
   }
 
+  setMaxInstances(max: number): void {
+    this.config.maxInstances = max;
+    for (const { loop } of this.loops.values()) {
+      loop.setMaxInstances(max);
+    }
+  }
+
   stopAll(): void {
     for (const { loop } of this.loops.values()) {
       loop.stop();

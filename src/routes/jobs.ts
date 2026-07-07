@@ -8,7 +8,10 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
+import type { Redis } from 'ioredis';
 import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, type JobRepository, type JobStatus } from '../data/job-repo.js';
+import { keys } from '../encore-scaler/types.js';
+import { decodeEncoreJobId } from '../data/job-repo.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
@@ -26,6 +29,7 @@ const jobSchema = z.object({
   // Transcode-job fields (issue #8). Present only when type === 'transcode'.
   encoreJobId: z.string().optional(),
   encoreInternalJobId: z.string().optional(),
+  encoreInstanceId: z.string().optional(), // which pool instance is running this job
   profile: z.string().optional(),
   renditionAssetIds: z.array(z.string()).optional(),
   createdAt: z.string(),
@@ -34,11 +38,13 @@ const jobSchema = z.object({
 
 type JobsRouterOptions = {
   repository?: JobRepository;
+  redis?: Redis; // for Encore instance lookup
 };
 
 export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository ?? new InMemoryJobRepository();
+  const redis = opts.redis;
 
   app.get(
     '/',
@@ -110,6 +116,20 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
           } catch {
             // Encore unreachable or job not found — leave status as-is
           }
+        }
+      }
+      // Annotate with the Encore pool instance that is (or was) running this job.
+      if (redis && job.encoreJobId) {
+        try {
+          const decoded = decodeEncoreJobId(job.encoreJobId);
+          if (decoded) {
+            const instanceId = await redis.hget(keys.jobInstance(decoded.workspaceId), job.encoreJobId);
+            if (instanceId) {
+              return reply.code(200).send({ ...job, encoreInstanceId: instanceId });
+            }
+          }
+        } catch {
+          // non-fatal — omit encoreInstanceId if lookup fails
         }
       }
       return reply.code(200).send(job);

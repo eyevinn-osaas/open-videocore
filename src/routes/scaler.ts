@@ -29,6 +29,10 @@ type ScalerRouterOptions = {
   redis?: Redis;
   // Upper bound on instances per workspace pool (ENCORE_MAX_INSTANCES).
   maxInstances: number;
+  // Minimum instances to keep warm (0 = scale to zero when idle). Default 0.
+  minInstances?: number;
+  // Callback to update the live scaler config at runtime.
+  onConfigChange?: (cfg: { maxInstances: number; minInstances: number }) => void;
 };
 
 const instanceSchema = z.object({
@@ -73,6 +77,15 @@ async function scanWorkspaceIds(redis: Redis): Promise<string[]> {
 export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
 
+  // Mutable runtime config — updated by PATCH /config.
+  let liveMaxInstances = opts.maxInstances;
+  let liveMinInstances = opts.minInstances ?? 0;
+
+  const scalerConfigSchema = z.object({
+    maxInstances: z.number().int().min(1).max(20),
+    minInstances: z.number().int().min(0).max(10)
+  });
+
   app.get(
     '/status',
     { schema: { tags: ['admin'], response: { 200: scalerStatusSchema } } },
@@ -94,7 +107,36 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         })
       );
 
-      return { workspaces, maxInstances: opts.maxInstances, scalerActive: true };
+      return { workspaces, maxInstances: liveMaxInstances, scalerActive: true };
     }
+  );
+
+  app.patch(
+    '/config',
+    {
+      schema: {
+        tags: ['admin'],
+        body: scalerConfigSchema.partial(),
+        response: { 200: scalerConfigSchema }
+      }
+    },
+    async (request) => {
+      const { maxInstances, minInstances } = request.body;
+      if (maxInstances !== undefined) liveMaxInstances = maxInstances;
+      if (minInstances !== undefined) liveMinInstances = minInstances;
+      opts.onConfigChange?.({ maxInstances: liveMaxInstances, minInstances: liveMinInstances });
+      return { maxInstances: liveMaxInstances, minInstances: liveMinInstances };
+    }
+  );
+
+  app.get(
+    '/config',
+    {
+      schema: {
+        tags: ['admin'],
+        response: { 200: scalerConfigSchema }
+      }
+    },
+    async () => ({ maxInstances: liveMaxInstances, minInstances: liveMinInstances })
   );
 };

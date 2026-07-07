@@ -1047,6 +1047,12 @@ async function showJobDetail(id, detailPanel) {
     if (job.error) {
       kvRows.push(['Error', '<span style="color:var(--error,#f87171)">' + escHtml(job.error) + '</span>']);
     }
+    if (job.encoreInstanceId) {
+      // Placeholder value; resolved to a link (or plain text) after render once
+      // the scaler status is fetched.
+      kvRows.push(['Encore Instance',
+        '<span id="job-encore-instance" class="text-mono">' + escHtml(job.encoreInstanceId) + '</span>']);
+    }
 
     const kvDiv = document.createElement('div');
     kvDiv.className = 'kv-grid';
@@ -1054,6 +1060,31 @@ async function showJobDetail(id, detailPanel) {
       return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
     }).join('');
     body.appendChild(kvDiv);
+
+    // Resolve the Encore instance to a clickable link via the scaler status.
+    if (job.encoreInstanceId) {
+      apiFetch('/scaler/status').then(function(status) {
+        var match = null;
+        (status && status.workspaces ? status.workspaces : []).some(function(ws) {
+          var found = (ws.instances || []).filter(function(inst) {
+            return inst.instanceId === job.encoreInstanceId;
+          })[0];
+          if (found) { match = found; return true; }
+          return false;
+        });
+        var span = body.querySelector('#job-encore-instance');
+        if (match && match.url && span) {
+          var link = document.createElement('a');
+          link.href = match.url;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.className = 'text-mono';
+          link.style.color = 'var(--accent)';
+          link.textContent = job.encoreInstanceId;
+          span.replaceWith(link);
+        }
+      }).catch(function() { /* leave plain-text instanceId on error */ });
+    }
 
     // Clicking the asset link jumps to the Assets tab and opens that asset.
     const assetLink = body.querySelector('.job-asset-link');
@@ -2224,6 +2255,60 @@ async function renderProvisionTab(container) {
       loader.remove();
       showMsg(resultEl, 'Error: ' + err.message, 'error');
     }
+  });
+
+  // ── Scaler configuration ──
+  const scalerSection = document.createElement('div');
+  scalerSection.className = 'section';
+  scalerSection.innerHTML = '<div class="section-title">Scaler Configuration</div>' +
+    '<div id="scaler-config-body"></div>';
+  container.appendChild(scalerSection);
+
+  const scalerBody = scalerSection.querySelector('#scaler-config-body');
+  scalerBody.appendChild(loadingEl());
+
+  apiFetch('/scaler/config').then(function(cfg) {
+    scalerBody.innerHTML = [
+      '<div class="form-row">',
+      '  <div class="form-field">',
+      '    <label for="scaler-max">Max Instances</label>',
+      '    <input type="number" id="scaler-max" min="1" max="20" value="' + escHtml(String(cfg.maxInstances)) + '" />',
+      '  </div>',
+      '  <div class="form-field">',
+      '    <label for="scaler-min">Min Instances (0 = scale to zero when idle)</label>',
+      '    <input type="number" id="scaler-min" min="0" max="10" value="' + escHtml(String(cfg.minInstances)) + '" />',
+      '  </div>',
+      '  <button id="scaler-save-btn" class="btn-ghost">Save</button>',
+      '</div>',
+      '<div id="scaler-config-msg" class="mt8"></div>',
+    ].join('');
+
+    scalerBody.querySelector('#scaler-save-btn').addEventListener('click', async function() {
+      const btn = scalerBody.querySelector('#scaler-save-btn');
+      const msgEl = scalerBody.querySelector('#scaler-config-msg');
+      msgEl.innerHTML = '';
+      const maxInstances = Number(scalerBody.querySelector('#scaler-max').value);
+      const minInstances = Number(scalerBody.querySelector('#scaler-min').value);
+      btn.disabled = true;
+      try {
+        const updated = await apiFetch('/scaler/config', {
+          method: 'PATCH',
+          body: JSON.stringify({ maxInstances: maxInstances, minInstances: minInstances })
+        });
+        scalerBody.querySelector('#scaler-max').value = updated.maxInstances;
+        scalerBody.querySelector('#scaler-min').value = updated.minInstances;
+        showMsg(msgEl, 'Scaler configuration saved.', 'success');
+      } catch (err) {
+        showMsg(msgEl, 'Error: ' + err.message, 'error');
+      }
+      btn.disabled = false;
+    });
+  }).catch(function(err) {
+    scalerBody.innerHTML = '';
+    const notice = document.createElement('p');
+    notice.className = 'text-muted';
+    notice.textContent = 'Scaler is not active — configuration unavailable (' + err.message + ').';
+    scalerBody.appendChild(notice);
   });
 
 }
