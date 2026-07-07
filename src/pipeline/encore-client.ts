@@ -11,11 +11,9 @@
 // implementation. The interface is injected into the transcode route so tests
 // can substitute a fake without standing up Encore.
 
-import type { EncoreProfile } from './encode-presets.js';
-
-// What Encore needs to start an ABR transcode: where to read the source, the
-// ladder to produce, where to write output, and the id we want echoed back to
-// us via the callback listener so we can correlate the completion.
+// What Encore needs to start a transcode: where to read the source, the
+// server-side named profile to apply, where to write output, and the id we want
+// echoed back via the callback listener so we can correlate the completion.
 export type EncoreSubmitInput = {
   // Our correlation id. We pass this as Encore's externalId; the callback
   // listener echoes it back on completion. It embeds the workspace + job id
@@ -28,8 +26,8 @@ export type EncoreSubmitInput = {
   inputUri: string;
   // S3 URI prefix where Encore should write the produced renditions.
   outputUri: string;
-  // The resolved ABR ladder.
-  profile: EncoreProfile;
+  // Named profile string forwarded verbatim to Encore (server-side resolution).
+  profile: string;
 };
 
 export type EncoreSubmitResult = {
@@ -69,7 +67,7 @@ export function toEncorePayload(input: EncoreSubmitInput): Record<string, unknow
   return {
     externalId: input.externalId,
     ...(input.progressCallbackUri ? { progressCallbackUri: input.progressCallbackUri } : {}),
-    profile: input.profile.name,
+    profile: input.profile,
     outputFolder: input.outputUri,
     baseName: 'rendition',
     inputs: [{ uri: input.inputUri, type: 'AudioVideo' }]

@@ -25,7 +25,7 @@ import {
   encodeEncoreJobId,
   type JobRepository
 } from '../data/job-repo.js';
-import { resolveProfile, type EncoreProfile, type PresetName } from './encode-presets.js';
+import type { EncoreProfile } from './encode-presets.js';
 import type { EncoreClient } from './encore-client.js';
 
 export const PACKAGED_OUTPUT_PREFIX = 'transcode';
@@ -37,7 +37,8 @@ export type SubmitTranscodeParams = {
   workspaceId: string;
   sourceAssetId: string;
   sourceObjectKey: string;
-  preset?: PresetName;
+  // Profile name forwarded verbatim to Encore (server-side named profile).
+  preset?: string;
   customProfile?: EncoreProfile;
   // S3 bucket names so we can build the s3:// URIs Encore reads/writes.
   sourceBucket: string;
@@ -56,13 +57,15 @@ export async function submitTranscode(
   params: SubmitTranscodeParams,
   deps: { jobs: JobRepository; assets: AssetRepository; encore: EncoreClient; encoreCallbackUrl?: string }
 ): Promise<SubmitTranscodeResult> {
-  const profile = resolveProfile(params.preset, params.customProfile);
+  // Profile name forwarded verbatim to Encore. Falls back to 'program' —
+  // the only profile guaranteed to exist in the default Encore test-profiles set.
+  const profileName = params.preset ?? 'program';
 
   // Create the job first so we have a local id to embed in the Encore job id.
   const job = await deps.jobs.create({
     type: 'transcode',
     assetId: params.sourceAssetId,
-    profile: profile.name
+    profile: profileName
   });
 
   const encoreJobId = encodeEncoreJobId(params.workspaceId, job.id);
@@ -85,7 +88,8 @@ export async function submitTranscode(
     const progressCallbackUri = deps.encoreCallbackUrl
       ? `${deps.encoreCallbackUrl.replace(/\/$/, '')}/encoreCallback`
       : undefined;
-    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile, progressCallbackUri });
+    const encoreProfile = params.customProfile ? params.customProfile.name : profileName;
+    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: encoreProfile, progressCallbackUri });
     encoreInternalJobId = result.encoreInternalId || undefined;
     if (encoreInternalJobId) {
       await deps.jobs.update(job.id, { encoreInternalJobId });

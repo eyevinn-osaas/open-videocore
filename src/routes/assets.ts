@@ -57,7 +57,7 @@ import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/cli
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
-import { PRESET_NAMES, type EncoreProfile } from '../pipeline/encode-presets.js';
+import type { EncoreProfile } from '../pipeline/encode-presets.js';
 import {
   rewrap,
   REWRAP_FORMATS,
@@ -86,7 +86,7 @@ const customProfileSchema = z.object({
 
 const transcodeBodySchema = z
   .object({
-    profile: z.enum(PRESET_NAMES).optional(),
+    profile: z.string().min(1).optional(),
     customProfile: customProfileSchema.optional()
   })
   .refine((b) => !(b.profile && b.customProfile), {
@@ -567,7 +567,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               sourceObjectKey: asset.objectKey as string,
               sourceBucket: opts.sourceBucket as string,
               outputBucket: opts.outputBucket as string,
-              preset: encodeOpts?.profile as typeof PRESET_NAMES[number] | undefined,
+              preset: encodeOpts?.profile,
               customProfile: encodeOpts?.customProfile
             },
             { jobs, assets: repo, encore: opts.encore!, encoreCallbackUrl: request.connections?.encoreCallbackUrl }
@@ -1001,7 +1001,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         params: z.object({ id: z.string() }),
         body: z.object({
           pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
-          profile: z.enum(PRESET_NAMES).optional(),
+          profile: z.string().min(1).optional(),
           customProfile: customProfileSchema.optional()
         }),
         response: {
