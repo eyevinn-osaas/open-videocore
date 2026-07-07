@@ -563,7 +563,7 @@ export class InMemoryAssetRepository implements AssetRepository {
   }
 
   async countChildren(id: string): Promise<number> {
-    return [...this.store.values()].filter((a) => a.parentId === id).length;
+    return [...this.store.values()].filter((a) => a.parentId === id && a.status !== 'archived').length;
   }
 
   async remove(id: string): Promise<Asset | undefined> {

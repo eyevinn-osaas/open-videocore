@@ -360,7 +360,7 @@ function loadingEl() {
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
 
-const TABS = ['assets', 'jobs', 'collections', 'search', 'webhooks', 'storage', 'provision'];
+const TABS = ['assets', 'jobs', 'pipelines', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
@@ -374,7 +374,7 @@ function switchTab(name) {
   if (jobsPollTimer) { clearInterval(jobsPollTimer); jobsPollTimer = null; }
   const content = document.getElementById('content');
   content.innerHTML = '';
-  content.classList.toggle('content-fullbleed', name === 'assets' || name === 'jobs');
+  content.classList.toggle('content-fullbleed', name === 'assets' || name === 'jobs' || name === 'pipelines');
   TAB_RENDERERS[name](content);
 }
 
@@ -750,8 +750,6 @@ async function showAssetDetail(id, detailPanel) {
     const actionsDiv = document.createElement('div');
     actionsDiv.className = 'mt12 flex-gap';
     actionsDiv.innerHTML = [
-      '<button id="btn-transcode" class="btn-ghost">Transcode (ABR)</button>',
-      '<button id="btn-package" class="btn-ghost">Package for VOD</button>',
       '<button id="btn-extract-meta" class="btn-ghost">Extract Metadata</button>',
       '<button id="btn-thumbnails" class="btn-ghost">Thumbnails</button>',
     ].join('');
@@ -780,32 +778,6 @@ async function showAssetDetail(id, detailPanel) {
     const thumbArea = document.createElement('div');
     thumbArea.id = 'thumbnails-area';
     body.appendChild(thumbArea);
-
-    body.querySelector('#btn-transcode').addEventListener('click', async function() {
-      actionMsg.innerHTML = '';
-      try {
-        const r = await apiFetch('/assets/' + encodeURIComponent(id) + '/transcode', { method: 'POST', body: JSON.stringify({}) });
-        showMsg(actionMsg, 'Transcode job submitted. ID: ' + (r && (r.jobId || r.id) ? (r.jobId || r.id) : JSON.stringify(r)), 'success');
-      } catch (err) {
-        showMsg(actionMsg, 'Error: ' + err.message, 'error');
-      }
-    });
-
-    body.querySelector('#btn-package').addEventListener('click', async function() {
-      actionMsg.innerHTML = '';
-      var encoreJobId = prompt('Enter an Encore job ID to package directly, or leave blank to start a full transcode+package pipeline:');
-      var requestBody = encoreJobId && encoreJobId.trim() ? { encoreJobId: encoreJobId.trim() } : {};
-      try {
-        var r = await apiFetch('/assets/' + encodeURIComponent(id) + '/package', { method: 'POST', body: JSON.stringify(requestBody) });
-        if (r && r.pipelineMode) {
-          showMsg(actionMsg, 'Pipeline started: transcoding then packaging. Job ID: ' + r.jobId + '. Reload asset to track progress.', 'success');
-        } else {
-          showMsg(actionMsg, 'Packaging enqueued. The packager will produce HLS/DASH manifests.', 'success');
-        }
-      } catch (err) {
-        showMsg(actionMsg, 'Error: ' + err.message, 'error');
-      }
-    });
 
     body.querySelector('#btn-extract-meta').addEventListener('click', async function() {
       actionMsg.innerHTML = '';
@@ -2419,10 +2391,97 @@ function cssEscape(value) {
   return String(value).replace(/["\\\]\[]/g, '\\$&');
 }
 
+// ─── PIPELINES TAB ───────────────────────────────────────────────────────────
+
+var PIPELINE_CATALOG = [
+  {
+    name: 'transcode',
+    label: 'Transcode',
+    description: 'Transcode source file to ABR renditions (no packaging).',
+    steps: ['transcode']
+  },
+  {
+    name: 'abr-vod',
+    label: 'ABR VOD',
+    description: 'Transcode to ABR renditions, then package to HLS/DASH for streaming.',
+    steps: ['transcode', 'package']
+  },
+  {
+    name: 'ingest',
+    label: 'Ingest',
+    description: 'Extract technical metadata and generate thumbnail frames.',
+    steps: ['extract-metadata', 'thumbnail']
+  },
+  {
+    name: 'full',
+    label: 'Full',
+    description: 'Full pipeline: metadata extraction, thumbnails, ABR transcode, and HLS/DASH packaging.',
+    steps: ['extract-metadata', 'thumbnail', 'transcode', 'package']
+  }
+];
+
+var STEP_ICONS = {
+  'extract-metadata': '🔬',
+  'thumbnail': '🖼',
+  'transcode': '🎞',
+  'package': '📦'
+};
+
+function renderPipelinesTab(container) {
+  var wrap = document.createElement('div');
+  wrap.className = 'pipelines-wrap';
+
+  var header = document.createElement('div');
+  header.className = 'section-title mb12';
+  header.textContent = 'Available Pipelines';
+  wrap.appendChild(header);
+
+  var grid = document.createElement('div');
+  grid.className = 'pipelines-grid';
+
+  PIPELINE_CATALOG.forEach(function(pipeline) {
+    var card = document.createElement('div');
+    card.className = 'pipeline-card';
+
+    var cardHeader = document.createElement('div');
+    cardHeader.className = 'pipeline-card-header';
+    cardHeader.innerHTML = '<span class="pipeline-card-name">' + escHtml(pipeline.label) + '</span>' +
+      '<span class="pipeline-card-id text-mono">' + escHtml(pipeline.name) + '</span>';
+    card.appendChild(cardHeader);
+
+    var desc = document.createElement('p');
+    desc.className = 'pipeline-card-desc';
+    desc.textContent = pipeline.description;
+    card.appendChild(desc);
+
+    var steps = document.createElement('div');
+    steps.className = 'pipeline-steps';
+    pipeline.steps.forEach(function(step, i) {
+      if (i > 0) {
+        var arrow = document.createElement('span');
+        arrow.className = 'pipeline-step-arrow';
+        arrow.textContent = '→';
+        steps.appendChild(arrow);
+      }
+      var chip = document.createElement('span');
+      chip.className = 'pipeline-step-chip';
+      chip.textContent = (STEP_ICONS[step] || '') + ' ' + step;
+      steps.appendChild(chip);
+    });
+    card.appendChild(steps);
+
+    grid.appendChild(card);
+  });
+
+  wrap.appendChild(grid);
+  container.appendChild(wrap);
+}
+
 // ─── Tab renderer registry ───────────────────────────────────────────────────
 
 TAB_RENDERERS['assets'] = renderAssetsTab;
 TAB_RENDERERS['jobs'] = renderJobsTab;
+TAB_RENDERERS['pipelines'] = renderPipelinesTab;
 TAB_RENDERERS['collections'] = renderCollectionsTab;
 TAB_RENDERERS['search'] = renderSearchTab;
 TAB_RENDERERS['webhooks'] = renderWebhooksTab;

@@ -194,7 +194,8 @@ export class CouchAssetRepository implements AssetRepository {
 
   async countChildren(id: string): Promise<number> {
     const couch = this.couchFor();
-    return couch.count({ resourceType: RESOURCE_TYPE, derivedFrom: id });
+    // Archived children no longer block deletion — they are already soft-deleted.
+    return couch.count({ resourceType: RESOURCE_TYPE, derivedFrom: id, state: { $ne: 'archived' } });
   }
 
   async remove(id: string): Promise<Asset | undefined> {

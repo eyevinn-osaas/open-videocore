@@ -897,3 +897,75 @@ pre.code-block {
 .grow { flex: 1; }
 .text-muted { color: var(--text-muted); }
 .text-mono { font-family: 'Courier New', monospace; font-size: 12px; }
+
+/* ─── Pipelines page ──────────────────────────────────────────────────────── */
+.pipelines-wrap {
+  padding: 24px;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.pipelines-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.pipeline-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pipeline-card-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.pipeline-card-name {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.pipeline-card-id {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.pipeline-card-desc {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.pipeline-steps {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.pipeline-step-chip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.pipeline-step-arrow {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.mb12 { margin-bottom: 12px; }
