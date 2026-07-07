@@ -282,17 +282,57 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   });
 }
 
+// Two-phase processing: messages move from the main queue to a processing set
+// before handleMessage runs, and are only removed from processing on success.
+// On any failure the message is returned to the main queue so it is retried on
+// the next iteration. On startup, leftover entries in the processing set (from a
+// crash or hot-reload kill) are recovered back to the main queue automatically.
+//
+// Sorted-set operations used (ioredis bindings, verified against ioredis docs):
+//   BZPOPMIN key timeout  → [key, member, score] | null
+//   ZADD key score member → number (added/updated count)
+//   ZREM key member       → number (removed count)
+//   ZRANGEBYSCORE key min max → string[]
+
+async function recoverProcessingQueue(
+  redis: Redis,
+  queueKey: string,
+  processingKey: string,
+  logger: Logger
+): Promise<void> {
+  // Any message left in the processing set did not complete in a prior run.
+  // Move them all back to the main queue so they are retried.
+  const stuck = await redis.zrangebyscore(processingKey, '-inf', '+inf', 'WITHSCORES');
+  // WITHSCORES returns [member, score, member, score, ...].
+  for (let i = 0; i < stuck.length; i += 2) {
+    const member = stuck[i];
+    const score = Number(stuck[i + 1]);
+    await redis.zadd(queueKey, score, member);
+    await redis.zrem(processingKey, member);
+    logger.info({ msg: 'encore-callback-poller: recovered stuck message from processing set', member });
+  }
+}
+
 // Start the background poller loop. Returns a stop() function that aborts the
 // loop after the in-flight BZPOPMIN times out (up to BZPOPMIN_TIMEOUT_SECONDS).
 export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
   const queueKey = deps.queueKey ?? DEFAULT_QUEUE_KEY;
+  const processingKey = `${queueKey}:processing`;
   const controller = new AbortController();
   const { signal } = controller;
 
-  deps.logger.info({ msg: 'encore-callback-poller: starting', queueKey });
+  deps.logger.info({ msg: 'encore-callback-poller: starting', queueKey, processingKey });
 
   const loop = async (): Promise<void> => {
+    // On startup, recover any messages left in the processing set from a prior
+    // crashed or hot-reloaded process before entering the main loop.
+    await recoverProcessingQueue(deps.redis, queueKey, processingKey, deps.logger).catch((err) => {
+      deps.logger.warn({ msg: 'encore-callback-poller: recovery scan failed', err });
+    });
+
     while (!signal.aborted) {
+      let raw: string | undefined;
+      let score: number | undefined;
       try {
         // BZPOPMIN blocks up to the timeout, then returns null so the loop can
         // check the abort signal and remain cancellable.
@@ -300,12 +340,25 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
         if (signal.aborted) break;
         if (!popped) continue;
         // bzpopmin returns [key, member, score]; the member is our JSON message.
-        const raw = popped[1];
+        raw = popped[1];
+        score = Number(popped[2]);
+
+        // Phase 1: move message to the processing set before doing any work.
+        // If the process dies after this point, recoverProcessingQueue re-queues
+        // it on the next startup.
+        await deps.redis.zadd(processingKey, score, raw);
+
         await handleMessage(deps, raw);
+
+        // Phase 2: processing succeeded — remove from the processing set.
+        await deps.redis.zrem(processingKey, raw);
       } catch (err) {
-        // Never crash the loop. Back off briefly on unexpected errors so a
-        // persistently failing Redis / fetch does not spin hot.
         deps.logger.error({ msg: 'encore-callback-poller: loop error', err });
+        // Return the message to the main queue so it is retried, then back off.
+        if (raw !== undefined && score !== undefined) {
+          await deps.redis.zadd(queueKey, score, raw).catch(() => {});
+          await deps.redis.zrem(processingKey, raw).catch(() => {});
+        }
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
