@@ -136,7 +136,7 @@ export async function extractTechnicalMetadata(
     const metadata = parseFfprobe(result, new Date().toISOString());
     // Extraction annotates the asset only; it never drives the lifecycle state
     // machine (the ingest/transcode paths own status transitions).
-    await deps.assets.update(assetId, { technicalMetadata: metadata });
+    await deps.assets.update(assetId, { technicalMetadata: metadata, status: 'ready' });
   } catch (err) {
     deps.onError?.(err);
     const message = err instanceof Error ? err.message : String(err);

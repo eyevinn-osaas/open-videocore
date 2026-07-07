@@ -544,6 +544,22 @@ async function showAssetDetail(id, detailPanel) {
       if (du.dash) kvRows.push(['DASH', '<a href="' + escHtml(du.dash) + '" target="_blank" rel="noopener" style="color:var(--accent)">Open</a>']);
       if (du.source) kvRows.push(['Source URL', '<a href="' + escHtml(du.source) + '" target="_blank" rel="noopener" style="color:var(--accent)">Download</a>']);
     }
+    if (asset.technicalMetadata) {
+      var tm = asset.technicalMetadata;
+      kvRows.push(['Codec', escHtml(tm.codec || '—')]);
+      kvRows.push(['Resolution', (tm.width && tm.height) ? (tm.width + '×' + tm.height) : '—']);
+      kvRows.push(['Duration', tm.durationSeconds ? (tm.durationSeconds.toFixed(1) + 's') : '—']);
+      kvRows.push(['Bitrate', tm.bitrateBps ? (Math.round(tm.bitrateBps / 1000) + ' kbps') : '—']);
+      kvRows.push(['Container', escHtml(tm.containerFormat || '—')]);
+      if (tm.audioTracks && tm.audioTracks.length > 0) {
+        var audioLabel = tm.audioTracks.map(function(t) {
+          return escHtml(t.codec) + ' ' + t.channels + 'ch ' + (t.sampleRateHz / 1000).toFixed(1) + 'kHz';
+        }).join(', ');
+        kvRows.push(['Audio', audioLabel]);
+      }
+    } else if (asset.technicalMetadataError) {
+      kvRows.push(['Tech Metadata', '<span style="color:var(--error,#f87171)">' + escHtml(asset.technicalMetadataError) + '</span>']);
+    }
 
     const kvHtml = kvRows.map(function(r) {
       return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
