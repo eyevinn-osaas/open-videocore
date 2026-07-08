@@ -25,7 +25,7 @@ import { collectionsRouter } from './routes/collections.js';
 import { storageRouter } from './routes/storage.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
-import { WorkspaceStackResolver, type WorkspaceConnections } from './services/workspace-stack.js';
+import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
 import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
@@ -322,8 +322,8 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // the same EncoreClient interface as the old static client but manages a
 // per-workspace pool of Encore OSC instances. Set ENCORE_MAX_INSTANCES=1 to
 // cap the pool at a single instance (equivalent to the previous static behaviour).
-// Requires REDIS_URL (same Valkey used for HLS/DASH packaging). When Redis is
-// unavailable transcoding degrades to 501.
+// Requires a Redis connection (resolved from the parameter store after provisioning).
+// When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] ?? '3', 10);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] ?? String(5 * 60 * 1000), 10);
 
@@ -348,8 +348,27 @@ if (!publicBaseUrl) {
 let encore: EncoreClient | undefined;
 let sharedRedis: IORedis | undefined;
 
-if (storageAvailable && process.env['REDIS_URL']) {
-  sharedRedis = new IORedis(process.env['REDIS_URL'], { lazyConnect: true, maxRetriesPerRequest: null });
+// Resolve the Redis URL from the provisioned stack config in the parameter store.
+// The REDIS_URL env var can override this for local development, but on OSC the
+// URL is self-discovered from the stack config written by POST /api/v1/provision.
+let resolvedRedisUrl = process.env['REDIS_URL'];
+if (!resolvedRedisUrl && paramStore) {
+  try {
+    const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+    if (names.length > 0) {
+      const stackCfg = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+      if (stackCfg?.redisUrl) {
+        resolvedRedisUrl = stackCfg.redisUrl;
+        app.log.info({ redisUrl: resolvedRedisUrl }, 'encore-scaler: resolved Redis URL from parameter store');
+      }
+    }
+  } catch (err) {
+    app.log.warn({ err }, 'encore-scaler: failed to resolve Redis URL from parameter store — transcoding unavailable');
+  }
+}
+
+if (storageAvailable && resolvedRedisUrl) {
+  sharedRedis = new IORedis(resolvedRedisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
   // ENCORE_S3_ENDPOINT et al. allow the operator to pass MinIO credentials to
   // every Encore instance the scaler spawns. Without these Encore resolves
   // s3:// URIs against AWS S3 and fails with 404.
@@ -358,7 +377,7 @@ if (storageAvailable && process.env['REDIS_URL']) {
   const encoreS3SecretKey = process.env['ENCORE_S3_SECRET_KEY'] ?? process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'];
   encore = new WorkspaceEncoreScalerRegistry({
     redis: sharedRedis,
-    redisUrl: process.env['REDIS_URL']!,
+    redisUrl: resolvedRedisUrl,
     minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] ?? '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
@@ -366,11 +385,40 @@ if (storageAvailable && process.env['REDIS_URL']) {
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
+    // Local-dev fallback only: ENCORE_S3_ENDPOINT is used verbatim for all
+    // workspaces when set. On OSC this is unset and resolveS3Config below
+    // resolves the MinIO endpoint per workspace from the parameter store.
     s3Config: encoreS3Endpoint && encoreS3SecretKey ? {
       endpoint: encoreS3Endpoint,
       accessKeyId: encoreS3AccessKey,
       secretAccessKey: encoreS3SecretKey
     } : undefined,
+    // Resolve each workspace's MinIO endpoint from the parameter store at loop
+    // creation time so no static ENCORE_S3_ENDPOINT env var is required on OSC.
+    // Mirrors WorkspaceStackResolver: address the stack by workspaceId, falling
+    // back to the first provisioned stack for the namespace.
+    resolveS3Config: async (workspaceId: string) => {
+      if (!paramStore || !encoreS3SecretKey) return undefined;
+      try {
+        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, workspaceId);
+        if (!config) {
+          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+          if (names.length > 0) {
+            config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+          }
+        }
+        if (config?.minioEndpoint) {
+          return {
+            endpoint: config.minioEndpoint,
+            accessKeyId: 'admin',
+            secretAccessKey: encoreS3SecretKey
+          };
+        }
+      } catch (err) {
+        app.log.warn({ err, workspaceId }, 'encore-scaler: failed to resolve MinIO s3Config from parameter store');
+      }
+      return undefined;
+    },
     // When the scaler dispatches a queued job to an Encore instance, advance the
     // Job record queued->running and the source asset to `processing`. The
     // scaler has no repositories of its own, so we resolve the job here by the
@@ -387,9 +435,6 @@ if (storageAvailable && process.env['REDIS_URL']) {
       }
     }
   });
-  if (!encoreS3Endpoint) {
-    app.log.warn('ENCORE_S3_ENDPOINT not set — Encore instances will not be able to read from MinIO; set ENCORE_S3_ENDPOINT to the MinIO URL');
-  }
   // Start loops for any workspaces that had pool entries from a previous run.
   // This triggers reconcile() on the first tick, correcting stale activeJobs counts
   // left by jobs that completed while the server was down.
@@ -397,7 +442,7 @@ if (storageAvailable && process.env['REDIS_URL']) {
     .resumeExistingWorkspaces()
     .catch((err) => app.log.warn({ err }, 'encore-scaler: failed to resume existing workspaces'));
 } else if (storageAvailable) {
-  app.log.warn('REDIS_URL not set — Encore auto-scaler disabled, transcoding unavailable');
+  app.log.warn('Redis URL not available — provision a stack first, or set REDIS_URL for local dev. Encore auto-scaler disabled.');
 }
 
 // Bucket names are stack-invariant (created at provision time, see provision.ts)
@@ -418,12 +463,12 @@ const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : und
 
 // HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
 // queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs and
-// receive a completion callback. Wiring is enabled only when REDIS_URL is set
-// (the Valkey queue is the load-bearing dependency); otherwise the packaging
-// trigger and the packager-callback route respond as not-configured.
+// receive a completion callback. Wiring is enabled only when a Redis connection
+// is available (resolved from the provisioned stack config); otherwise the
+// packaging trigger and the packager-callback route respond as not-configured.
 function buildPackaging(): PackagingService | undefined {
   if (!sharedRedis) {
-    app.log.warn('REDIS_URL not set — HLS/DASH packaging disabled');
+    app.log.warn('Redis not available — HLS/DASH packaging disabled');
     return undefined;
   }
   return new PackagingService({
@@ -447,8 +492,7 @@ const pipelineRepository = new InMemoryPipelineRepository();
 // reachable when this API is deployed publicly. This poller drains that same
 // sorted set and runs the identical completion + pipeline-advancement logic, so
 // transcode completions are applied even when the callback route is unreachable
-// (e.g. local runs). Only started when the shared Redis (same REDIS_URL the
-// listener writes to) is configured.
+// (e.g. local runs). Only started when the shared Redis connection is available.
 let stopEncoreCallbackPoller: (() => void) | undefined;
 if (sharedRedis) {
   stopEncoreCallbackPoller = startEncoreCallbackPoller({
@@ -592,7 +636,7 @@ await app.register(adminRouter, { prefix: '/api/v1/admin', watchFolder });
 
 // Encore auto-scaler status (ADR-006). Unauthenticated read-only introspection
 // of the per-workspace scaler pool for the ops UI. `sharedRedis` is undefined
-// when the scaler is off (no REDIS_URL); the endpoint then reports
+// when the scaler is off (no Redis connection); the endpoint then reports
 // scalerActive:false with an empty workspace list.
 await app.register(scalerRouter, {
   prefix: '/api/v1/scaler',
