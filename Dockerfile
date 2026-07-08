@@ -14,8 +14,5 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile --prod
 COPY --from=build /app/dist ./dist
 COPY public ./public
-COPY osc-entrypoint.sh /osc-entrypoint.sh
-RUN chmod +x /osc-entrypoint.sh
 EXPOSE 3000
-ENTRYPOINT ["/osc-entrypoint.sh"]
 CMD ["node", "dist/main.js"]
