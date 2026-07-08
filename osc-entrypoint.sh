@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
 # Map OSC_HOSTNAME to PUBLIC_BASE_URL so Encore profile loading works correctly
