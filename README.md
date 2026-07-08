@@ -110,7 +110,9 @@ curl -X DELETE http://localhost:3000/api/v1/provision/mystack
 
 ## API reference
 
-Interactive API documentation is at `/api-docs` when the service is running.
+A generated [openapi.json](openapi.json) is committed to the repo and kept up to date — no running instance required.
+
+Interactive documentation is also at `/api-docs` when the service is running.
 
 Key endpoints:
 
@@ -281,7 +283,7 @@ pnpm build        # compile TypeScript
 pnpm test         # run test suite
 ```
 
-The ops UI is served at `/ui` and the Swagger API docs at `/api-docs`.
+The ops UI is at `/ui` and the interactive API docs are at `/api-docs`. To regenerate `openapi.json` after adding routes, run `pnpm generate:openapi`.
 
 For local development against real OSC services, set your `OSC_ACCESS_TOKEN`, then provision a stack via the Provision tab in the ops UI.
 
