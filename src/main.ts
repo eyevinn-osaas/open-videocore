@@ -348,8 +348,28 @@ if (!publicBaseUrl) {
 let encore: EncoreClient | undefined;
 let sharedRedis: IORedis | undefined;
 
-if (storageAvailable && process.env['REDIS_URL']) {
-  sharedRedis = new IORedis(process.env['REDIS_URL'], { lazyConnect: true, maxRetriesPerRequest: null });
+// Resolve the Redis URL: prefer the REDIS_URL env var (local dev / explicit
+// override), then fall back to the first provisioned stack's Valkey URL stored
+// in the parameter store. This means no static REDIS_URL is required on OSC —
+// the URL is self-discovered from the stack config after provisioning.
+let resolvedRedisUrl = process.env['REDIS_URL'];
+if (!resolvedRedisUrl && paramStore) {
+  try {
+    const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+    if (names.length > 0) {
+      const stackCfg = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+      if (stackCfg?.redisUrl) {
+        resolvedRedisUrl = stackCfg.redisUrl;
+        app.log.info({ redisUrl: resolvedRedisUrl }, 'encore-scaler: resolved Redis URL from parameter store');
+      }
+    }
+  } catch (err) {
+    app.log.warn({ err }, 'encore-scaler: failed to resolve Redis URL from parameter store — transcoding unavailable');
+  }
+}
+
+if (storageAvailable && resolvedRedisUrl) {
+  sharedRedis = new IORedis(resolvedRedisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
   // ENCORE_S3_ENDPOINT et al. allow the operator to pass MinIO credentials to
   // every Encore instance the scaler spawns. Without these Encore resolves
   // s3:// URIs against AWS S3 and fails with 404.
@@ -358,7 +378,7 @@ if (storageAvailable && process.env['REDIS_URL']) {
   const encoreS3SecretKey = process.env['ENCORE_S3_SECRET_KEY'] ?? process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'];
   encore = new WorkspaceEncoreScalerRegistry({
     redis: sharedRedis,
-    redisUrl: process.env['REDIS_URL']!,
+    redisUrl: resolvedRedisUrl,
     minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] ?? '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
