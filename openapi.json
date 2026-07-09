@@ -151,6 +151,14 @@
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "provisioning",
+                        "ready",
+                        "failed"
+                      ]
+                    },
                     "minioEndpoint": {
                       "type": "string"
                     },
@@ -919,6 +927,11 @@
                     "minLength": 1,
                     "maxLength": 256
                   },
+                  "slug": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
                   "description": {
                     "type": "string",
                     "maxLength": 2048
@@ -968,6 +981,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "slug": {
+                      "type": "string"
+                    },
                     "description": {
                       "type": "string"
                     },
@@ -981,7 +997,22 @@
                         "archived"
                       ]
                     },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
                     "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
                       "type": "string"
                     },
                     "objectKey": {
@@ -1316,6 +1347,9 @@
                           "name": {
                             "type": "string"
                           },
+                          "slug": {
+                            "type": "string"
+                          },
                           "description": {
                             "type": "string"
                           },
@@ -1329,7 +1363,22 @@
                               "archived"
                             ]
                           },
+                          "reviewState": {
+                            "type": "string",
+                            "enum": [
+                              "draft",
+                              "in-review",
+                              "approved",
+                              "rejected"
+                            ]
+                          },
                           "parentId": {
+                            "type": "string"
+                          },
+                          "versionOfAssetId": {
+                            "type": "string"
+                          },
+                          "versionGroupId": {
                             "type": "string"
                           },
                           "objectKey": {
@@ -1776,6 +1825,9 @@
                           "name": {
                             "type": "string"
                           },
+                          "slug": {
+                            "type": "string"
+                          },
                           "description": {
                             "type": "string"
                           },
@@ -1789,7 +1841,22 @@
                               "archived"
                             ]
                           },
+                          "reviewState": {
+                            "type": "string",
+                            "enum": [
+                              "draft",
+                              "in-review",
+                              "approved",
+                              "rejected"
+                            ]
+                          },
                           "parentId": {
+                            "type": "string"
+                          },
+                          "versionOfAssetId": {
+                            "type": "string"
+                          },
+                          "versionGroupId": {
                             "type": "string"
                           },
                           "objectKey": {
@@ -2093,6 +2160,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "slug": {
+                      "type": "string"
+                    },
                     "description": {
                       "type": "string"
                     },
@@ -2106,7 +2176,22 @@
                         "archived"
                       ]
                     },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
                     "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
                       "type": "string"
                     },
                     "objectKey": {
@@ -2473,6 +2558,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "slug": {
+                      "type": "string"
+                    },
                     "description": {
                       "type": "string"
                     },
@@ -2486,7 +2574,22 @@
                         "archived"
                       ]
                     },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
                     "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
                       "type": "string"
                     },
                     "objectKey": {
@@ -2872,6 +2975,372 @@
         }
       }
     },
+    "/api/v1/assets/{id}/versions": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "assetId": {
+                      "type": "string"
+                    },
+                    "versions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "slug": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ]
+                          },
+                          "reviewState": {
+                            "type": "string",
+                            "enum": [
+                              "draft",
+                              "in-review",
+                              "approved",
+                              "rejected"
+                            ]
+                          },
+                          "parentId": {
+                            "type": "string"
+                          },
+                          "versionOfAssetId": {
+                            "type": "string"
+                          },
+                          "versionGroupId": {
+                            "type": "string"
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "statusHistory": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "at": {
+                                  "type": "string"
+                                },
+                                "from": {
+                                  "type": "string",
+                                  "enum": [
+                                    "uploading",
+                                    "processing",
+                                    "ready",
+                                    "failed",
+                                    "archived"
+                                  ],
+                                  "nullable": true
+                                },
+                                "to": {
+                                  "type": "string",
+                                  "enum": [
+                                    "uploading",
+                                    "processing",
+                                    "ready",
+                                    "failed",
+                                    "archived"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "from",
+                                "to"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "technicalMetadata": {
+                            "type": "object",
+                            "properties": {
+                              "codec": {
+                                "type": "string"
+                              },
+                              "width": {
+                                "type": "number"
+                              },
+                              "height": {
+                                "type": "number"
+                              },
+                              "durationSeconds": {
+                                "type": "number"
+                              },
+                              "bitrateBps": {
+                                "type": "number"
+                              },
+                              "containerFormat": {
+                                "type": "string"
+                              },
+                              "audioTracks": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "index": {
+                                      "type": "number"
+                                    },
+                                    "codec": {
+                                      "type": "string"
+                                    },
+                                    "channels": {
+                                      "type": "number"
+                                    },
+                                    "sampleRateHz": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "required": [
+                                    "index",
+                                    "codec",
+                                    "channels",
+                                    "sampleRateHz"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              },
+                              "extractedAt": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "codec",
+                              "width",
+                              "height",
+                              "durationSeconds",
+                              "bitrateBps",
+                              "containerFormat",
+                              "audioTracks",
+                              "extractedAt"
+                            ],
+                            "additionalProperties": false,
+                            "nullable": true
+                          },
+                          "technicalMetadataError": {
+                            "type": "string"
+                          },
+                          "manifestUrls": {
+                            "type": "object",
+                            "properties": {
+                              "hls": {
+                                "type": "string"
+                              },
+                              "dash": {
+                                "type": "string"
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "packagingError": {
+                            "type": "string"
+                          },
+                          "renditions": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "label": {
+                                  "type": "string"
+                                },
+                                "width": {
+                                  "type": "number"
+                                },
+                                "height": {
+                                  "type": "number"
+                                },
+                                "objectKey": {
+                                  "type": "string"
+                                },
+                                "codec": {
+                                  "type": "string"
+                                },
+                                "bitrateBps": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "label",
+                                "width",
+                                "height",
+                                "objectKey"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "thumbnails": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "metadata": {
+                            "type": "object",
+                            "additionalProperties": {}
+                          },
+                          "audioTracks": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "language": {
+                                  "type": "string"
+                                },
+                                "codec": {
+                                  "type": "string"
+                                },
+                                "channels": {
+                                  "type": "number"
+                                },
+                                "label": {
+                                  "type": "string"
+                                },
+                                "default": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "language"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "subtitleTracks": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "language": {
+                                  "type": "string"
+                                },
+                                "format": {
+                                  "type": "string",
+                                  "enum": [
+                                    "vtt",
+                                    "srt",
+                                    "ttml"
+                                  ]
+                                },
+                                "objectKey": {
+                                  "type": "string"
+                                },
+                                "label": {
+                                  "type": "string"
+                                },
+                                "default": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "language",
+                                "format"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "tags": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "createdAt": {
+                            "type": "string"
+                          },
+                          "updatedAt": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "status",
+                          "statusHistory",
+                          "createdAt",
+                          "updatedAt"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "assetId",
+                    "versions"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/assets/{id}/delivery": {
       "get": {
         "parameters": [
@@ -2918,6 +3387,179 @@
                     "assetId",
                     "urls",
                     "expiresAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/assets/{id}/files": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "files": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string",
+                            "enum": [
+                              "source",
+                              "rendition",
+                              "export"
+                            ]
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "format": {
+                            "type": "string"
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "type": "string"
+                          },
+                          "sizeBytes": {
+                            "type": "number"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          },
+                          "codec": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "type",
+                          "name",
+                          "format",
+                          "objectKey",
+                          "url"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "fileGroups": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string",
+                            "enum": [
+                              "hls-package",
+                              "dash-package"
+                            ]
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "manifestUrl": {
+                            "type": "string"
+                          },
+                          "segmentCount": {
+                            "type": "number"
+                          },
+                          "objectKeyPrefix": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "type",
+                          "name",
+                          "manifestUrl",
+                          "objectKeyPrefix"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "files",
+                    "fileGroups"
                   ],
                   "additionalProperties": false
                 }
@@ -4221,6 +4863,9 @@
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 256
+                  },
+                  "asVersion": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -4255,6 +4900,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "slug": {
+                      "type": "string"
+                    },
                     "description": {
                       "type": "string"
                     },
@@ -4268,7 +4916,22 @@
                         "archived"
                       ]
                     },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
                     "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
                       "type": "string"
                     },
                     "objectKey": {
@@ -4671,6 +5334,9 @@
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 256
+                  },
+                  "asVersion": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -4706,6 +5372,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "slug": {
+                      "type": "string"
+                    },
                     "description": {
                       "type": "string"
                     },
@@ -4719,7 +5388,22 @@
                         "archived"
                       ]
                     },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
                     "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
                       "type": "string"
                     },
                     "objectKey": {
@@ -5164,6 +5848,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "slug": {
+                      "type": "string"
+                    },
                     "description": {
                       "type": "string"
                     },
@@ -5177,7 +5864,22 @@
                         "archived"
                       ]
                     },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
                     "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
                       "type": "string"
                     },
                     "objectKey": {
@@ -6016,6 +6718,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "slug": {
+                      "type": "string"
+                    },
                     "description": {
                       "type": "string"
                     },
@@ -6029,7 +6734,22 @@
                         "archived"
                       ]
                     },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
                     "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
                       "type": "string"
                     },
                     "objectKey": {
@@ -6357,6 +7077,9 @@
                     "name": {
                       "type": "string"
                     },
+                    "slug": {
+                      "type": "string"
+                    },
                     "description": {
                       "type": "string"
                     },
@@ -6370,7 +7093,22 @@
                         "archived"
                       ]
                     },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
                     "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
                       "type": "string"
                     },
                     "objectKey": {
@@ -6663,6 +7401,403 @@
         }
       }
     },
+    "/api/v1/assets/{id}/review-state": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reviewState": {
+                    "type": "string",
+                    "enum": [
+                      "draft",
+                      "in-review",
+                      "approved",
+                      "rejected"
+                    ]
+                  }
+                },
+                "required": [
+                  "reviewState"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "slug": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "uploading",
+                        "processing",
+                        "ready",
+                        "failed",
+                        "archived"
+                      ]
+                    },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
+                    "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
+                      "type": "string"
+                    },
+                    "objectKey": {
+                      "type": "string"
+                    },
+                    "statusHistory": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "at": {
+                            "type": "string"
+                          },
+                          "from": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ],
+                            "nullable": true
+                          },
+                          "to": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "at",
+                          "from",
+                          "to"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "technicalMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "codec": {
+                          "type": "string"
+                        },
+                        "width": {
+                          "type": "number"
+                        },
+                        "height": {
+                          "type": "number"
+                        },
+                        "durationSeconds": {
+                          "type": "number"
+                        },
+                        "bitrateBps": {
+                          "type": "number"
+                        },
+                        "containerFormat": {
+                          "type": "string"
+                        },
+                        "audioTracks": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "index": {
+                                "type": "number"
+                              },
+                              "codec": {
+                                "type": "string"
+                              },
+                              "channels": {
+                                "type": "number"
+                              },
+                              "sampleRateHz": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "index",
+                              "codec",
+                              "channels",
+                              "sampleRateHz"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "extractedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "width",
+                        "height",
+                        "durationSeconds",
+                        "bitrateBps",
+                        "containerFormat",
+                        "audioTracks",
+                        "extractedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "manifestUrls": {
+                      "type": "object",
+                      "properties": {
+                        "hls": {
+                          "type": "string"
+                        },
+                        "dash": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "packagingError": {
+                      "type": "string"
+                    },
+                    "renditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "label",
+                          "width",
+                          "height",
+                          "objectKey"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "thumbnails": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "metadata": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "audioTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "channels": {
+                            "type": "number"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "subtitleTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "format": {
+                            "type": "string",
+                            "enum": [
+                              "vtt",
+                              "srt",
+                              "ttml"
+                            ]
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language",
+                          "format"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "status",
+                    "statusHistory",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/jobs/": {
       "get": {
         "parameters": [
@@ -6718,7 +7853,8 @@
                               "queued",
                               "running",
                               "done",
-                              "failed"
+                              "failed",
+                              "cancelled"
                             ]
                           },
                           "assetId": {
@@ -6835,7 +7971,8 @@
                         "queued",
                         "running",
                         "done",
-                        "failed"
+                        "failed",
+                        "cancelled"
                       ]
                     },
                     "assetId": {
@@ -6961,7 +8098,8 @@
                         "queued",
                         "running",
                         "done",
-                        "failed"
+                        "failed",
+                        "cancelled"
                       ]
                     },
                     "assetId": {
@@ -7508,545 +8646,6 @@
             }
           },
           "501": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/assets/{id}/upload": {
-      "put": {
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "id",
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "id": {
-                      "type": "string"
-                    },
-                    "status": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "id",
-                    "status"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/assets/{id}/upload-url": {
-      "post": {
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "id",
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "url": {
-                      "type": "string"
-                    },
-                    "objectKey": {
-                      "type": "string"
-                    },
-                    "method": {
-                      "type": "string"
-                    },
-                    "expiresInSeconds": {
-                      "type": "number"
-                    }
-                  },
-                  "required": [
-                    "url",
-                    "objectKey",
-                    "method",
-                    "expiresInSeconds"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/assets/{id}/multipart/initiate": {
-      "post": {
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "id",
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "uploadId": {
-                      "type": "string"
-                    },
-                    "objectKey": {
-                      "type": "string"
-                    },
-                    "expiresInSeconds": {
-                      "type": "number"
-                    }
-                  },
-                  "required": [
-                    "uploadId",
-                    "objectKey",
-                    "expiresInSeconds"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/assets/{id}/multipart/{uploadId}/part-url": {
-      "get": {
-        "parameters": [
-          {
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 10000
-            },
-            "in": "query",
-            "name": "partNumber",
-            "required": true
-          },
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "id",
-            "required": true
-          },
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "uploadId",
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "url": {
-                      "type": "string"
-                    },
-                    "partNumber": {
-                      "type": "number"
-                    },
-                    "expiresInSeconds": {
-                      "type": "number"
-                    }
-                  },
-                  "required": [
-                    "url",
-                    "partNumber",
-                    "expiresInSeconds"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/assets/{id}/multipart/{uploadId}/complete": {
-      "post": {
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "parts": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "partNumber": {
-                          "type": "integer",
-                          "minimum": 1,
-                          "maximum": 10000
-                        },
-                        "etag": {
-                          "type": "string",
-                          "minLength": 1
-                        }
-                      },
-                      "required": [
-                        "partNumber",
-                        "etag"
-                      ],
-                      "additionalProperties": false
-                    },
-                    "minItems": 1,
-                    "maxItems": 10000
-                  }
-                },
-                "required": [
-                  "parts"
-                ],
-                "additionalProperties": false
-              }
-            }
-          }
-        },
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "id",
-            "required": true
-          },
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "uploadId",
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "id": {
-                      "type": "string"
-                    },
-                    "status": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "id",
-                    "status"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/assets/{id}/multipart/{uploadId}": {
-      "delete": {
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "id",
-            "required": true
-          },
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "uploadId",
-            "required": true
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "enum": [
-                    "null"
-                  ],
-                  "nullable": true
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/assets/{id}/upload-complete": {
-      "post": {
-        "parameters": [
-          {
-            "schema": {
-              "type": "string",
-              "minLength": 1
-            },
-            "in": "path",
-            "name": "id",
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Default Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "id": {
-                      "type": "string"
-                    },
-                    "status": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "id",
-                    "status"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "404": {
             "description": "Default Response",
             "content": {
               "application/json": {
