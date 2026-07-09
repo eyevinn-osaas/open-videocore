@@ -4090,6 +4090,7 @@
                       "transcode",
                       "abr-vod",
                       "ingest",
+                      "subtitles",
                       "full"
                     ]
                   },
@@ -4215,6 +4216,7 @@
                             "enum": [
                               "extract-metadata",
                               "thumbnail",
+                              "subtitles",
                               "transcode",
                               "package"
                             ]
@@ -4409,6 +4411,7 @@
                               "enum": [
                                 "extract-metadata",
                                 "thumbnail",
+                                "subtitles",
                                 "transcode",
                                 "package"
                               ]
@@ -4544,6 +4547,7 @@
                             "enum": [
                               "extract-metadata",
                               "thumbnail",
+                              "subtitles",
                               "transcode",
                               "package"
                             ]
