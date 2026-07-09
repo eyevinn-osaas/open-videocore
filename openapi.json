@@ -1124,6 +1124,45 @@
                     "technicalMetadataError": {
                       "type": "string"
                     },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
+                      "type": "string"
+                    },
                     "manifestUrls": {
                       "type": "object",
                       "properties": {
@@ -1488,6 +1527,45 @@
                             "nullable": true
                           },
                           "technicalMetadataError": {
+                            "type": "string"
+                          },
+                          "sceneMetadata": {
+                            "type": "object",
+                            "properties": {
+                              "boundaries": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "startSeconds": {
+                                      "type": "number"
+                                    },
+                                    "endSeconds": {
+                                      "type": "number"
+                                    },
+                                    "keyframeSeconds": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "additionalProperties": false
+                                }
+                              },
+                              "sceneCount": {
+                                "type": "number"
+                              },
+                              "detectedAt": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "boundaries",
+                              "sceneCount",
+                              "detectedAt"
+                            ],
+                            "additionalProperties": false,
+                            "nullable": true
+                          },
+                          "sceneDetectionError": {
                             "type": "string"
                           },
                           "manifestUrls": {
@@ -1968,6 +2046,45 @@
                           "technicalMetadataError": {
                             "type": "string"
                           },
+                          "sceneMetadata": {
+                            "type": "object",
+                            "properties": {
+                              "boundaries": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "startSeconds": {
+                                      "type": "number"
+                                    },
+                                    "endSeconds": {
+                                      "type": "number"
+                                    },
+                                    "keyframeSeconds": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "additionalProperties": false
+                                }
+                              },
+                              "sceneCount": {
+                                "type": "number"
+                              },
+                              "detectedAt": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "boundaries",
+                              "sceneCount",
+                              "detectedAt"
+                            ],
+                            "additionalProperties": false,
+                            "nullable": true
+                          },
+                          "sceneDetectionError": {
+                            "type": "string"
+                          },
                           "manifestUrls": {
                             "type": "object",
                             "properties": {
@@ -2301,6 +2418,45 @@
                       "nullable": true
                     },
                     "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
                       "type": "string"
                     },
                     "manifestUrls": {
@@ -2699,6 +2855,45 @@
                       "nullable": true
                     },
                     "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
                       "type": "string"
                     },
                     "manifestUrls": {
@@ -3150,6 +3345,45 @@
                             "nullable": true
                           },
                           "technicalMetadataError": {
+                            "type": "string"
+                          },
+                          "sceneMetadata": {
+                            "type": "object",
+                            "properties": {
+                              "boundaries": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "startSeconds": {
+                                      "type": "number"
+                                    },
+                                    "endSeconds": {
+                                      "type": "number"
+                                    },
+                                    "keyframeSeconds": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "additionalProperties": false
+                                }
+                              },
+                              "sceneCount": {
+                                "type": "number"
+                              },
+                              "detectedAt": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "boundaries",
+                              "sceneCount",
+                              "detectedAt"
+                            ],
+                            "additionalProperties": false,
+                            "nullable": true
+                          },
+                          "sceneDetectionError": {
                             "type": "string"
                           },
                           "manifestUrls": {
@@ -4091,6 +4325,7 @@
                       "abr-vod",
                       "ingest",
                       "subtitles",
+                      "scene-detect",
                       "full"
                     ]
                   },
@@ -4217,6 +4452,7 @@
                               "extract-metadata",
                               "thumbnail",
                               "subtitles",
+                              "scene-detect",
                               "transcode",
                               "package"
                             ]
@@ -4412,6 +4648,7 @@
                                 "extract-metadata",
                                 "thumbnail",
                                 "subtitles",
+                                "scene-detect",
                                 "transcode",
                                 "package"
                               ]
@@ -4548,6 +4785,7 @@
                               "extract-metadata",
                               "thumbnail",
                               "subtitles",
+                              "scene-detect",
                               "transcode",
                               "package"
                             ]
@@ -5047,6 +5285,45 @@
                     "technicalMetadataError": {
                       "type": "string"
                     },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
+                      "type": "string"
+                    },
                     "manifestUrls": {
                       "type": "object",
                       "properties": {
@@ -5517,6 +5794,45 @@
                       "nullable": true
                     },
                     "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
                       "type": "string"
                     },
                     "manifestUrls": {
@@ -5993,6 +6309,45 @@
                       "nullable": true
                     },
                     "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
                       "type": "string"
                     },
                     "manifestUrls": {
@@ -6865,6 +7220,45 @@
                     "technicalMetadataError": {
                       "type": "string"
                     },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
+                      "type": "string"
+                    },
                     "manifestUrls": {
                       "type": "object",
                       "properties": {
@@ -7222,6 +7616,45 @@
                       "nullable": true
                     },
                     "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
                       "type": "string"
                     },
                     "manifestUrls": {
@@ -7597,6 +8030,45 @@
                       "nullable": true
                     },
                     "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
                       "type": "string"
                     },
                     "manifestUrls": {
