@@ -184,7 +184,10 @@ export async function spawnInstance(
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
       // Only retry on transient 5xx / network errors, not on 4xx (bad request).
-      const isTransient = msg.includes('500') || msg.includes('502') || msg.includes('503') || msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
+      const isTransient =
+        msg.includes('500') || msg.includes('502') || msg.includes('503') ||
+        msg.includes('ORCHESTRATOR_UNAVAILABLE') || msg.includes('ORCHESTRATOR_AUTH_TRANSIENT') ||
+        msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
       if (!isTransient || attempt === maxAttempts) throw err;
       // Exponential back-off: 5s, 10s.
       await new Promise((r) => setTimeout(r, attempt * 5_000));
@@ -213,17 +216,37 @@ export async function spawnInstance(
     const callbackSat = await config.oscContext.getServiceAccessToken(
       ENCORE_CALLBACK_LISTENER_SERVICE_ID
     );
-    const callback = (await createInstance(
-      config.oscContext,
-      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-      callbackSat,
-      {
-        name: instanceId,
-        RedisUrl: config.redisUrl,
-        EncoreUrl: encoreUrl.replace(/\/+$/, ''),
-        RedisQueue: 'ovc:transcode-done'
+    // Retry callback listener creation with the same transient-error logic as
+    // the Encore instance above. The OSC ingress webhook sometimes returns
+    // ORCHESTRATOR_UNAVAILABLE under load; a short back-off is enough.
+    let callback: OscInstance | undefined;
+    let lastCallbackErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        callback = (await createInstance(
+          config.oscContext,
+          ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+          callbackSat,
+          {
+            name: instanceId,
+            RedisUrl: config.redisUrl,
+            EncoreUrl: encoreUrl.replace(/\/+$/, ''),
+            RedisQueue: 'ovc:transcode-done'
+          }
+        )) as OscInstance;
+        break;
+      } catch (err) {
+        lastCallbackErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient =
+          msg.includes('500') || msg.includes('502') || msg.includes('503') ||
+          msg.includes('ORCHESTRATOR_UNAVAILABLE') || msg.includes('ORCHESTRATOR_AUTH_TRANSIENT') ||
+          msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
+        if (!isTransient || attempt === maxAttempts) throw err;
+        await new Promise((r) => setTimeout(r, attempt * 5_000));
       }
-    )) as OscInstance;
+    }
+    if (!callback) throw lastCallbackErr;
     await waitForInstanceReady(
       ENCORE_CALLBACK_LISTENER_SERVICE_ID,
       instanceId,
