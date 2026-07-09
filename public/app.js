@@ -2968,49 +2968,23 @@ async function renderPipelinesTab(container) {
   var wrap = document.createElement('div');
   wrap.className = 'pipelines-wrap';
 
-  // ── Catalog ──
-  var catalogHeader = document.createElement('div');
-  catalogHeader.className = 'section-title mb12';
-  catalogHeader.textContent = 'Available Pipelines';
-  wrap.appendChild(catalogHeader);
-
-  var grid = document.createElement('div');
-  grid.className = 'pipelines-grid';
+  // ── Compact catalog strip ──
+  var catalogBar = document.createElement('div');
+  catalogBar.className = 'pipeline-catalog-bar';
   PIPELINE_CATALOG.forEach(function(pipeline) {
-    var card = document.createElement('div');
-    card.className = 'pipeline-card';
-    var cardHeader = document.createElement('div');
-    cardHeader.className = 'pipeline-card-header';
-    cardHeader.innerHTML =
-      '<span class="pipeline-card-name">' + escHtml(pipeline.label) + '</span>' +
-      '<span class="pipeline-card-id text-mono">' + escHtml(pipeline.name) + '</span>';
-    card.appendChild(cardHeader);
-    var desc = document.createElement('p');
-    desc.className = 'pipeline-card-desc';
-    desc.textContent = pipeline.description;
-    card.appendChild(desc);
-    var stepsEl = document.createElement('div');
-    stepsEl.className = 'pipeline-steps';
-    pipeline.steps.forEach(function(step, i) {
-      if (i > 0) {
-        var arrow = document.createElement('span');
-        arrow.className = 'pipeline-step-arrow';
-        arrow.textContent = '→';
-        stepsEl.appendChild(arrow);
-      }
-      var chip = document.createElement('span');
-      chip.className = 'pipeline-step-chip';
-      chip.textContent = (STEP_ICONS[step] || '') + ' ' + step;
-      stepsEl.appendChild(chip);
-    });
-    card.appendChild(stepsEl);
-    grid.appendChild(card);
+    var pill = document.createElement('span');
+    pill.className = 'pipeline-catalog-pill';
+    pill.title = pipeline.description + '\nSteps: ' + pipeline.steps.join(' → ');
+    pill.innerHTML =
+      '<span class="pipeline-catalog-pill-name">' + escHtml(pipeline.label) + '</span>' +
+      '<span class="pipeline-catalog-pill-id">' + escHtml(pipeline.name) + '</span>';
+    catalogBar.appendChild(pill);
   });
-  wrap.appendChild(grid);
+  wrap.appendChild(catalogBar);
 
   // ── Executions ──
   var execHeader = document.createElement('div');
-  execHeader.className = 'section-title mt24 mb12';
+  execHeader.className = 'section-title mt16 mb12';
   execHeader.textContent = 'Pipeline Executions';
   wrap.appendChild(execHeader);
 

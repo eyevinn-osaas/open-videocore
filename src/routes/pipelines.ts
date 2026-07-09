@@ -8,15 +8,13 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
-import type { PipelineRepository } from '../data/pipeline-repo.js';
+import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 
-const stepStatusSchema = z.enum(['pending', 'running', 'done', 'failed']);
-
 const stepExecutionSchema = z.object({
   name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
-  status: stepStatusSchema,
+  status: z.enum(['pending', 'running', 'done', 'failed']),
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
   error: z.string().optional(),
@@ -49,9 +47,9 @@ export type PipelinesRouterOptions = {
 
 // Enrich step executions with live progress from the linked job.
 async function enrichWithProgress(
-  steps: ReturnType<typeof cloneSteps>,
+  steps: StepExecution[],
   jobRepository: JobRepository
-): Promise<typeof steps> {
+): Promise<StepExecution[]> {
   return Promise.all(
     steps.map(async (step) => {
       if (step.status === 'running' && step.jobId) {
@@ -63,10 +61,6 @@ async function enrichWithProgress(
       return step;
     })
   );
-}
-
-function cloneSteps<T extends { steps: unknown[] }>(execution: T) {
-  return (execution.steps as Array<Record<string, unknown>>).map((s) => ({ ...s }));
 }
 
 export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async (app, opts) => {
@@ -91,19 +85,11 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
       const { status, limit = 50, offset = 0 } = request.query;
       const { items, total } = await pipelineRepository.listAll({ status, limit, offset });
 
-      // Enrich each execution with asset name and job progress.
       const enriched = await Promise.all(
         items.map(async (exec) => {
           const asset = await assetRepository.get(exec.assetId);
-          const steps = await enrichWithProgress(
-            exec.steps.map((s) => ({ ...s })),
-            jobRepository
-          );
-          return {
-            ...exec,
-            assetName: asset?.name,
-            steps
-          };
+          const steps = await enrichWithProgress([...exec.steps], jobRepository);
+          return { ...exec, assetName: asset?.name, steps };
         })
       );
 
@@ -131,15 +117,8 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
         return reply.code(404).send({ error: 'not_found' });
       }
       const asset = await assetRepository.get(exec.assetId);
-      const steps = await enrichWithProgress(
-        exec.steps.map((s) => ({ ...s })),
-        jobRepository
-      );
-      return reply.code(200).send({
-        ...exec,
-        assetName: asset?.name,
-        steps
-      });
+      const steps = await enrichWithProgress([...exec.steps], jobRepository);
+      return reply.code(200).send({ ...exec, assetName: asset?.name, steps });
     }
   );
 };
