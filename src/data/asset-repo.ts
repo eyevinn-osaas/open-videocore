@@ -46,6 +46,48 @@ export function isValidTransition(from: AssetStatus, to: AssetStatus): boolean {
   return ALLOWED_TRANSITIONS[from].includes(to);
 }
 
+// ---------------------------------------------------------------------------
+// Review state (issue #134, sub-task of #117)
+// ---------------------------------------------------------------------------
+
+// Editorial review state, DISTINCT from the lifecycle `status` above. Where
+// `status` tracks the technical/ingest lifecycle (uploading -> ... -> archived),
+// `reviewState` tracks a human approval workflow layered on top of it. The two
+// are INDEPENDENT: a `ready` asset can be `draft`, `in-review`, `approved`, or
+// `rejected`, and moving one never moves the other.
+//
+// An asset starts in `draft`. Absent/legacy assets and documents are treated as
+// `draft` (see asset-document.ts) so backward compatibility is preserved.
+export const ASSET_REVIEW_STATES = ['draft', 'in-review', 'approved', 'rejected'] as const;
+export type AssetReviewState = (typeof ASSET_REVIEW_STATES)[number];
+
+// Allowed forward transitions for the review workflow. Anything not listed is
+// rejected with 422 (same mapping as the lifecycle machine).
+//   draft      -> in-review                submit for review
+//   in-review  -> approved | rejected      reviewer decision
+//   rejected   -> in-review                resubmit after changes (re-review)
+//   approved   -> in-review                re-open an approved asset for
+//                                          re-review (e.g. a later edit needs
+//                                          fresh sign-off). `approved` is NOT
+//                                          terminal so content can always be
+//                                          pulled back into review — a common
+//                                          editorial need — while still barring
+//                                          direct approved -> rejected without a
+//                                          re-review step.
+const ALLOWED_REVIEW_TRANSITIONS: Record<AssetReviewState, readonly AssetReviewState[]> = {
+  draft: ['in-review'],
+  'in-review': ['approved', 'rejected'],
+  approved: ['in-review'],
+  rejected: ['in-review']
+};
+
+export function isValidReviewTransition(from: AssetReviewState, to: AssetReviewState): boolean {
+  if (from === to) {
+    return true; // idempotent no-op transitions are allowed
+  }
+  return ALLOWED_REVIEW_TRANSITIONS[from].includes(to);
+}
+
 export type StatusTransition = {
   at: string; // ISO timestamp
   from: AssetStatus | null; // null for the initial creation entry
@@ -91,6 +133,35 @@ export type TechnicalMetadata = {
   containerFormat: string;
   audioTracks: AudioTrack[];
   extractedAt: string; // ISO timestamp of when extraction completed
+};
+
+// One scene/shot boundary produced by the scene-detection pipeline (issue #115,
+// eyevinn-function-scenes). A scene-detection tool reports the natural cut points
+// of a video; each boundary describes one detected shot for use in the clip/trim
+// workflows. Fields are ALL optional/permissive because the runtime wire shape of
+// eyevinn-function-scenes is NOT contract-verified (see pipeline/scene-detector.ts):
+//   - startSeconds / endSeconds: the [start, end) window of the shot in seconds.
+//     `endSeconds` may be absent for the final shot (no following cut).
+//   - keyframeSeconds: a representative keyframe timecode for the shot, typically
+//     the cut point at the shot's start.
+export type SceneBoundary = {
+  startSeconds?: number;
+  endSeconds?: number;
+  keyframeSeconds?: number;
+};
+
+// Scene/shot-detection metadata extracted from the stored object by the OSC
+// eyevinn-function-scenes media function (issue #115). Populated asynchronously
+// after ingest by the OPTIONAL, fire-and-forget scene-detect step; null until the
+// first successful detection (or after a failed one — see `sceneDetectionError`).
+// It is METADATA (mirrors TechnicalMetadata), not an asset-producing output, and
+// surfaces on the asset for clip/trim workflows to consume the cut points.
+export type SceneMetadata = {
+  // Detected scene/shot boundaries, in ascending time order.
+  boundaries: SceneBoundary[];
+  // Number of detected boundaries (convenience mirror of boundaries.length).
+  sceneCount: number;
+  detectedAt: string; // ISO timestamp of when detection completed
 };
 
 // Streaming manifest URLs produced by the HLS/DASH packaging pipeline (issue
@@ -159,10 +230,37 @@ export type SubtitleTrack = {
 export type Asset = {
   id: string;
   name: string;
+  // URL-safe, human-readable handle (issue #131). Generated at create time,
+  // lowercase words joined by hyphens plus a numeric suffix (e.g.
+  // `brave-river-042`), unique within the (structurally isolated) workspace.
+  // The ULID `id` remains the internal primary key; `slug` is a friendly alias.
+  // Optional so pre-existing slug-less assets remain valid on read/validation.
+  slug?: string;
   description?: string;
   status: AssetStatus;
+  // Editorial review state (issue #134), INDEPENDENT of `status`. Optional so
+  // pre-existing assets/documents without it remain valid; absent is treated as
+  // the initial state `draft` throughout (get/list/document round-trip).
+  reviewState?: AssetReviewState;
   // Source asset id for renditions/children; undefined for top-level sources.
   parentId?: string;
+  // Version-chain linkage (issue #118), DISTINCT from `parentId`. Where
+  // `parentId` models the rendition/child HIERARCHY (drives countChildren /
+  // HasChildrenError / ?parentId= listing), the version chain records that this
+  // asset is an EDIT VERSION of another asset produced by a clip/export/rewrap
+  // operation run with `asVersion`. The two are independent: a version output is
+  // NOT a parentId child, so it never blocks the source's deletion and does not
+  // appear under ?parentId=<source>.
+  //   - versionOfAssetId: the immediate source asset this output is a version
+  //     of. Undefined for originals (assets that are not a version of anything).
+  //   - versionGroupId: stable id shared by every asset in one lineage so
+  //     "show all versions of this asset" is a single indexed lookup. An
+  //     original that has never been versioned has no group; the first version
+  //     operation seeds the group to the source's own id (see the clip/export/
+  //     rewrap handlers). Both fields are optional so pre-existing assets and
+  //     documents without them remain valid (backward compatible).
+  versionOfAssetId?: string;
+  versionGroupId?: string;
   // MinIO object key (workspace-local) for the asset payload, if any.
   objectKey?: string;
   // Append-only audit trail of every status change (issue #3 deliverable 5).
@@ -201,8 +299,21 @@ export type Asset = {
   audioTracks?: AssetAudioTrack[];
   // Multi-language subtitle / caption tracks (issue #18). Managed via the
   // dedicated /:id/subtitle-tracks routes. Undefined until the first track is
-  // added.
+  // added. Also the attach target for the auto-subtitles pipeline (issue #114),
+  // which appends an auto-generated track.
   subtitleTracks?: SubtitleTrack[];
+  // Set by the auto-subtitles pipeline (issue #114) when its last generation
+  // attempt failed. Fire-and-forget like `technicalMetadataError`: it never
+  // blocks the asset record or changes lifecycle status, so it is optional and
+  // cleared (to undefined) on the next successful generation.
+  subtitlesError?: string;
+  // Scene/shot-detection metadata from the scene-detect pipeline (issue #115).
+  // `null` means detection has not yet succeeded; an accompanying
+  // `sceneDetectionError` carries the reason when the last attempt failed.
+  // Detection never blocks the asset record or changes lifecycle status, so both
+  // fields are optional. Surfaced on GET /:id for clip/trim workflows.
+  sceneMetadata?: SceneMetadata | null;
+  sceneDetectionError?: string;
   // How the asset entered the system (ADR-005 administrative.source.method).
   sourceMethod?: AssetSourceMethod;
   // Origin URI for url-pull / watch-folder ingest.
@@ -217,8 +328,19 @@ export type Asset = {
 
 export type CreateAssetInput = {
   name: string;
+  // Optional caller-supplied slug (issue #131). When omitted the repository
+  // generates a unique, human-readable slug per workspace. When supplied it is
+  // normalized and, on collision within the workspace, a numeric suffix is
+  // appended to make it unique.
+  slug?: string;
   description?: string;
   parentId?: string;
+  // Version-chain linkage (issue #118). Supplied by the clip/export/rewrap
+  // handlers when the caller opts in with `asVersion`; omitted otherwise so the
+  // default (disconnected sibling) behavior is preserved. See the Asset type for
+  // the distinction from `parentId`.
+  versionOfAssetId?: string;
+  versionGroupId?: string;
   objectKey?: string;
   // Optional free-form metadata supplied at creation time (issue #12).
   metadata?: Record<string, unknown>;
@@ -236,6 +358,13 @@ export type UpdateAssetInput = {
   description?: string;
   objectKey?: string;
   status?: AssetStatus;
+  // Version-chain linkage backfill (issue #118). Set only when a clip/export/
+  // rewrap run with `asVersion` seeds a lineage on a source asset that had no
+  // group yet, so the source joins its own chain. Not exposed on the PATCH
+  // route — the `versionGroupId` mirror is written on the source by the handler,
+  // never overwriting an existing group. `versionOfAssetId` is intentionally
+  // immutable after create (an asset's provenance parent does not change).
+  versionGroupId?: string;
   // Set by the metadata extractor (issue #6). Writing `technicalMetadata` to a
   // value clears any prior error; writing `technicalMetadataError` records a
   // failure and leaves `technicalMetadata` null. `null` is an accepted value
@@ -269,6 +398,17 @@ export type UpdateAssetInput = {
   // the dedicated /:id/audio-tracks and /:id/subtitle-tracks routes.
   audioTracks?: AssetAudioTrack[];
   subtitleTracks?: SubtitleTrack[];
+  // Set by the auto-subtitles pipeline (issue #114). Writing a string records a
+  // failure; writing `null` clears any prior error after a successful attach.
+  // Does not change `status`. Mirrors the technicalMetadataError semantics.
+  subtitlesError?: string | null;
+  // Set by the scene-detect pipeline (issue #115). Writing `sceneMetadata` to a
+  // value clears any prior error; writing `sceneDetectionError` records a failure
+  // and leaves `sceneMetadata` null. `null` is an accepted value for
+  // `sceneMetadata` (distinct from "not provided"). Mirrors the
+  // technicalMetadata/technicalMetadataError semantics. Does not change `status`.
+  sceneMetadata?: SceneMetadata | null;
+  sceneDetectionError?: string;
 };
 
 export type ListOptions = {
@@ -276,6 +416,10 @@ export type ListOptions = {
   offset?: number;
   status?: AssetStatus;
   parentId?: string;
+  // Filter to a single version lineage (issue #118). Matches assets whose
+  // `versionGroupId` equals this value — used by the versions listing surface to
+  // enumerate every version in a chain. Independent of `parentId`.
+  versionGroupId?: string;
 };
 
 export type ListResult = {
@@ -295,6 +439,16 @@ export class InvalidStateTransitionError extends Error {
   constructor(from: AssetStatus, to: AssetStatus) {
     super(`invalid status transition: ${from} -> ${to}`);
     this.name = 'InvalidStateTransitionError';
+  }
+}
+
+// Raised when a review-state change violates the review state machine -> 422.
+// Mirrors InvalidStateTransitionError so routes map both to the same 422.
+export class InvalidReviewTransitionError extends Error {
+  readonly statusCode = 422;
+  constructor(from: AssetReviewState, to: AssetReviewState) {
+    super(`invalid review-state transition: ${from} -> ${to}`);
+    this.name = 'InvalidReviewTransitionError';
   }
 }
 
@@ -329,8 +483,18 @@ export interface AssetRepository {
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
+  // Transition the asset's editorial review state (issue #134). Validates the
+  // move against the review state machine (throws InvalidReviewTransitionError
+  // on an illegal move) and persists the new state. Returns the updated asset,
+  // or undefined if the asset does not exist. INDEPENDENT of `status`.
+  transitionReviewState(id: string, to: AssetReviewState): Promise<Asset | undefined>;
   // Returns the count of direct children of an asset (for delete-blocking).
   countChildren(id: string): Promise<number>;
+  // Enumerate every asset in the version lineage of `id` (issue #118), oldest
+  // first. Resolves `id`'s `versionGroupId` and returns all assets sharing it.
+  // An asset that has never participated in a version chain (no group) returns
+  // just itself. Returns undefined when `id` does not exist.
+  listVersions(id: string): Promise<Asset[] | undefined>;
   // Soft-delete: transitions the asset to `archived`. Returns the archived
   // asset, or undefined if it does not exist.
   remove(id: string): Promise<Asset | undefined>;
@@ -354,6 +518,9 @@ export function provenanceForPatch(patch: UpdateAssetInput, now: string): Proven
   }
   if (patch.technicalMetadata !== undefined || patch.technicalMetadataError !== undefined) {
     entries.push({ at: now, by: 'system', op: 'technical' });
+  }
+  if (patch.sceneMetadata !== undefined || patch.sceneDetectionError !== undefined) {
+    entries.push({ at: now, by: 'system', op: 'scenes' });
   }
   if (patch.renditions !== undefined) {
     entries.push({ at: now, by: 'system', op: 'rendition' });
@@ -398,6 +565,21 @@ export function applyStatus(
   };
 }
 
+// Apply a review-state change (issue #134), validating the transition against
+// the review state machine. `current` defaults to `draft` for assets that have
+// no reviewState yet (backward compat). Throws InvalidReviewTransitionError on
+// an illegal move. Returns the resolved next state.
+export function applyReviewState(
+  current: AssetReviewState | undefined,
+  next: AssetReviewState
+): { reviewState: AssetReviewState } {
+  const from = current ?? 'draft';
+  if (!isValidReviewTransition(from, next)) {
+    throw new InvalidReviewTransitionError(from, next);
+  }
+  return { reviewState: next };
+}
+
 // Apply a metadata patch to an asset's existing metadata (issue #12). When
 // `replace` is set the patch becomes the new metadata wholesale (PUT semantics);
 // otherwise the patch is shallow-merged into the existing object — top-level
@@ -413,6 +595,29 @@ export function applyMetadata(
   return { ...(existing ?? {}), ...patch };
 }
 
+// Resolve version-chain linkage for an output derived from `source` (issue
+// #118). Called by the clip/export/rewrap handlers when the caller opts in with
+// `asVersion`. Returns:
+//   - versionOfAssetId: the immediate source id (the new output is a version OF
+//     the source).
+//   - versionGroupId: the source's existing lineage id when it already belongs
+//     to a chain, otherwise the source's own id (which seeds a fresh lineage).
+//   - seedSourceGroup: true when the source had no group and must be backfilled
+//     with `versionGroupId` so it appears in its own chain alongside the new
+//     version. The handler performs that backfill via repo.update.
+export function resolveVersionLinkage(source: Asset): {
+  versionOfAssetId: string;
+  versionGroupId: string;
+  seedSourceGroup: boolean;
+} {
+  const versionGroupId = source.versionGroupId ?? source.id;
+  return {
+    versionOfAssetId: source.id,
+    versionGroupId,
+    seedSourceGroup: source.versionGroupId === undefined
+  };
+}
+
 // Deduplicate a tag list while preserving first-seen order (issue #11).
 export function normalizeTags(tags: readonly string[]): string[] {
   const seen = new Set<string>();
@@ -424,6 +629,92 @@ export function normalizeTags(tags: readonly string[]): string[] {
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Human-readable slug generation (issue #131)
+// ---------------------------------------------------------------------------
+
+// Small embedded word lists for friendly, URL-safe slugs (e.g. `brave-river-042`).
+// No existing generator/word list was found in the repo, so a compact list is
+// used here. All entries are lowercase [a-z] only, so the joined slug is always
+// URL-safe without further escaping.
+const SLUG_ADJECTIVES = [
+  'brave', 'calm', 'clever', 'bright', 'bold', 'gentle', 'happy', 'keen',
+  'lively', 'lucky', 'merry', 'noble', 'proud', 'quiet', 'swift', 'warm',
+  'wise', 'zesty', 'amber', 'azure', 'cosmic', 'crisp', 'daring', 'eager',
+  'fancy', 'golden', 'humble', 'jolly', 'mellow', 'nimble', 'placid', 'rapid'
+] as const;
+
+const SLUG_NOUNS = [
+  'river', 'forest', 'meadow', 'canyon', 'harbor', 'summit', 'valley', 'island',
+  'comet', 'nebula', 'falcon', 'otter', 'badger', 'lynx', 'heron', 'willow',
+  'cedar', 'maple', 'ember', 'pebble', 'ripple', 'breeze', 'boulder', 'lagoon',
+  'glacier', 'prairie', 'tundra', 'orchard', 'thicket', 'delta', 'fjord', 'reef'
+] as const;
+
+// Maximum number of generation attempts before falling back to a guaranteed
+// suffix. Bounds the collision-retry loop so create() cannot spin forever.
+export const SLUG_MAX_ATTEMPTS = 25;
+
+function pick<T>(list: readonly T[]): T {
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+// Coerce an arbitrary string into a URL-safe, lowercase, hyphen-joined slug
+// base. Non-alphanumeric runs collapse to a single hyphen; leading/trailing
+// hyphens are trimmed. Returns '' when nothing usable remains (caller then
+// falls back to a generated base).
+export function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .normalize('NFKD')
+    // Strip combining diacritical marks (U+0300-U+036F) left by NFKD so
+    // accented input folds to plain ASCII before the alnum filter below.
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+// Build one random `<adjective>-<noun>-<NNN>` slug candidate. The numeric
+// suffix is zero-padded to three digits for a stable, readable shape.
+export function randomSlug(): string {
+  const suffix = Math.floor(Math.random() * 1000)
+    .toString()
+    .padStart(3, '0');
+  return `${pick(SLUG_ADJECTIVES)}-${pick(SLUG_NOUNS)}-${suffix}`;
+}
+
+// Generate a slug that is unique within a workspace. `isTaken` performs the
+// workspace-scoped existence check (each repository supplies its own lookup,
+// so uniqueness is always scoped to that repository's isolated store).
+//
+// When `base` is provided (a caller-supplied slug) it is normalized and used as
+// the stem; collisions append an incrementing `-N` suffix. When `base` is
+// absent a fresh random `adjective-noun-NNN` candidate is drawn each attempt.
+// After SLUG_MAX_ATTEMPTS the loop appends a short unique-ish suffix so create()
+// is always bounded and never blocks.
+export async function generateUniqueSlug(
+  isTaken: (slug: string) => Promise<boolean>,
+  base?: string
+): Promise<string> {
+  const stem = base ? slugify(base) : '';
+  for (let attempt = 0; attempt < SLUG_MAX_ATTEMPTS; attempt++) {
+    let candidate: string;
+    if (stem) {
+      candidate = attempt === 0 ? stem : `${stem}-${attempt + 1}`;
+    } else {
+      candidate = randomSlug();
+    }
+    if (!(await isTaken(candidate))) {
+      return candidate;
+    }
+  }
+  // Bounded fallback: append a random 6-char base36 tail to whatever stem we
+  // have (or a fresh random slug), guaranteeing termination.
+  const tail = Math.random().toString(36).slice(2, 8);
+  const fallbackStem = stem || randomSlug();
+  return `${fallbackStem}-${tail}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -446,12 +737,18 @@ export class InMemoryAssetRepository implements AssetRepository {
     // ULID local id (ADR-005 / issue #53): time-sortable + URL-safe.
     const localId = ulid();
     const method = input.sourceMethod ?? 'upload';
+    // Human-readable slug (issue #131), unique within this repository's store
+    // (workspace-scoped uniqueness — the store is one tenant's isolated set).
+    const slug = await generateUniqueSlug((s) => this.slugTaken(s), input.slug);
     const asset: Asset = {
       id: localId,
       name: input.name,
+      slug,
       description: input.description,
       status: 'uploading',
       parentId: input.parentId,
+      versionOfAssetId: input.versionOfAssetId,
+      versionGroupId: input.versionGroupId,
       objectKey: input.objectKey,
       statusHistory: initialHistory(now),
       metadata: input.metadata,
@@ -464,6 +761,17 @@ export class InMemoryAssetRepository implements AssetRepository {
     };
     this.store.set(localId, asset);
     return { ...asset };
+  }
+
+  // Workspace-scoped slug existence check (issue #131). Scans this store, which
+  // holds exactly one tenant's assets, so uniqueness is per-workspace.
+  private async slugTaken(slug: string): Promise<boolean> {
+    for (const a of this.store.values()) {
+      if (a.slug === slug) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async get(id: string): Promise<Asset | undefined> {
@@ -483,6 +791,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (opts.parentId !== undefined) {
       all = all.filter((a) => a.parentId === opts.parentId);
+    }
+    if (opts.versionGroupId !== undefined) {
+      all = all.filter((a) => a.versionGroupId === opts.versionGroupId);
     }
     all.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     const items = all.slice(offset, offset + limit).map((a) => ({ ...a }));
@@ -549,6 +860,23 @@ export class InMemoryAssetRepository implements AssetRepository {
     if (patch.subtitleTracks !== undefined) {
       next.subtitleTracks = patch.subtitleTracks;
     }
+    if (patch.subtitlesError !== undefined) {
+      // `null` clears the error (successful attach); a string records a failure.
+      next.subtitlesError = patch.subtitlesError ?? undefined;
+    }
+    if (patch.sceneMetadata !== undefined) {
+      next.sceneMetadata = patch.sceneMetadata;
+      // A successful detection clears any stale error.
+      if (patch.sceneMetadata !== null) {
+        next.sceneDetectionError = undefined;
+      }
+    }
+    if (patch.sceneDetectionError !== undefined) {
+      next.sceneDetectionError = patch.sceneDetectionError;
+    }
+    if (patch.versionGroupId !== undefined) {
+      next.versionGroupId = patch.versionGroupId;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -562,8 +890,39 @@ export class InMemoryAssetRepository implements AssetRepository {
     return { ...next };
   }
 
+  async transitionReviewState(
+    id: string,
+    to: AssetReviewState
+  ): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const applied = applyReviewState(existing.reviewState, to);
+    const now = new Date().toISOString();
+    const next: Asset = { ...existing, reviewState: applied.reviewState, updatedAt: now };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
   async countChildren(id: string): Promise<number> {
     return [...this.store.values()].filter((a) => a.parentId === id && a.status !== 'archived').length;
+  }
+
+  async listVersions(id: string): Promise<Asset[] | undefined> {
+    const asset = this.store.get(id);
+    if (!asset) {
+      return undefined;
+    }
+    // No lineage yet: the asset is its own (single-member) chain.
+    if (!asset.versionGroupId) {
+      return [{ ...asset }];
+    }
+    const group = asset.versionGroupId;
+    return [...this.store.values()]
+      .filter((a) => a.versionGroupId === group)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((a) => ({ ...a }));
   }
 
   async remove(id: string): Promise<Asset | undefined> {

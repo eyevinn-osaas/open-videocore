@@ -15,9 +15,11 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import {
+  ASSET_REVIEW_STATES,
   ASSET_STATUSES,
   HasChildrenError,
   InMemoryAssetRepository,
+  InvalidReviewTransitionError,
   InvalidStateTransitionError,
   ParentNotFoundError,
   normalizeTags,
@@ -31,8 +33,8 @@ import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import {
   SourceTooLargeError,
+  WorkspaceStorage,
   deliveryUrlTtlSeconds,
-  type WorkspaceStorage
 } from '../data/storage.js';
 import { parseSource, assertPublicHost, SourceValidationError } from '../pipeline/source.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
@@ -42,6 +44,16 @@ import {
   type ProbeRunner
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
+import {
+  generateSubtitles,
+  type GenerateSubtitlesDeps,
+  type SubtitleGenerator
+} from '../pipeline/subtitle-generator.js';
+import {
+  detectScenes,
+  type DetectScenesDeps,
+  type SceneDetector
+} from '../pipeline/scene-detector.js';
 import {
   BUILT_IN_PIPELINES,
   PIPELINE_NAMES,
@@ -67,6 +79,9 @@ import {
 } from '../pipeline/rewrap.js';
 
 const statusSchema = z.enum(ASSET_STATUSES);
+
+// Editorial review state (issue #134), distinct from lifecycle `status`.
+const reviewStateSchema = z.enum(ASSET_REVIEW_STATES);
 
 // A custom Encore profile a caller may supply instead of a named preset. Kept
 // permissive (forwarded to Encore) but bounded so it cannot be abused.
@@ -109,6 +124,10 @@ const tagsSchema = z.array(tagSchema).max(128);
 
 const createSchema = z.object({
   name: z.string().min(1).max(256),
+  // Optional caller-supplied slug (issue #131). Bounded; the repository
+  // normalizes it and appends a numeric suffix on collision. When omitted a
+  // unique human-readable slug is generated server-side.
+  slug: z.string().min(1).max(256).optional(),
   description: z.string().max(2048).optional(),
   parentId: z.string().min(1).optional(),
   objectKey: z.string().min(1).max(1024).optional(),
@@ -158,6 +177,42 @@ const deliverySchema = z.object({
   expiresAt: z.string()
 });
 
+// Unified files view (issue #119). A DERIVED / projection read model over the
+// asset's existing storage fields — it does NOT change how assets are stored.
+// A `file` is a single downloadable object; its `url` is a presigned GET so a
+// caller can download without MinIO credentials. `objectKey` is retained so the
+// caller can correlate the presigned URL back to the underlying storage key.
+// A `fileGroup` is a multi-file streaming package (HLS/DASH) addressed by a
+// single manifest URL rather than a per-segment presigned URL.
+const assetFileSchema = z.object({
+  id: z.string(),
+  type: z.enum(['source', 'rendition', 'export']),
+  name: z.string(),
+  format: z.string(),
+  objectKey: z.string(),
+  url: z.string(),
+  sizeBytes: z.number().optional(),
+  label: z.string().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+  bitrateBps: z.number().optional(),
+  codec: z.string().optional()
+});
+
+const assetFileGroupSchema = z.object({
+  id: z.string(),
+  type: z.enum(['hls-package', 'dash-package']),
+  name: z.string(),
+  manifestUrl: z.string(),
+  segmentCount: z.number().optional(),
+  objectKeyPrefix: z.string()
+});
+
+const assetFilesSchema = z.object({
+  files: z.array(assetFileSchema),
+  fileGroups: z.array(assetFileGroupSchema)
+});
+
 // Thumbnail extraction request (issue #7): one or more timecodes in seconds.
 const thumbnailsBodySchema = z.object({
   timecodes: z.array(z.number().min(0)).min(1).max(50)
@@ -173,7 +228,11 @@ const thumbnailsResultSchema = z.object({
 // with a Zod enum so an unsupported container is a 400 at the boundary.
 const exportBodySchema = z.object({
   targetFormat: z.enum(REWRAP_FORMATS),
-  outputName: z.string().min(1).max(256).optional()
+  outputName: z.string().min(1).max(256).optional(),
+  // Version-chain linkage (issue #118). Optional; defaults to false so existing
+  // callers get today's behavior (a disconnected parentId child). When true the
+  // export is additionally recorded as a version of the source asset.
+  asVersion: z.boolean().optional()
 });
 // Clip / trim request (issue #17): a time window in seconds. `endSeconds` must
 // be strictly greater than `startSeconds`. Optional `outputName` names the new
@@ -182,7 +241,11 @@ const clipBodySchema = z
   .object({
     startSeconds: z.number().min(0),
     endSeconds: z.number().positive(),
-    outputName: z.string().min(1).max(256).optional()
+    outputName: z.string().min(1).max(256).optional(),
+    // Version-chain linkage (issue #118). Optional; defaults to false so
+    // existing callers get today's behavior (a disconnected parentId child).
+    // When true the clip is additionally recorded as a version of the source.
+    asVersion: z.boolean().optional()
   })
   .refine((b) => b.endSeconds > b.startSeconds, {
     message: 'endSeconds must be greater than startSeconds'
@@ -215,6 +278,20 @@ const technicalMetadataSchema = z.object({
 const manifestUrlsSchema = z.object({
   hls: z.string().optional(),
   dash: z.string().optional()
+});
+
+// Scene/shot-detection metadata (issue #115). Boundary fields are all optional
+// because the eyevinn-function-scenes runtime wire shape is not contract-verified
+// (see pipeline/scene-detector.ts), so a boundary may carry only a subset.
+const sceneBoundarySchema = z.object({
+  startSeconds: z.number().optional(),
+  endSeconds: z.number().optional(),
+  keyframeSeconds: z.number().optional()
+});
+const sceneMetadataSchema = z.object({
+  boundaries: z.array(sceneBoundarySchema),
+  sceneCount: z.number(),
+  detectedAt: z.string()
 });
 
 const renditionSchema = z.object({
@@ -275,15 +352,31 @@ const tracksSchema = z.object({
 const assetSchema = z.object({
   id: z.string(),
   name: z.string(),
+  // Human-readable, URL-safe slug (issue #131). Present on assets created after
+  // slugs were introduced; absent/undefined for pre-existing slug-less assets.
+  slug: z.string().optional(),
   description: z.string().optional(),
   status: statusSchema,
+  // Editorial review state (issue #134), INDEPENDENT of `status`. Optional so
+  // pre-existing assets serialized before reviewState existed still validate.
+  reviewState: reviewStateSchema.optional(),
   parentId: z.string().optional(),
+  // Version-chain linkage (issue #118), DISTINCT from `parentId`. Present only
+  // on outputs produced by a clip/export/rewrap run with `asVersion`. Absent on
+  // originals and on pre-existing assets serialized before #118.
+  versionOfAssetId: z.string().optional(),
+  versionGroupId: z.string().optional(),
   objectKey: z.string().optional(),
   statusHistory: z.array(transitionSchema),
   // Technical metadata (issue #6). `null` until the first successful extraction
   // (or after a failed one); `technicalMetadataError` carries the last failure.
   technicalMetadata: technicalMetadataSchema.nullish(),
   technicalMetadataError: z.string().optional(),
+  // Scene/shot-detection metadata (issue #115). `null` until the first successful
+  // detection (or after a failed one); `sceneDetectionError` carries the last
+  // failure. Surfaced here so clip/trim clients read the cut points from GET /:id.
+  sceneMetadata: sceneMetadataSchema.nullish(),
+  sceneDetectionError: z.string().optional(),
   // Streaming manifest URLs from the packaging pipeline (issue #9). Absent until
   // packaging completes; `packagingError` carries the last packaging failure.
   manifestUrls: manifestUrlsSchema.optional(),
@@ -339,6 +432,24 @@ type AssetsRouterOptions = {
   // Defaults to the real fire-and-forget extractor.
   extract?: typeof extractTechnicalMetadata;
   extractDeps?: Partial<ExtractDeps>;
+  // Auto-subtitles (issue #114). `subtitleGenerator` calls the OSC
+  // eyevinn-auto-subtitles (Whisper) service (a stub in tests). When absent (or
+  // no object storage), the OPTIONAL `subtitles` pipeline step skips gracefully —
+  // it is fire-and-forget and never throws into the ingest path.
+  subtitleGenerator?: SubtitleGenerator;
+  // Injectable orchestrator runner + extra deps (tests stub the generator/TTL).
+  // Defaults to the real fire-and-forget generator.
+  generateSubtitles?: typeof generateSubtitles;
+  subtitleDeps?: Partial<GenerateSubtitlesDeps>;
+  // Scene detection (issue #115). `sceneDetector` calls the OSC
+  // eyevinn-function-scenes media function (a stub in tests). When absent (or no
+  // object storage), the OPTIONAL `scene-detect` pipeline step skips gracefully —
+  // it is fire-and-forget and never throws into the ingest/pipeline path.
+  sceneDetector?: SceneDetector;
+  // Injectable orchestrator runner + extra deps (tests stub the detector/TTL).
+  // Defaults to the real fire-and-forget detector.
+  detectScenes?: typeof detectScenes;
+  sceneDetectDeps?: Partial<DetectScenesDeps>;
   // Encore transcode client (issue #8). When absent, POST /:id/transcode
   // responds 501 (Encore not configured on this deployment).
   encore?: EncoreClient;
@@ -353,8 +464,10 @@ type AssetsRouterOptions = {
   // Defaults to the real awaited extractor.
   extractThumbnails?: typeof extractThumbnails;
   thumbnailDeps?: Partial<ExtractThumbnailsDeps>;
-  // Public base URL for building thumbnail URLs in GET responses. When unset,
-  // GET returns workspace-local object keys instead of absolute URLs.
+  // Deprecated (issue #113): thumbnail listing now always returns API proxy
+  // URLs (/api/v1/assets/:id/thumbnails/:index), so this option is inert and no
+  // longer read by the GET handler. Retained only so existing callers/tests
+  // that still pass it continue to type-check.
   thumbnailPublicBaseUrl?: string;
   // Export / re-wrap (issue #19). `rewrapRunner` runs the OSC ffmpeg `-c copy`
   // job (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
@@ -380,7 +493,7 @@ type AssetsRouterOptions = {
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
 const stepStatusSchema = z.enum(['pending', 'running', 'done', 'failed']);
 const stepExecutionSchema = z.object({
-  name: z.enum(['extract-metadata', 'thumbnail', 'transcode', 'package']),
+  name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
   status: stepStatusSchema,
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
@@ -434,12 +547,68 @@ async function resolveEncoreJobUrlForPackaging(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Files-view helpers (issue #119). Pure, derive display fields from object keys
+// and manifest URLs. None of these mutate the asset — the endpoint is a read
+// projection only.
+// ---------------------------------------------------------------------------
+
+// The last path segment of a MinIO object key, used as a human file name (e.g.
+// `sources/<id>/master.mp4` -> `master.mp4`). Falls back to the whole key.
+// Parse an `s3://bucket/key` URI into its parts. Renditions written by Encore
+// carry this format because Encore writes to a configurable S3 output bucket
+// that may differ from the source bucket (ADR-001). Returns null for plain
+// object keys (no scheme prefix) so callers can use the source-bucket storage.
+function parseS3Uri(uri: string): { bucket: string; key: string } | null {
+  const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
+  if (!match) return null;
+  return { bucket: match[1], key: match[2] };
+}
+
+function fileNameFromKey(key: string): string {
+  const trimmed = key.replace(/\/+$/, '');
+  const segment = trimmed.slice(trimmed.lastIndexOf('/') + 1);
+  return segment || key;
+}
+
+// Container format inferred from an object key's file extension (e.g.
+// `.../master.mp4` -> `mp4`). Asset renditions and source keys do not carry an
+// explicit format field, so it is derived from the stored key. Returns an empty
+// string when the key has no extension (schema `format` stays a plain string).
+function formatFromKey(key: string): string {
+  const name = fileNameFromKey(key);
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0 || dot === name.length - 1) {
+    return '';
+  }
+  return name.slice(dot + 1).toLowerCase();
+}
+
+// Derive the object-key prefix backing a streaming package from its manifest
+// URL — the manifest's parent "directory" (e.g.
+// `https://minio/packaged/<id>/hls/master.m3u8` -> `packaged/<id>/hls/`). The
+// URL path is used when parseable; otherwise the raw string is treated as a
+// path. Segment objects live under this prefix.
+function objectKeyPrefixFromManifest(manifestUrl: string): string {
+  let path = manifestUrl;
+  try {
+    path = new URL(manifestUrl).pathname;
+  } catch {
+    // Not an absolute URL; treat the value itself as a path.
+  }
+  path = path.replace(/^\/+/, '');
+  const lastSlash = path.lastIndexOf('/');
+  return lastSlash >= 0 ? path.slice(0, lastSlash + 1) : '';
+}
+
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository ?? new InMemoryAssetRepository();
   const jobs = opts.jobRepository ?? new InMemoryJobRepository();
   const runner = opts.runPull ?? runPull;
   const extractRunner = opts.extract ?? extractTechnicalMetadata;
+  const subtitleRunner = opts.generateSubtitles ?? generateSubtitles;
+  const sceneDetectRunner = opts.detectScenes ?? detectScenes;
   const thumbnailRunner = opts.extractThumbnails ?? extractThumbnails;
   const rewrapRunner = opts.rewrap ?? rewrap;
   const clipRunnerOrchestrator = opts.clip ?? runClip;
@@ -460,6 +629,50 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         storage: storageFor(),
         probe: opts.probe,
         ...opts.extractDeps
+      }
+    );
+    return true;
+  }
+
+  // Fire-and-forget auto-subtitle generation for a pipeline step (issue #114).
+  // Detached, never blocks the caller, and the generator itself never throws
+  // (records failures on the asset as `subtitlesError`). No-op when the OSC
+  // auto-subtitles service or object storage is not configured — consistent with
+  // the OPTIONAL, opt-in nature of the step. Returns true when a generation was
+  // actually kicked off (false = skipped gracefully).
+  function triggerSubtitles(assetId: string, objectKey: string): boolean {
+    if (!opts.subtitleGenerator || !storageFor) {
+      return false;
+    }
+    void subtitleRunner(
+      { assetId, objectKey },
+      {
+        assets: repo,
+        storage: storageFor(),
+        generate: opts.subtitleGenerator,
+        ...opts.subtitleDeps
+      }
+    );
+    return true;
+  }
+
+  // Fire-and-forget scene/shot detection for a pipeline step (issue #115).
+  // Detached, never blocks the caller, and the detector itself never throws
+  // (records failures on the asset as `sceneDetectionError`). No-op when the OSC
+  // eyevinn-function-scenes service or object storage is not configured —
+  // consistent with the OPTIONAL, opt-in nature of the step. Returns true when a
+  // detection was actually kicked off (false = skipped gracefully).
+  function triggerSceneDetect(assetId: string, objectKey: string): boolean {
+    if (!opts.sceneDetector || !storageFor) {
+      return false;
+    }
+    void sceneDetectRunner(
+      { assetId, objectKey },
+      {
+        assets: repo,
+        storage: storageFor(),
+        detect: opts.sceneDetector,
+        ...opts.sceneDetectDeps
       }
     );
     return true;
@@ -533,7 +746,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return undefined;
       }
     }
-    if ((firstStep === 'extract-metadata' || firstStep === 'thumbnail') && !asset.objectKey) {
+    if (
+      (firstStep === 'extract-metadata' ||
+        firstStep === 'thumbnail' ||
+        firstStep === 'subtitles' ||
+        firstStep === 'scene-detect') &&
+      !asset.objectKey
+    ) {
       reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
       return undefined;
     }
@@ -556,6 +775,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         }
         if (step.name === 'thumbnail') {
           triggerThumbnail(asset.id, asset.objectKey as string, request);
+          stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          continue;
+        }
+        if (step.name === 'subtitles') {
+          // Fire-and-forget, exactly like extract-metadata: kick off (or skip
+          // gracefully when unconfigured) and settle the step immediately. The
+          // generator records its own success/failure on the asset and never
+          // throws into this loop, so the step never fails the pipeline.
+          triggerSubtitles(asset.id, asset.objectKey as string);
+          stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          continue;
+        }
+        if (step.name === 'scene-detect') {
+          // Fire-and-forget, exactly like extract-metadata/subtitles: kick off (or
+          // skip gracefully when unconfigured) and settle the step immediately. The
+          // detector records its own success/failure on the asset and never throws
+          // into this loop, so the step never fails the pipeline.
+          triggerSceneDetect(asset.id, asset.objectKey as string);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -613,6 +850,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
     if (err instanceof InvalidStateTransitionError) {
       return reply.code(422).send({ error: 'invalid_state_transition', message: err.message });
+    }
+    if (err instanceof InvalidReviewTransitionError) {
+      return reply.code(422).send({ error: 'invalid_review_transition', message: err.message });
     }
     if (err instanceof ParentNotFoundError) {
       return reply.code(422).send({ error: 'parent_not_found', message: err.message });
@@ -748,6 +988,34 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // Enumerate every version in an asset's version chain (issue #118).
+  // Workspace-scoped and behind `authenticate`. Returns all assets sharing the
+  // target's `versionGroupId`, oldest first, so a client can "show all versions
+  // of this asset", compare, or roll back. An asset that has never participated
+  // in a clip/export/rewrap version chain returns just itself (single-member
+  // chain). DISTINCT from ?parentId= listing, which enumerates rendition/child
+  // hierarchy, not edit versions.
+  //   200 — the version chain (always includes the target); 404 — unknown asset
+  app.get(
+    '/:id/versions',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: {
+          200: z.object({ assetId: z.string(), versions: z.array(assetSchema) }),
+          404: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const versions = await repo.listVersions(request.params.id);
+      if (!versions) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send({ assetId: request.params.id, versions });
+    }
+  );
+
   // Delivery URL generation (issue #14). Closes the pipeline loop: ingest ->
   // transcode -> package -> deliver. Workspace-scoped and behind `authenticate`.
   // Resolution order:
@@ -805,6 +1073,137 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         error: 'no_delivery',
         message: 'asset has no packaged output or stored source object to deliver'
       });
+    }
+  );
+
+  // Unified files view (issue #119). A DERIVED / additive read model that folds
+  // the asset's three separate storage fields into one shape callers can consume
+  // without reassembling it themselves:
+  //   - `objectKey`   (the stored source)      -> one `file` of type `source`
+  //   - each `renditions[]` entry (issue #8)   -> a `file` of type `rendition`
+  //   - `manifestUrls` (HLS/DASH, issue #9)    -> `fileGroups`
+  // The legacy fields on the asset are UNCHANGED — this endpoint never writes.
+  // Each `file` carries a PRESIGNED GET `url` (minted the same way as the
+  // /:id/delivery source fallback above) so a caller downloads without MinIO
+  // creds. Package manifests are already public CMAF URLs, so `fileGroups` carry
+  // the manifest URL directly (no per-segment signing).
+  //   200 — the projection (files / fileGroups may each be empty)
+  //   404 — unknown/foreign asset (existence not leaked; matches sibling routes)
+  //   501 — one or more files need presigning but object storage is not
+  //         configured here (same not_configured convention as /:id/delivery)
+  app.get(
+    '/:id/files',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: assetFilesSchema, 404: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      // Collect the object keys that must be presigned (source + renditions).
+      // Groups (manifests) are already-public URLs and need no signing.
+      const sourceKey = asset.objectKey;
+      const renditions = asset.renditions ?? [];
+      const needsPresign = Boolean(sourceKey) || renditions.length > 0;
+
+      // Match /:id/delivery: only 501 when we actually have a key to sign and no
+      // storage is configured to sign it. An asset with only manifests (or no
+      // files at all) still returns 200 with an empty/group-only projection.
+      if (needsPresign && !storageFor) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured'
+        });
+      }
+
+      const ttl = deliveryUrlTtlSeconds();
+      const storage = storageFor ? storageFor() : undefined;
+
+      const files: z.infer<typeof assetFileSchema>[] = [];
+
+      // Source object -> one `source` file. `id` is the fixed literal "source"
+      // (an asset has at most one source object), giving a stable, addressable id.
+      if (sourceKey) {
+        files.push({
+          id: 'source',
+          type: 'source',
+          name: fileNameFromKey(sourceKey),
+          format: formatFromKey(sourceKey),
+          objectKey: sourceKey,
+          // storage is defined here: needsPresign is true so the 501 guard above
+          // already returned if storageFor was absent.
+          url: await storage!.presignedGet(sourceKey, ttl)
+        });
+      }
+
+      // Each rendition -> a `rendition` file. The rendition already carries a
+      // stable ULID `id` (asset-repo Rendition.id), so the file id is derived
+      // deterministically as `rendition:<renditionId>` — stable across calls and
+      // unique even if two rungs share a label.
+      //
+      // Renditions from Encore store their objectKey as an S3 URI
+      // (s3://openvideocore-packaged/transcode/<id>/rendition.mp4) because Encore
+      // writes to a separate packaged bucket. Parse the URI to get the actual
+      // bucket + key and presign from the right storage.
+      const storageClient = request.connections?.storageClient;
+      for (const r of renditions) {
+        const s3Uri = parseS3Uri(r.objectKey);
+        let url: string;
+        let exposedKey: string;
+        if (s3Uri && storageClient) {
+          const rendStorage = new WorkspaceStorage(storageClient, s3Uri.bucket);
+          url = await rendStorage.presignedGet(s3Uri.key, ttl);
+          exposedKey = s3Uri.key;
+        } else {
+          url = await storage!.presignedGet(r.objectKey, ttl);
+          exposedKey = r.objectKey;
+        }
+        files.push({
+          id: `rendition:${r.id}`,
+          type: 'rendition',
+          name: fileNameFromKey(exposedKey),
+          format: formatFromKey(exposedKey),
+          objectKey: exposedKey,
+          url,
+          label: r.label,
+          width: r.width,
+          height: r.height,
+          bitrateBps: r.bitrateBps,
+          codec: r.codec
+        });
+      }
+
+      // manifestUrls -> streaming fileGroups. `id` is the fixed package type so
+      // each format yields at most one stable group id ("hls"/"dash"). The
+      // objectKeyPrefix is derived from the manifest's path so callers can locate
+      // the segment objects that back the package.
+      const fileGroups: z.infer<typeof assetFileGroupSchema>[] = [];
+      const manifests = asset.manifestUrls;
+      if (manifests?.hls) {
+        fileGroups.push({
+          id: 'hls',
+          type: 'hls-package',
+          name: 'HLS',
+          manifestUrl: manifests.hls,
+          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.hls)
+        });
+      }
+      if (manifests?.dash) {
+        fileGroups.push({
+          id: 'dash',
+          type: 'dash-package',
+          name: 'DASH',
+          manifestUrl: manifests.dash,
+          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.dash)
+        });
+      }
+
+      return reply.code(200).send({ files, fileGroups });
     }
   );
 
@@ -1199,7 +1598,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceAssetId: asset.id,
             objectKey: asset.objectKey,
             targetFormat: request.body.targetFormat,
-            outputName: request.body.outputName
+            outputName: request.body.outputName,
+            asVersion: request.body.asVersion
           },
           {
             assets: repo,
@@ -1256,7 +1656,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             objectKey: asset.objectKey,
             startSeconds: request.body.startSeconds,
             endSeconds: request.body.endSeconds,
-            outputName: request.body.outputName
+            outputName: request.body.outputName,
+            asVersion: request.body.asVersion
           },
           {
             assets: repo,
@@ -1273,14 +1674,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // List an asset's thumbnail URLs (issue #7). Returns absolute URLs when a
-  // public base URL is configured, otherwise the workspace-local object keys.
-  //   200 — list of thumbnail URLs (possibly empty)
+  // List an asset's thumbnail URLs (issue #7, #113). Returns API proxy URLs of
+  // the form /api/v1/assets/:id/thumbnails/:index keyed by array position. The
+  // proxy route below streams the object from MinIO using admin credentials, so
+  // these URLs work without a public/presigned MinIO URL and match how the asset
+  // list card renders thumbnails (public/app.js).
+  //   200 — list of thumbnail proxy URLs (possibly empty)
   //   404 — unknown/foreign asset (existence not leaked)
   app.get(
     '/:id/thumbnails',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         response: {
@@ -1295,12 +1699,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       const keys = asset.thumbnails ?? [];
-      const base = opts.thumbnailPublicBaseUrl;
-      // With a public base URL, return absolute URLs; otherwise return the
-      // stored object keys as-is (callers can fetch them via the proxy route).
-      const thumbnails = base
-        ? keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`)
-        : keys;
+      const thumbnails = keys.map(
+        (_k, i) => `/api/v1/assets/${asset.id}/thumbnails/${i}`
+      );
       return reply.code(200).send({ assetId: asset.id, thumbnails });
     }
   );
@@ -1600,10 +2001,36 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // Transition an asset's editorial review state (issue #134, sub-task of #117).
+  // DISTINCT from the lifecycle `status`: this drives a human approval workflow
+  // (draft -> in-review -> approved | rejected, with re-review paths) and never
+  // touches `status`. Forward-only transitions are validated by the review state
+  // machine; an illegal move returns 422 (same mapping as the status machine).
+  //   200 — review state transitioned, full asset returned
+  //   404 — unknown/foreign asset (existence not leaked)
+  //   422 — invalid review-state transition
+  app.post(
+    '/:id/review-state',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: z.object({ reviewState: reviewStateSchema }),
+        response: { 200: assetSchema, 404: errorSchema, 422: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.transitionReviewState(request.params.id, request.body.reviewState);
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
+    }
+  );
+
   app.patch(
     '/:id',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         body: updateSchema,

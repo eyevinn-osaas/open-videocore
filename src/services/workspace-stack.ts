@@ -11,7 +11,7 @@
 
 import nano from 'nano';
 import { Client as MinioClient } from 'minio';
-import type { ParamStore, StackConfig } from './param-store.js';
+import { isReadyStack, type ParamStore, type StackConfig } from './param-store.js';
 import { couchServer, StackCouch } from '../data/couchdb.js';
 import { WorkspaceStorage } from '../data/storage.js';
 import { CouchAssetRepository } from '../data/couch-asset-repo.js';
@@ -53,12 +53,35 @@ export type WorkspaceConnections = {
 
 type CacheEntry = { connections: WorkspaceConnections; expiresAt: number };
 
+// True if the value is a non-empty, parseable absolute URL. A partially
+// provisioned stack can persist empty-string coordinates; feeding those to nano
+// (dbScope) or the MinIO client's `new URL(...)` throws an uncaught assertion,
+// which — in the global preHandler — would 500 every route including /health.
+function isValidUrl(value: string | undefined): boolean {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  try {
+    // eslint-disable-next-line no-new
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Build connections for a provisioned stack. Returns null when the stack config
+// is incomplete/invalid (empty or non-URL couchdbUrl or minioEndpoint) so the
+// resolver can fall back to no-op in-memory connections instead of throwing an
+// uncaught assertion out of the global preHandler (issue #105).
 function buildConnectionsFromStack(
   config: StackConfig,
   minioPassword: string,
   couchPassword: string,
   oscContext: Context
-): WorkspaceConnections {
+): WorkspaceConnections | null {
+  if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
+    return null;
+  }
+
   const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
   const couchUrl = config.couchdbUrl.replace(/\/$/, '').replace(
     /^(https?:\/\/)/, `$1admin:${couchPassword}@`
@@ -249,6 +272,16 @@ export class WorkspaceStackResolver {
     try {
       if (stackName) {
         config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
+        // If the requested stack name isn't found, fall back to the default
+        // (first provisioned) stack rather than degrading to in-memory
+        // connections. This prevents stale UI stack selections from breaking
+        // all storage/asset operations.
+        if (!config) {
+          const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+          if (names.length > 0) {
+            config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
+          }
+        }
       } else {
         const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
         if (names.length > 0) {
@@ -259,9 +292,17 @@ export class WorkspaceStackResolver {
       // Fall through to in-memory
     }
 
-    const connections = config
-      ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext)
-      : buildInMemoryConnections();
+    // A partially-provisioned/failed stack must never be treated as a live,
+    // connectable stack (issue #106): only 'ready' (or legacy status-less)
+    // configs are connected. Non-ready configs still exist in the store so the
+    // deprovision route can read services[] and clean up, but the resolver skips
+    // them here. buildConnectionsFromStack also returns null for empty/invalid
+    // coordinates (issue #105 defence-in-depth). In every skip case we fall back
+    // to no-op in-memory connections so /health and infra routes stay up.
+    const connections =
+      (config && isReadyStack(config)
+        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext)
+        : null) ?? buildInMemoryConnections();
 
     this.cache.set(cacheKey, { connections, expiresAt: Date.now() + CACHE_TTL_MS });
     return connections;

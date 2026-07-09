@@ -24,10 +24,12 @@
 
 import { z } from 'zod';
 import {
+  ASSET_REVIEW_STATES,
   ASSET_SOURCE_METHODS,
   PROVENANCE_ACTORS,
   SUBTITLE_FORMATS,
   type Asset,
+  type AssetReviewState,
   type AssetSourceMethod,
   type AssetStatus,
   type ProvenanceEntry
@@ -104,6 +106,27 @@ const EditorialSubtitleTrackSchema = z.object({
   default: z.boolean().optional()
 });
 
+// Scene/shot-detection boundary (issue #115), persisted under the structural
+// namespace. All fields optional/permissive because the runtime wire shape of
+// eyevinn-function-scenes is NOT contract-verified (see pipeline/scene-detector.ts).
+const SceneBoundarySchema = z.object({
+  startSeconds: z.number().optional(),
+  endSeconds: z.number().optional(),
+  keyframeSeconds: z.number().optional()
+});
+
+// Scene-detection metadata (issue #115). Held under the structural namespace and
+// optional so documents written before #115 (field absent) still deserialize — no
+// schemaVersion bump required. The failure of the LAST attempt is carried in a
+// separate structural `sceneDetectionError` field (mirroring `packagingError` /
+// `subtitlesError`), so a failed detection records the error without a metadata
+// object, exactly like the flat domain type.
+const SceneDetectionSchema = z.object({
+  boundaries: z.array(SceneBoundarySchema).default([]),
+  sceneCount: z.number().default(0),
+  detectedAt: z.string()
+});
+
 const StatusTransitionSchema = z.object({
   at: z.string(),
   from: z.string().nullable(),
@@ -123,6 +146,9 @@ export const AssetDocumentSchema = z.object({
 
   descriptive: z.object({
     title: z.string(),
+    // Human-readable URL-safe handle (issue #131). Optional so documents written
+    // before slugs existed still deserialize (field simply absent).
+    slug: z.string().optional(),
     description: z.string().optional(),
     tags: z.array(z.string()).default([]),
     language: z.string().optional(),
@@ -153,7 +179,12 @@ export const AssetDocumentSchema = z.object({
       .object({ license: z.string().optional(), expiresAt: z.string().nullable().optional() })
       .optional(),
     provenance: z.array(ProvenanceEntrySchema).default([]),
-    statusHistory: z.array(StatusTransitionSchema).default([])
+    statusHistory: z.array(StatusTransitionSchema).default([]),
+    // Editorial review state (issue #134), DISTINCT from lifecycle `state`.
+    // `.default('draft')` means documents written before reviewState existed
+    // (the field simply absent) deserialize as `draft` — no schemaVersion bump
+    // is required, so all v1 documents remain valid.
+    reviewState: z.enum(ASSET_REVIEW_STATES).default('draft')
   }),
 
   structural: z
@@ -163,7 +194,22 @@ export const AssetDocumentSchema = z.object({
       thumbnails: z.array(ThumbnailSchema).optional(),
       collections: z.array(z.string()).default([]),
       derivedFrom: z.string().nullable().optional(),
+      // Version-chain linkage (issue #118), DISTINCT from `derivedFrom` (which
+      // persists the parentId hierarchy). Both optional so documents written
+      // before #118 (field simply absent) still deserialize — no schemaVersion
+      // bump is required, all v1 documents remain valid.
+      versionOf: z.string().nullable().optional(),
+      versionGroupId: z.string().nullable().optional(),
       packagingError: z.string().optional(),
+      // Last auto-subtitles generation failure (issue #114). Optional so
+      // documents written before #114 (field absent) still deserialize — no
+      // schemaVersion bump required.
+      subtitlesError: z.string().optional(),
+      // Scene/shot-detection metadata (issue #115) and the last detection
+      // failure. Both optional so documents written before #115 (fields absent)
+      // still deserialize — no schemaVersion bump required.
+      sceneDetection: SceneDetectionSchema.optional(),
+      sceneDetectionError: z.string().optional(),
       editorialAudio: z.array(EditorialAudioTrackSchema).optional(),
       editorialSubtitles: z.array(EditorialSubtitleTrackSchema).optional()
     })
@@ -236,6 +282,7 @@ export function toAssetDocument(
     state: asset.status,
     descriptive: {
       title: asset.name,
+      slug: asset.slug,
       description: asset.description,
       tags: asset.tags ?? [],
       custom: (asset.metadata as Record<string, unknown>) ?? {}
@@ -249,12 +296,19 @@ export function toAssetDocument(
         originUri: asset.originUri
       },
       provenance: asset.provenance ?? [],
-      statusHistory: asset.statusHistory
+      statusHistory: asset.statusHistory,
+      // Editorial review state (issue #134). Absent on the flat asset means the
+      // asset has never been moved out of draft; persist the default explicitly.
+      reviewState: asset.reviewState ?? 'draft'
     },
     structural: {
       renditions: asset.renditions ?? [],
       collections: asset.collections ?? [],
-      derivedFrom: asset.parentId ?? null
+      derivedFrom: asset.parentId ?? null,
+      // Version-chain linkage (issue #118). Persisted next to derivedFrom but
+      // semantically independent of the parentId hierarchy.
+      versionOf: asset.versionOfAssetId ?? null,
+      versionGroupId: asset.versionGroupId ?? null
     }
   };
   if (opts.rev) {
@@ -272,6 +326,19 @@ export function toAssetDocument(
   }
   if (asset.packagingError) {
     doc.structural.packagingError = asset.packagingError;
+  }
+  if (asset.subtitlesError) {
+    doc.structural.subtitlesError = asset.subtitlesError;
+  }
+  if (asset.sceneMetadata) {
+    doc.structural.sceneDetection = {
+      boundaries: asset.sceneMetadata.boundaries,
+      sceneCount: asset.sceneMetadata.sceneCount,
+      detectedAt: asset.sceneMetadata.detectedAt
+    };
+  }
+  if (asset.sceneDetectionError) {
+    doc.structural.sceneDetectionError = asset.sceneDetectionError;
   }
   if (asset.thumbnails && asset.thumbnails.length > 0) {
     doc.structural.thumbnails = asset.thumbnails.map((objectKey) => ({ objectKey }));
@@ -296,13 +363,21 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
   const renditions = doc.structural?.renditions;
   const collections = doc.structural?.collections;
   const derivedFrom = doc.structural?.derivedFrom ?? undefined;
+  const versionOfAssetId = doc.structural?.versionOf ?? undefined;
+  const versionGroupId = doc.structural?.versionGroupId ?? undefined;
 
   return {
     id: doc._id,
     name: doc.descriptive.title,
+    slug: doc.descriptive.slug,
     description: doc.descriptive.description,
     status: doc.state as AssetStatus,
+    // Editorial review state (issue #134). The schema defaults absent values to
+    // `draft`, so legacy documents round-trip to `draft` rather than undefined.
+    reviewState: doc.administrative.reviewState as AssetReviewState,
     parentId: derivedFrom ?? undefined,
+    versionOfAssetId,
+    versionGroupId,
     objectKey: doc.administrative.storage?.key,
     statusHistory: (doc.administrative.statusHistory ?? []).map((t) => ({
       at: t.at,
@@ -313,6 +388,18 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     technicalMetadataError: technical.technicalMetadataError,
     manifestUrls,
     packagingError: doc.structural?.packagingError,
+    subtitlesError: doc.structural?.subtitlesError,
+    // Scene-detection metadata (issue #115). Absent structural.sceneDetection
+    // maps to `undefined` (never detected) rather than `null`; the flat type
+    // treats both as "no metadata yet". The last failure round-trips separately.
+    sceneMetadata: doc.structural?.sceneDetection
+      ? {
+          boundaries: doc.structural.sceneDetection.boundaries,
+          sceneCount: doc.structural.sceneDetection.sceneCount,
+          detectedAt: doc.structural.sceneDetection.detectedAt
+        }
+      : undefined,
+    sceneDetectionError: doc.structural?.sceneDetectionError,
     renditions: renditions && renditions.length > 0 ? renditions : undefined,
     thumbnails: thumbnails && thumbnails.length > 0 ? thumbnails : undefined,
     metadata:

@@ -23,14 +23,17 @@ import { ulid } from 'ulid';
 import {
   type Asset,
   type AssetRepository,
+  type AssetReviewState,
   type AssetStatus,
   type CreateAssetInput,
   type ListOptions,
   type ListResult,
   type UpdateAssetInput,
   applyMetadata,
+  applyReviewState,
   applyStatus,
   clampLimit,
+  generateUniqueSlug,
   initialHistory,
   initialProvenance,
   normalizeTags,
@@ -67,12 +70,22 @@ export class CouchAssetRepository implements AssetRepository {
     // ULID local id (ADR-005 / issue #53): time-sortable + URL-safe.
     const localId = ulid();
     const method = input.sourceMethod ?? 'upload';
+    // Human-readable slug (issue #131), unique within this stack's database.
+    // OSC provisions one CouchDB instance per tenant (ADR-003), so a slug
+    // existence check against this database is inherently workspace-scoped.
+    const slug = await generateUniqueSlug(
+      (s) => this.slugTaken(couch, s),
+      input.slug
+    );
     const asset: Asset = {
       id: localId,
       name: input.name,
+      slug,
       description: input.description,
       status: 'uploading',
       parentId: input.parentId,
+      versionOfAssetId: input.versionOfAssetId,
+      versionGroupId: input.versionGroupId,
       objectKey: input.objectKey,
       statusHistory: initialHistory(now),
       metadata: input.metadata,
@@ -177,6 +190,23 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.subtitleTracks !== undefined) {
       next.subtitleTracks = patch.subtitleTracks;
     }
+    if (patch.subtitlesError !== undefined) {
+      // `null` clears the error (successful attach); a string records a failure.
+      next.subtitlesError = patch.subtitlesError ?? undefined;
+    }
+    if (patch.sceneMetadata !== undefined) {
+      next.sceneMetadata = patch.sceneMetadata;
+      // A successful detection clears any stale error.
+      if (patch.sceneMetadata !== null) {
+        next.sceneDetectionError = undefined;
+      }
+    }
+    if (patch.sceneDetectionError !== undefined) {
+      next.sceneDetectionError = patch.sceneDetectionError;
+    }
+    if (patch.versionGroupId !== undefined) {
+      next.versionGroupId = patch.versionGroupId;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -192,10 +222,56 @@ export class CouchAssetRepository implements AssetRepository {
     return next;
   }
 
+  async transitionReviewState(
+    id: string,
+    to: AssetReviewState
+  ): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const existing = fromDoc(doc);
+    const applied = applyReviewState(existing.reviewState, to);
+    const now = new Date().toISOString();
+    const next: Asset = { ...existing, reviewState: applied.reviewState, updatedAt: now };
+    // Carry _rev so CouchDB accepts the update; put() forces the partition.
+    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
+    return next;
+  }
+
+  // Workspace-scoped slug existence check (issue #131). Queries the top-level
+  // `slug` mirror emitted by toDoc() so the lookup is a simple Mango selector.
+  private async slugTaken(couch: StackCouch, slug: string): Promise<boolean> {
+    const matches = await couch.find({ resourceType: RESOURCE_TYPE, slug }, { limit: 1 });
+    return matches.length > 0;
+  }
+
   async countChildren(id: string): Promise<number> {
     const couch = this.couchFor();
     // Archived children no longer block deletion — they are already soft-deleted.
     return couch.count({ resourceType: RESOURCE_TYPE, derivedFrom: id, state: { $ne: 'archived' } });
+  }
+
+  async listVersions(id: string): Promise<Asset[] | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const asset = fromDoc(doc);
+    // No lineage yet: the asset is its own (single-member) chain.
+    if (!asset.versionGroupId) {
+      return [asset];
+    }
+    const docs = await couch.find(
+      { resourceType: RESOURCE_TYPE, versionGroupId: asset.versionGroupId },
+      { limit: MAX_LIMIT }
+    );
+    return docs
+      .filter((d) => d.resourceType === RESOURCE_TYPE)
+      .map(fromDoc)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   }
 
   async remove(id: string): Promise<Asset | undefined> {
@@ -214,6 +290,10 @@ function buildSelector(opts: ListOptions): Record<string, unknown> {
     // Mirror of structural.derivedFrom for indexable Mango filtering.
     selector['derivedFrom'] = opts.parentId;
   }
+  if (opts.versionGroupId !== undefined) {
+    // Mirror of structural.versionGroupId for indexable Mango filtering (#118).
+    selector['versionGroupId'] = opts.versionGroupId;
+  }
   return selector;
 }
 
@@ -231,7 +311,15 @@ function toDoc(asset: Asset): Record<string, unknown> {
     resourceType: RESOURCE_TYPE,
     localId: asset.id,
     state: asset.status,
-    derivedFrom: asset.parentId ?? null
+    derivedFrom: asset.parentId ?? null,
+    // Top-level mirror of structural.versionGroupId (issue #118) so enumerating
+    // a version lineage is a simple, indexable Mango selector. Omitted for
+    // assets not in any version chain.
+    ...(asset.versionGroupId ? { versionGroupId: asset.versionGroupId } : {}),
+    // Top-level mirror of descriptive.slug (issue #131) so the workspace-scoped
+    // uniqueness check is a simple, indexable Mango selector. Omitted for
+    // legacy/slug-less assets.
+    ...(asset.slug ? { slug: asset.slug } : {})
   };
 }
 

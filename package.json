@@ -10,7 +10,8 @@
     "build": "tsc",
     "start": "node --env-file-if-exists=.env dist/main.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "generate:openapi": "bash scripts/generate-openapi.sh"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.2",
@@ -31,6 +32,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.6",
+    "happy-dom": "^20.10.6",
     "tsx": "^4.19.3",
     "typescript": "^5.8.3",
     "vitest": "^4.1.3"

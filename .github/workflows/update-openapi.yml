@@ -1,0 +1,45 @@
+name: Update OpenAPI spec
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - openapi.json
+
+jobs:
+  update-openapi:
+    name: Regenerate openapi.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate openapi.json
+        run: pnpm generate:openapi
+        env:
+          OSC_ACCESS_TOKEN: ci-placeholder
+          MINIO_ROOT_PASSWORD: ci-placeholder
+          COUCHDB_ADMIN_PASSWORD: ci-placeholder
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add openapi.json
+          if git diff --cached --quiet; then
+            echo "openapi.json unchanged — nothing to commit"
+          else
+            git commit -m "chore(openapi): regenerate openapi.json [skip ci]"
+            git push
+          fi

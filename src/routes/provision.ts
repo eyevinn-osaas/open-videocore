@@ -25,6 +25,7 @@ import {
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { STACK_SERVICES } from '../services/stack.js';
 import type { OperationStore } from '../services/operation-store.js';
+import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
 // referenced by Encore (input/source) and eyevinn-encore-packager
@@ -100,6 +101,15 @@ type ProvisionRouterOptions = {
   // deployment's own tenant (deriveWorkspaceId). Optional: when omitted no cache
   // invalidation is signalled.
   onStackChange?: (workspaceId: string) => void;
+  // Late-bound accessor for the scaler registry. The registry is created lazily
+  // in main.ts *after* this router registers (only once a stack exists), so it
+  // cannot be passed by value at registration time. This getter reads the
+  // outer module-level binding, resolving the ordering: it returns the current
+  // registry when one is active and undefined otherwise. Mirrors the deferred
+  // onStackChange precedent. The DELETE route uses it to reach
+  // WorkspaceEncoreScalerRegistry.teardown(workspaceId) (#122; teardown call
+  // itself is #123). Optional: when omitted the router has no registry to reach.
+  getScalerRegistry?: () => WorkspaceEncoreScalerRegistry | undefined;
   // In-memory store for async provision/deprovision operations. POST / and
   // DELETE /:name return 202 immediately with an operationId; the caller polls
   // GET /operations/:id for completion.
@@ -128,6 +138,7 @@ const acceptedSchema = z.object({
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
 // declared as a schema for response validation.
 const storedConfigSchema = z.object({
+  status: z.enum(['provisioning', 'ready', 'failed']).optional(),
   minioEndpoint: z.string(),
   couchdbUrl: z.string(),
   redisUrl: z.string(),
@@ -199,7 +210,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   opts
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { osc, paramStore, onStackChange, operationStore: ops } = opts;
+  const { osc, paramStore, onStackChange, getScalerRegistry, operationStore: ops } =
+    opts;
 
   // Operator-supplied credentials (ADR-002). Read once at registration time so
   // a misconfigured deployment fails fast at startup rather than mid-provision.
@@ -502,6 +514,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // source of truth, so a write error must not strand a healthy stack.
         if (paramStore) {
           const stackConfig: StackConfig = {
+            status: 'ready',
             minioEndpoint,
             couchdbUrl: stripCredentials(couchdbUrl),
             redisUrl,
@@ -553,6 +566,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             try {
               const workspaceId = await deriveWorkspaceId(osc);
               await paramStore.storeStackConfig(workspaceId, name, {
+                // Mark the partial write as failed (issue #106) so the resolver
+                // never treats this never-completed stack as live. The empty
+                // coordinates are still recorded, but the deprovision route
+                // reads services[] regardless of status to clean up.
+                status: 'failed',
                 minioEndpoint: '',
                 couchdbUrl: '',
                 redisUrl: '',
@@ -705,6 +723,26 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               result: { name, status: 'not_found', services: [] }
             });
             return;
+          }
+
+          // Stop the per-workspace Encore scaler and destroy every pooled
+          // Encore/callback-listener instance *before* removing the static
+          // services below (#123, sub-task of #107). teardown() is a clean
+          // no-op when the scaler was never active for this workspace
+          // (workspace-registry.ts:138), so this is safe when the registry is
+          // absent or the pool is empty. Guard failures the same way the
+          // parameter-store cleanup below does: a teardown error is logged but
+          // must not abort the static-service deprovision that follows.
+          const scalerRegistry = getScalerRegistry?.();
+          if (scalerRegistry) {
+            try {
+              await scalerRegistry.teardown(workspaceId);
+            } catch (err) {
+              app.log.error(
+                { err, name, workspaceId },
+                'scaler teardown failed before static-service deprovision; continuing'
+              );
+            }
           }
 
           // Teardown order and the instance set come from what was actually

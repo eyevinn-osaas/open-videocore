@@ -36,7 +36,12 @@ import {
 } from './data/per-workspace-repos.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
+import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
+import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
+import { makeOscSceneDetector } from './pipeline/osc-scene-detect.js';
+import type { SceneDetector } from './pipeline/scene-detector.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
+import { extractThumbnails } from './pipeline/thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
@@ -221,7 +226,14 @@ await app.register(provisionRouter, {
     void reconcileScaler().catch((err) =>
       app.log.warn({ err }, 'encore-scaler: reconcile after stack change failed')
     );
-  }
+  },
+  // Late-bound accessor for the scaler registry. scalerRegistry is a
+  // module-level binding created lazily by reconcileScaler() only once a stack
+  // exists (and reset to undefined on the last deprovision), which is *after*
+  // this register() call runs. This getter reads that outer binding on demand
+  // so the DELETE route can reach the current registry for teardown (#123)
+  // without depending on registration-time ordering.
+  getScalerRegistry: () => scalerRegistry
 });
 
 // Workspace-scoped resource repositories. These hold NO connection of their
@@ -333,6 +345,51 @@ const clipRunner: ClipRunner | undefined = storageAvailable
       removeJob
     })
   : undefined;
+
+// Auto-subtitles (issue #114) runs on the long-lived OSC eyevinn-auto-subtitles
+// (Whisper) SERVICE, called over HTTP at its instance URL — NOT an ephemeral job
+// like the ffprobe/thumbnail/clip runners. It is OPTIONAL and opt-in: the
+// service is provisioned separately (it needs an OpenAI key), so the deployment
+// supplies the instance name via AUTO_SUBTITLES_INSTANCE_NAME. When that name is
+// unset (or object storage is missing) the generator is undefined and the
+// `subtitles` pipeline step skips gracefully (never throws — fire-and-forget).
+// AUTO_SUBTITLES_WRITES_S3=true tells the runner the service uploads the result
+// object to S3 itself (so we skip our own upload path).
+const autoSubtitlesInstanceName = process.env['AUTO_SUBTITLES_INSTANCE_NAME'];
+const subtitleGenerator: SubtitleGenerator | undefined =
+  storageAvailable && autoSubtitlesInstanceName
+    ? makeOscSubtitleGenerator({
+        context: oscContext,
+        getInstance,
+        instanceName: autoSubtitlesInstanceName,
+        writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
+      })
+    : undefined;
+if (storageAvailable && !autoSubtitlesInstanceName) {
+  app.log.info('AUTO_SUBTITLES_INSTANCE_NAME not set — optional auto-subtitles pipeline step disabled');
+}
+
+// Scene detection (issue #115) runs on the OSC eyevinn-function-scenes media
+// FUNCTION, called over HTTP at its instance URL (NOT an ephemeral job). Like
+// auto-subtitles it is OPTIONAL and opt-in: the function is provisioned
+// separately, so the deployment supplies the instance name via
+// SCENE_DETECT_INSTANCE_NAME. When that name is unset (or object storage is
+// missing) the detector is undefined and the OPTIONAL `scene-detect` pipeline
+// step skips gracefully (never throws — fire-and-forget). SCENE_DETECT_PATH
+// overrides the (un-contract-verified) runtime endpoint path (default '/').
+const sceneDetectInstanceName = process.env['SCENE_DETECT_INSTANCE_NAME'];
+const sceneDetector: SceneDetector | undefined =
+  storageAvailable && sceneDetectInstanceName
+    ? makeOscSceneDetector({
+        context: oscContext,
+        getInstance,
+        instanceName: sceneDetectInstanceName,
+        path: process.env['SCENE_DETECT_PATH']
+      })
+    : undefined;
+if (storageAvailable && !sceneDetectInstanceName) {
+  app.log.info('SCENE_DETECT_INSTANCE_NAME not set — optional scene-detect pipeline step disabled');
+}
 
 // ABR transcoding via auto-scaling Encore pool (ADR-006). The scaler exposes
 // the same EncoreClient interface as the old static client but manages a
@@ -644,9 +701,10 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   sourceBucket,
   outputBucket,
   thumbnailExtractor,
-  thumbnailPublicBaseUrl: process.env['THUMBNAIL_PUBLIC_BASE_URL'],
   rewrapRunner,
   clipRunner,
+  subtitleGenerator,
+  sceneDetector,
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository
@@ -691,18 +749,39 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
 await app.register(internalRouter, internalRouterOptions);
 
 // On object storage (upload-complete OR watch-folder ingest), fire-and-forget
-// ffprobe extraction (issue #6). Shared by the upload route and the
-// watch-folder service so a direct-bucket drop gets the same treatment as an
-// API upload. Undefined when no probe runner is configured.
-// The upload route resolves the caller's workspace before invoking this, so the
-// resolver cache is warm and the sync storageFor() can read it.
+// ffprobe extraction (issue #6) and thumbnail extraction (issue #7). Shared by
+// the upload route and the watch-folder service. The upload route resolves the
+// caller's workspace before invoking this, so the resolver cache is warm and
+// the sync storageFor() and resolveCached() can be read synchronously.
 const onObjectStored =
-  storageAvailable && probe
-    ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) =>
-        void extractTechnicalMetadata(
-          { assetId, objectKey },
-          { assets: assetRepository, storage: storage ?? storageFor(), probe }
-        )
+  storageAvailable
+    ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) => {
+        const effectiveStorage = storage ?? storageFor();
+        if (probe) {
+          void extractTechnicalMetadata(
+            { assetId, objectKey },
+            { assets: assetRepository, storage: effectiveStorage, probe }
+          );
+        }
+        if (thumbnailExtractor) {
+          // Read s3Config from the already-warm resolver cache. The upload
+          // preHandler called resolve() so resolveCached() is valid here.
+          const conns = stackResolver.resolveCached();
+          const s3Cfg = conns?.s3Config;
+          const bucket = conns?.sourceBucket ?? sourceBucket;
+          const extractor = s3Cfg
+            ? (thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)(
+                { ...s3Cfg, bucket }
+              )
+            : undefined;
+          if (extractor) {
+            void extractThumbnails(
+              { assetId, objectKey, timecodes: [1] },
+              { assets: assetRepository, storage: effectiveStorage, extractor }
+            ).catch(() => { /* failures recorded on asset */ });
+          }
+        }
+      }
     : undefined;
 
 if (storageAvailable) {

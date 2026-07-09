@@ -13,6 +13,7 @@
 
 import type {
   AssetRepository,
+  AssetReviewState,
   CreateAssetInput,
   UpdateAssetInput,
   ListOptions,
@@ -69,8 +70,14 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   async update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined> {
     return (await this.repo()).update(id, patch);
   }
+  async transitionReviewState(id: string, to: AssetReviewState): Promise<Asset | undefined> {
+    return (await this.repo()).transitionReviewState(id, to);
+  }
   async countChildren(id: string): Promise<number> {
     return (await this.repo()).countChildren(id);
+  }
+  async listVersions(id: string): Promise<Asset[] | undefined> {
+    return (await this.repo()).listVersions(id);
   }
   async remove(id: string): Promise<Asset | undefined> {
     return (await this.repo()).remove(id);
