@@ -242,7 +242,16 @@ export async function destroyInstance(
   config: EncoreScalerConfig
 ): Promise<void> {
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
-  await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
+  try {
+    await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
+  } catch (err) {
+    // 404 = instance already gone on OSC — treat as success so the pool record
+    // is still cleaned up below. Any other error means the instance may still
+    // be running: keep the pool record so the next tick retries rather than
+    // spawning a replacement for something that's still alive.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes('404') && !msg.includes('not found')) throw err;
+  }
   // Best-effort teardown of the paired callback listener (same name). It may
   // already be gone, so any error is swallowed.
   try {
@@ -258,8 +267,9 @@ export async function destroyInstance(
   } catch {
     // Listener already removed or unreachable — nothing to do.
   }
-  // Only drop the pool record after OSC removal succeeds. Dropping it before
-  // or on OSC failure would cause the pool to lose track of a still-running
-  // instance, which makes the next tick think it can spawn a replacement.
+  // Only drop the pool record after OSC removal succeeds (or confirmed gone).
+  // Dropping it on a transient failure would cause the pool to lose track of a
+  // still-running instance, making the next tick spawn a replacement — which is
+  // exactly the runaway-spawning bug this fixes.
   await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
 }
