@@ -196,43 +196,60 @@ export async function spawnInstance(
   await waitForInstanceReady(ENCORE_SERVICE_ID, instanceId, config.oscContext);
   const encoreUrl = instanceUrl(instance);
 
-  // Pair this Encore instance with a dedicated callback listener (same name)
-  // configured with this exact Encore URL, so completion callbacks are routed
-  // to the scaler-managed instance rather than a static one. RedisQueue is set
-  // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
-  // eyevinn-encore-packager consumes, so an external packager can't win the
-  // BZPOPMIN race against our poller and swallow our completion messages
-  // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
-  // src/pipeline/encore-callback-poller.ts.
-  const callbackSat = await config.oscContext.getServiceAccessToken(
-    ENCORE_CALLBACK_LISTENER_SERVICE_ID
-  );
-  const callback = (await createInstance(
-    config.oscContext,
-    ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-    callbackSat,
-    {
-      name: instanceId,
-      RedisUrl: config.redisUrl,
-      EncoreUrl: encoreUrl.replace(/\/+$/, ''),
-      RedisQueue: 'ovc:transcode-done'
-    }
-  )) as OscInstance;
-  await waitForInstanceReady(
-    ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-    instanceId,
-    config.oscContext
-  );
+  // Everything after this point runs with the Encore instance already live on
+  // OSC. If any step fails (callback listener creation, waitForInstanceReady,
+  // or pool write) we must destroy the Encore instance before re-throwing so
+  // it doesn't become an untracked orphan that causes the next tick to spawn
+  // a duplicate.
+  try {
+    // Pair this Encore instance with a dedicated callback listener (same name)
+    // configured with this exact Encore URL, so completion callbacks are routed
+    // to the scaler-managed instance rather than a static one. RedisQueue is set
+    // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
+    // eyevinn-encore-packager consumes, so an external packager can't win the
+    // BZPOPMIN race against our poller and swallow our completion messages
+    // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
+    // src/pipeline/encore-callback-poller.ts.
+    const callbackSat = await config.oscContext.getServiceAccessToken(
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID
+    );
+    const callback = (await createInstance(
+      config.oscContext,
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+      callbackSat,
+      {
+        name: instanceId,
+        RedisUrl: config.redisUrl,
+        EncoreUrl: encoreUrl.replace(/\/+$/, ''),
+        RedisQueue: 'ovc:transcode-done'
+      }
+    )) as OscInstance;
+    await waitForInstanceReady(
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+      instanceId,
+      config.oscContext
+    );
 
-  const record: EncoreInstanceRecord = {
-    instanceId,
-    url: encoreUrl,
-    callbackListenerUrl: instanceUrl(callback),
-    activeJobs: 0,
-    lastIdleAt: Date.now()
-  };
-  await updateInstance(config.redis, config.workspaceId, record);
-  return record;
+    const record: EncoreInstanceRecord = {
+      instanceId,
+      url: encoreUrl,
+      callbackListenerUrl: instanceUrl(callback),
+      activeJobs: 0,
+      lastIdleAt: Date.now()
+    };
+    await updateInstance(config.redis, config.workspaceId, record);
+    return record;
+  } catch (err) {
+    // Clean up the already-created Encore instance so it doesn't become an
+    // untracked orphan. Best-effort: swallow cleanup errors so the original
+    // error is what propagates to the caller.
+    try {
+      await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
+    } catch {
+      // Ignore — we're already in an error path.
+    }
+    throw err;
+  }
 }
 
 // Tear down an Encore OSC instance and drop it from the pool hash. Idempotent:
