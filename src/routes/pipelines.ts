@@ -11,6 +11,7 @@ import { z } from 'zod';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
+import type { EncoreClient } from '../pipeline/encore-client.js';
 
 const stepExecutionSchema = z.object({
   name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
@@ -43,6 +44,7 @@ export type PipelinesRouterOptions = {
   pipelineRepository: PipelineRepository;
   jobRepository: JobRepository;
   assetRepository: AssetRepository;
+  encoreClient?: EncoreClient;
 };
 
 // Enrich step executions with live progress from the linked job.
@@ -64,7 +66,7 @@ async function enrichWithProgress(
 }
 
 export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async (app, opts) => {
-  const { pipelineRepository, jobRepository, assetRepository } = opts;
+  const { pipelineRepository, jobRepository, assetRepository, encoreClient } = opts;
   const server = app.withTypeProvider<ZodTypeProvider>();
 
   // List all pipeline executions across all assets, newest first.
@@ -96,6 +98,58 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
       );
 
       return reply.code(200).send({ items: enriched, total });
+    }
+  );
+
+  // Cancel a pipeline execution: remove any pending Encore jobs from the
+  // scaler queue and mark the execution + all non-terminal steps as failed.
+  //   200 — cancelled execution
+  //   404 — unknown execution ID
+  server.delete(
+    '/:executionId',
+    {
+      schema: {
+        params: z.object({ executionId: z.string() }),
+        response: {
+          200: pipelineExecutionSchema,
+          404: z.object({ error: z.string() })
+        }
+      }
+    },
+    async (request, reply) => {
+      const exec = await pipelineRepository.get(request.params.executionId);
+      if (!exec) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      // Cancel any pending Encore jobs so they are removed from the scaler
+      // queue and don't keep triggering instance spawning.
+      if (encoreClient) {
+        for (const step of exec.steps) {
+          if (step.encoreJobId && step.status !== 'done') {
+            await encoreClient.cancel(step.encoreJobId).catch(() => {});
+          }
+        }
+      }
+
+      // Mark each non-terminal step as failed and the execution overall.
+      const now = new Date().toISOString();
+      const updatedSteps = exec.steps.map((step) =>
+        step.status === 'done' ? step : { ...step, status: 'failed' as const, completedAt: now }
+      );
+      const updated = await pipelineRepository.update(exec.id, {
+        status: 'failed',
+        steps: updatedSteps
+      });
+
+      // Also mark the linked job(s) as failed in the job repository.
+      for (const step of exec.steps) {
+        if (step.jobId && step.status !== 'done') {
+          await jobRepository.update(step.jobId, { status: 'failed', error: 'Cancelled by operator' }).catch(() => {});
+        }
+      }
+
+      return reply.code(200).send({ ...(updated ?? exec), steps: updatedSteps });
     }
   );
 

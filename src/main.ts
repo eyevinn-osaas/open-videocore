@@ -595,6 +595,7 @@ function activateScaler(redisUrl: string): void {
   assetRouterOptions.packagingRedis = redis;
   jobsRouterOptions.redis = redis;
   encoreCompatRouterOptions.encore = encore;
+  pipelinesRouterOptions.encoreClient = encore;
   internalRouterOptions.packaging = packaging;
   internalRouterOptions.redis = redis;
   scalerRouterOptions.redis = redis;
@@ -641,6 +642,7 @@ async function deactivateScaler(): Promise<void> {
   assetRouterOptions.packagingRedis = undefined;
   jobsRouterOptions.redis = undefined;
   encoreCompatRouterOptions.encore = undefined;
+  pipelinesRouterOptions.encoreClient = undefined;
   internalRouterOptions.packaging = undefined;
   internalRouterOptions.redis = undefined;
   scalerRouterOptions.redis = undefined;
@@ -736,12 +738,14 @@ const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } =
 await app.register(jobsRouter, jobsRouterOptions);
 
 // Cross-asset pipeline execution visibility (issue #161).
-await app.register(pipelinesRouter, {
+const pipelinesRouterOptions: Parameters<typeof pipelinesRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/pipelines',
   pipelineRepository,
   jobRepository,
-  assetRepository
-});
+  assetRepository,
+  encoreClient: encore
+};
+await app.register(pipelinesRouter, pipelinesRouterOptions);
 
 // Encore-compatible transcode submission (migration surface). Lets integrators
 // who POST directly to an Encore OSC instance repoint at this API with only a
