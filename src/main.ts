@@ -218,7 +218,7 @@ await app.register(provisionRouter, {
   osc: oscContext,
   paramStore,
   operationStore,
-  publicBaseUrl,
+  publicBaseUrl: process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, ''),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly
