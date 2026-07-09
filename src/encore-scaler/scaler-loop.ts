@@ -44,8 +44,10 @@ export class EncoreScalerLoop {
       if (this.running) return;
       this.running = true;
       void this.tick()
-        .catch(() => {
+        .catch((err) => {
           // A tick failure must not kill the interval; the next tick retries.
+          // Log so spawn/dispatch errors are visible rather than silently lost.
+          console.error('[encore-scaler] tick error (workspace=%s):', this.config.workspaceId, err);
         })
         .finally(() => {
           this.running = false;
