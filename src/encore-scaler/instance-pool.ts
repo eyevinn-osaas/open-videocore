@@ -16,6 +16,7 @@
 import type { Redis } from 'ioredis';
 import {
   createInstance,
+  listInstances as oscListInstances,
   removeInstance,
   waitForInstanceReady
 } from '@osaas/client-core';
@@ -72,6 +73,74 @@ export async function updateInstance(
   record: EncoreInstanceRecord
 ): Promise<void> {
   await redis.hset(keys.pool(workspaceId), record.instanceId, JSON.stringify(record));
+}
+
+// Reconcile the Valkey pool for workspaceId against the actual OSC instance
+// list. Intended for startup after a Valkey wipe or unclean shutdown: discovers
+// any scaler-owned Encore instances that are still running on OSC but absent
+// from the pool hash, and re-adds them so the loop can dispatch jobs to them
+// instead of spawning duplicates.
+//
+// Contracts verified (CLAUDE.md rule 7):
+//   - oscListInstances(context, serviceId, token): Promise<any[]>
+//     (@osaas/client-core lib/core.d.ts:65, lib/core.js:160-171)
+//     Returns the raw JSON array from the OSC instances endpoint. Each element
+//     carries at minimum `name: string` and `url: string` (same fields read by
+//     instanceName()/instanceUrl() at spawnInstance time).
+//   - Instance naming: `scaler${workspaceId.replace(/[^a-z0-9]/gi,'').toLowerCase()}${Date.now().toString(36)}`
+//     (instance-pool.ts:88). The prefix `scaler{sanitisedWorkspaceId}` is the
+//     stable part; only instances with that prefix belong to this scaler/workspace.
+//   - updateInstance: writes to encore:pool:{workspaceId} hash (this file:68).
+//   - listInstances (Valkey): reads encore:pool:{workspaceId} hash (this file:52).
+export async function reconcilePoolFromOsc(
+  config: EncoreScalerConfig
+): Promise<number> {
+  const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+  let allOscInstances: OscInstance[];
+  try {
+    allOscInstances = (await oscListInstances(config.oscContext, ENCORE_SERVICE_ID, sat)) as OscInstance[];
+    if (!Array.isArray(allOscInstances)) return 0;
+  } catch {
+    // OSC unavailable — skip reconciliation; the pool stays as-is.
+    return 0;
+  }
+
+  // Instances spawned by this scaler for this workspace are named with this
+  // stable prefix. Using the same sanitisation as spawnInstance (line 88).
+  const prefix = `scaler${config.workspaceId.replace(/[^a-z0-9]/gi, '').toLowerCase()}`;
+  const ours = allOscInstances.filter(
+    (inst) => typeof inst.name === 'string' && inst.name.startsWith(prefix)
+  );
+  if (ours.length === 0) return 0;
+
+  // Read existing pool so we don't overwrite live records (e.g. activeJobs > 0).
+  const existing = await listInstances(config.redis, config.workspaceId);
+  const existingIds = new Set(existing.map((r) => r.instanceId));
+
+  const now = Date.now();
+  let added = 0;
+  for (const inst of ours) {
+    let id: string;
+    let url: string;
+    try {
+      id = instanceName(inst);
+      url = instanceUrl(inst);
+    } catch {
+      continue; // skip malformed OSC entries
+    }
+    if (existingIds.has(id)) continue; // already tracked
+    await updateInstance(config.redis, config.workspaceId, {
+      instanceId: id,
+      url,
+      // callbackListenerUrl: not stored on OSC — will be unknown until next
+      // spawnInstance. Dispatch still works: Encore posts to the callback
+      // listener directly using the URL it was configured with at creation time.
+      activeJobs: 0,
+      lastIdleAt: now
+    });
+    added += 1;
+  }
+  return added;
 }
 
 // Spawn a fresh Encore OSC instance and register it in the pool. The instance
