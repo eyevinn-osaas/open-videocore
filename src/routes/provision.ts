@@ -501,7 +501,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         await provision('eyevinn-encore-packager', {
           RedisUrl: redisUrl,
           RedisQueue: 'encore-packager:jobs',
-          OutputFolder: `s3://${PACKAGED_BUCKET}`,
+          OutputFolder: `s3://${PACKAGED_BUCKET.replace(/\/+$/, '')}/`,
           PersonalAccessToken: pat,
           AwsAccessKeyId: 'admin',
           AwsSecretAccessKey: packagerS3SecretRef,
