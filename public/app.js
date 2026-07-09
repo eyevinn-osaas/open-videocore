@@ -719,9 +719,11 @@ async function showAssetDetail(id, detailPanel) {
 //                   bitrateBps?, codec? }
 //   fileGroups[]: { id, type: 'hls-package'|'dash-package', name, manifestUrl,
 //                   segmentCount?, objectKeyPrefix }
-// Renders nothing (leaves `container` empty) when both lists are empty, so the
-// section stays hidden for assets that expose no files. All server-provided
-// text flows through escHtml before interpolation.
+// Renders a "Files" table (source + renditions + exports, each with a presigned
+// download link) and "File Groups" cards (one per HLS/DASH package, with the
+// manifest URL, a copy-to-clipboard button, and the segment count). Each section
+// shows a distinct empty state when its list is empty (issue #136). All
+// server-provided text flows through escHtml before interpolation.
 async function renderAssetFiles(assetId, container) {
   container.innerHTML = '';
 
@@ -740,9 +742,6 @@ async function renderAssetFiles(assetId, container) {
 
   var files = (data && data.files) || [];
   var fileGroups = (data && data.fileGroups) || [];
-  // Per issue #157: the section is only shown when there is at least one file or
-  // group. Nothing to render -> leave the container empty (hidden).
-  if (files.length === 0 && fileGroups.length === 0) return;
 
   // A compact "resolution/bitrate" summary for a rendition. Any of the optional
   // fields may be absent (e.g. audio-only rendition) — the row still renders
@@ -756,12 +755,16 @@ async function renderAssetFiles(assetId, container) {
     return parts.length ? parts.join(' · ') : '<span class="text-muted">—</span>';
   };
 
-  if (files.length > 0) {
-    var filesTitle = document.createElement('div');
-    filesTitle.className = 'section-title';
-    filesTitle.textContent = 'Files';
-    container.appendChild(filesTitle);
+  // ── Files table (source + renditions + exports) ──────────────────────────
+  // Always render the "Files" heading so a ready asset with no downloadable
+  // files still shows an explicit empty state (issue #136), rather than the
+  // section silently disappearing.
+  var filesTitle = document.createElement('div');
+  filesTitle.className = 'section-title';
+  filesTitle.textContent = 'Files';
+  container.appendChild(filesTitle);
 
+  if (files.length > 0) {
     var fwrap = document.createElement('div');
     fwrap.className = 'table-wrap';
     var frows = files.map(function(f) {
@@ -779,36 +782,45 @@ async function renderAssetFiles(assetId, container) {
       '<th>Type</th><th>Filename</th><th>Format</th><th>Details</th><th></th>' +
       '</tr></thead><tbody>' + frows + '</tbody></table>';
     container.appendChild(fwrap);
+  } else {
+    var filesEmpty = document.createElement('div');
+    filesEmpty.className = 'empty';
+    filesEmpty.setAttribute('data-empty', 'files');
+    filesEmpty.textContent = 'No files available for this asset yet.';
+    container.appendChild(filesEmpty);
   }
 
-  if (fileGroups.length > 0) {
-    var groupsTitle = document.createElement('div');
-    groupsTitle.className = 'section-title mt12';
-    groupsTitle.textContent = 'File Groups';
-    container.appendChild(groupsTitle);
+  // ── File-group cards (HLS / DASH streaming packages) ─────────────────────
+  var groupsTitle = document.createElement('div');
+  groupsTitle.className = 'section-title mt12';
+  groupsTitle.textContent = 'File Groups';
+  container.appendChild(groupsTitle);
 
-    var gwrap = document.createElement('div');
-    gwrap.className = 'table-wrap';
-    var grows = fileGroups.map(function(g, i) {
-      return '<tr>' +
-        '<td>' + renderBadge(g.type) + '</td>' +
-        '<td>' + escHtml(g.name) + '</td>' +
-        '<td class="cell-id" title="' + escHtml(g.manifestUrl) + '">' + escHtml(g.manifestUrl) + '</td>' +
-        '<td>' +
+  if (fileGroups.length > 0) {
+    var cards = document.createElement('div');
+    cards.className = 'file-group-cards';
+    var cardHtml = fileGroups.map(function(g, i) {
+      // segmentCount is optional in the contract (assetFileGroupSchema); show it
+      // only when the server actually populated it.
+      var segLine = (g.segmentCount != null)
+        ? '<div class="file-group-meta">' + escHtml(String(g.segmentCount)) + ' segment' + (g.segmentCount === 1 ? '' : 's') + '</div>'
+        : '<div class="file-group-meta text-muted">segment count unavailable</div>';
+      return '<div class="file-group-card">' +
+        '<div class="file-group-card-head">' + renderBadge(g.type) + '<span class="file-group-name">' + escHtml(g.name) + '</span></div>' +
+        '<div class="file-group-url cell-id" title="' + escHtml(g.manifestUrl) + '">' + escHtml(g.manifestUrl) + '</div>' +
+        segLine +
+        '<div class="file-group-actions">' +
           '<button type="button" class="btn-ghost file-group-copy" data-idx="' + i + '">Copy URL</button> ' +
           '<a class="btn-ghost" href="' + escHtml(g.manifestUrl) + '" target="_blank" rel="noopener">Open</a>' +
-        '</td>' +
-        '</tr>';
+        '</div>' +
+        '</div>';
     }).join('');
-    gwrap.innerHTML =
-      '<table><thead><tr>' +
-      '<th>Type</th><th>Name</th><th>Manifest URL</th><th></th>' +
-      '</tr></thead><tbody>' + grows + '</tbody></table>';
-    container.appendChild(gwrap);
+    cards.innerHTML = cardHtml;
+    container.appendChild(cards);
 
     // Copy-to-clipboard for each manifest URL. Bound via the untrusted URL held
     // in JS (not re-parsed from the DOM) and reported with transient feedback.
-    gwrap.querySelectorAll('.file-group-copy').forEach(function(btn) {
+    cards.querySelectorAll('.file-group-copy').forEach(function(btn) {
       btn.addEventListener('click', function() {
         var group = fileGroups[Number(btn.dataset.idx)];
         if (!group) return;
@@ -827,6 +839,12 @@ async function renderAssetFiles(assetId, container) {
         }
       });
     });
+  } else {
+    var groupsEmpty = document.createElement('div');
+    groupsEmpty.className = 'empty';
+    groupsEmpty.setAttribute('data-empty', 'file-groups');
+    groupsEmpty.textContent = 'No streaming packages (HLS/DASH) for this asset yet.';
+    container.appendChild(groupsEmpty);
   }
 }
 
@@ -2901,57 +2919,134 @@ var STEP_ICONS = {
   'extract-metadata': '🔬',
   'thumbnail': '🖼',
   'transcode': '🎞',
-  'package': '📦'
+  'package': '📦',
+  'subtitles': '💬',
+  'scene-detect': '🎬'
 };
 
-function renderPipelinesTab(container) {
+var EXEC_STATUS_CLASS = {
+  running: 'status-processing',
+  done: 'status-ready',
+  failed: 'status-failed'
+};
+
+var STEP_STATUS_CLASS = {
+  pending: 'step-pending',
+  running: 'step-running',
+  done: 'step-done',
+  failed: 'step-failed'
+};
+
+function renderStepChip(step) {
+  var icon = STEP_ICONS[step.name] || '⚙';
+  var label = icon + ' ' + step.name;
+  if (step.status === 'running' && step.progress != null) {
+    label += ' ' + step.progress + '%';
+  }
+  var cls = 'pipeline-exec-step ' + (STEP_STATUS_CLASS[step.status] || '');
+  if (step.status === 'failed' && step.error) {
+    return '<span class="' + cls + '" title="' + escHtml(step.error) + '">' + escHtml(label) + '</span>';
+  }
+  return '<span class="' + cls + '">' + escHtml(label) + '</span>';
+}
+
+function renderExecutionRow(exec) {
+  var row = document.createElement('div');
+  row.className = 'pipeline-exec-row';
+
+  var meta = document.createElement('div');
+  meta.className = 'pipeline-exec-meta';
+  var statusCls = EXEC_STATUS_CLASS[exec.status] || '';
+  var assetLabel = exec.assetName ? escHtml(exec.assetName) : escHtml(exec.assetId);
+  meta.innerHTML =
+    '<span class="pipeline-exec-name">' + escHtml(exec.pipelineName) + '</span>' +
+    '<span class="asset-link" data-id="' + escHtml(exec.assetId) + '">' + assetLabel + '</span>' +
+    '<span class="status-badge ' + statusCls + '">' + escHtml(exec.status) + '</span>' +
+    '<span class="pipeline-exec-time">' + escHtml(exec.createdAt.slice(0, 16).replace('T', ' ')) + '</span>';
+  row.appendChild(meta);
+
+  var steps = document.createElement('div');
+  steps.className = 'pipeline-exec-steps';
+  steps.innerHTML = exec.steps.map(function(s, i) {
+    return (i > 0 ? '<span class="pipeline-step-arrow">→</span>' : '') + renderStepChip(s);
+  }).join('');
+  row.appendChild(steps);
+
+  // Click on asset name navigates to asset detail.
+  meta.querySelector('.asset-link').addEventListener('click', function() {
+    switchTab('assets');
+    var detail = document.getElementById('asset-detail');
+    if (detail) showAssetDetail(exec.assetId, detail);
+  });
+
+  return row;
+}
+
+async function renderPipelinesTab(container) {
   var wrap = document.createElement('div');
   wrap.className = 'pipelines-wrap';
 
-  var header = document.createElement('div');
-  header.className = 'section-title mb12';
-  header.textContent = 'Available Pipelines';
-  wrap.appendChild(header);
-
-  var grid = document.createElement('div');
-  grid.className = 'pipelines-grid';
-
+  // ── Compact catalog strip ──
+  var catalogBar = document.createElement('div');
+  catalogBar.className = 'pipeline-catalog-bar';
   PIPELINE_CATALOG.forEach(function(pipeline) {
-    var card = document.createElement('div');
-    card.className = 'pipeline-card';
-
-    var cardHeader = document.createElement('div');
-    cardHeader.className = 'pipeline-card-header';
-    cardHeader.innerHTML = '<span class="pipeline-card-name">' + escHtml(pipeline.label) + '</span>' +
-      '<span class="pipeline-card-id text-mono">' + escHtml(pipeline.name) + '</span>';
-    card.appendChild(cardHeader);
-
-    var desc = document.createElement('p');
-    desc.className = 'pipeline-card-desc';
-    desc.textContent = pipeline.description;
-    card.appendChild(desc);
-
-    var steps = document.createElement('div');
-    steps.className = 'pipeline-steps';
-    pipeline.steps.forEach(function(step, i) {
-      if (i > 0) {
-        var arrow = document.createElement('span');
-        arrow.className = 'pipeline-step-arrow';
-        arrow.textContent = '→';
-        steps.appendChild(arrow);
-      }
-      var chip = document.createElement('span');
-      chip.className = 'pipeline-step-chip';
-      chip.textContent = (STEP_ICONS[step] || '') + ' ' + step;
-      steps.appendChild(chip);
-    });
-    card.appendChild(steps);
-
-    grid.appendChild(card);
+    var pill = document.createElement('span');
+    pill.className = 'pipeline-catalog-pill';
+    pill.title = pipeline.description + '\nSteps: ' + pipeline.steps.join(' → ');
+    pill.innerHTML =
+      '<span class="pipeline-catalog-pill-name">' + escHtml(pipeline.label) + '</span>' +
+      '<span class="pipeline-catalog-pill-id">' + escHtml(pipeline.name) + '</span>';
+    catalogBar.appendChild(pill);
   });
+  wrap.appendChild(catalogBar);
 
-  wrap.appendChild(grid);
+  // ── Executions ──
+  var execHeader = document.createElement('div');
+  execHeader.className = 'section-title mt16 mb12';
+  execHeader.textContent = 'Pipeline Executions';
+  wrap.appendChild(execHeader);
+
+  var execList = document.createElement('div');
+  execList.className = 'pipeline-exec-list';
+  execList.textContent = 'Loading…';
+  wrap.appendChild(execList);
+
   container.appendChild(wrap);
+
+  var pollTimer = null;
+
+  async function loadExecutions() {
+    try {
+      var data = await apiFetch('/pipelines?limit=50');
+      var items = (data && data.items) ? data.items : [];
+      execList.innerHTML = '';
+      if (items.length === 0) {
+        execList.textContent = 'No pipeline executions yet.';
+      } else {
+        items.forEach(function(exec) {
+          execList.appendChild(renderExecutionRow(exec));
+        });
+      }
+      // Poll while any execution is running.
+      var anyRunning = items.some(function(e) { return e.status === 'running'; });
+      if (anyRunning) {
+        pollTimer = setTimeout(loadExecutions, 5000);
+      }
+    } catch (e) {
+      execList.textContent = 'Failed to load executions.';
+    }
+  }
+
+  await loadExecutions();
+
+  // Stop polling when the tab is replaced.
+  var observer = new MutationObserver(function() {
+    if (!document.body.contains(wrap)) {
+      if (pollTimer) clearTimeout(pollTimer);
+      observer.disconnect();
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 // ─── TRANSCODERS TAB ───────────────────────────────────────────────────────────
@@ -3109,6 +3204,7 @@ TAB_RENDERERS['provision'] = renderProvisionTab;
 // shares the exact same renderer + helper logic (no duplication / divergence).
 export {
   renderAssetDetailBody,
+  renderAssetFiles,
   renderJobDetailBody,
   openDetailWindow,
   setActiveStack,

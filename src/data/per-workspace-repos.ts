@@ -43,6 +43,11 @@ import type {
   Profile
 } from './profile-repo.js';
 import type {
+  PipelineRepository,
+  PipelineExecution
+} from './pipeline-repo.js';
+import type { PipelineStepName } from '../pipeline/pipelines.js';
+import type {
   EncoreClient,
   EncoreSubmitInput,
   EncoreSubmitResult
@@ -60,6 +65,9 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   }
   async get(id: string): Promise<Asset | undefined> {
     return (await this.repo()).get(id);
+  }
+  async getBySlug(slug: string): Promise<Asset | undefined> {
+    return (await this.repo()).getBySlug(slug);
   }
   async list(opts?: ListOptions): Promise<ListResult> {
     return (await this.repo()).list(opts);
@@ -109,6 +117,45 @@ export class PerWorkspaceJobRepository implements JobRepository {
 // Encore transcode client that resolves the stack's Encore at call time. Throws
 // when the resolved stack has no Encore configured — the transcode route maps
 // the throw to 502.
+export class PerWorkspacePipelineRepository implements PipelineRepository {
+  constructor(private readonly resolver: WorkspaceStackResolver) {}
+  private async repo(): Promise<PipelineRepository> {
+    return (await this.resolver.resolve()).pipelines;
+  }
+  async create(input: {
+    assetId: string;
+    pipelineName: string;
+    steps: PipelineStepName[];
+  }): Promise<PipelineExecution> {
+    return (await this.repo()).create(input);
+  }
+  async get(id: string): Promise<PipelineExecution | undefined> {
+    return (await this.repo()).get(id);
+  }
+  async update(
+    id: string,
+    patch: Partial<Pick<PipelineExecution, 'status' | 'steps'>>
+  ): Promise<PipelineExecution | undefined> {
+    return (await this.repo()).update(id, patch);
+  }
+  async listByAsset(assetId: string): Promise<PipelineExecution[]> {
+    return (await this.repo()).listByAsset(assetId);
+  }
+  async listAll(opts?: {
+    status?: 'running' | 'done' | 'failed';
+    limit?: number;
+    offset?: number;
+  }): Promise<{ items: PipelineExecution[]; total: number }> {
+    return (await this.repo()).listAll(opts);
+  }
+  async findRunningByAssetAndStep(
+    assetId: string,
+    step: PipelineStepName
+  ): Promise<PipelineExecution | undefined> {
+    return (await this.repo()).findRunningByAssetAndStep(assetId, step);
+  }
+}
+
 export class PerWorkspaceEncoreClient implements EncoreClient {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   async submit(input: EncoreSubmitInput): Promise<EncoreSubmitResult> {
@@ -125,6 +172,13 @@ export class PerWorkspaceEncoreClient implements EncoreClient {
     const conns = await this.resolver.resolve();
     if (!conns.encore) return undefined;
     return conns.encore.getJobStatus(encoreJobId);
+  }
+  async cancel(encoreJobId: string): Promise<void> {
+    const conns = await this.resolver.resolve();
+    // No Encore configured: nothing to cancel — idempotent no-op, matching
+    // getJobStatus above.
+    if (!conns.encore) return;
+    return conns.encore.cancel(encoreJobId);
   }
 }
 

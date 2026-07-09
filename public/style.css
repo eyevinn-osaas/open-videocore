@@ -659,6 +659,49 @@ pre.code-block {
   word-break: break-all;
 }
 
+/* Asset detail — file-group (HLS/DASH package) cards */
+.file-group-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.file-group-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.file-group-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.file-group-name {
+  font-weight: 600;
+}
+
+/* Widen the manifest URL beyond the narrow table .cell-id cap so the card can
+   use its full width; still truncates with an ellipsis + title tooltip. */
+.file-group-url.cell-id {
+  max-width: 100%;
+}
+
+.file-group-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.file-group-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .breadcrumb {
   margin: 8px 0 12px;
   font-size: 13px;
@@ -987,62 +1030,39 @@ pre.code-block {
   margin: 0 auto;
 }
 
-.pipelines-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 16px;
-  margin-top: 12px;
-}
-
-.pipeline-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 18px;
+/* Compact pipeline catalog strip */
+.pipeline-catalog-bar {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.pipeline-card-header {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.pipeline-card-name {
-  font-weight: 600;
-  font-size: 15px;
-  color: var(--text);
-}
-
-.pipeline-card-id {
-  color: var(--text-muted);
-  font-size: 11px;
-}
-
-.pipeline-card-desc {
-  color: var(--text-muted);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.pipeline-steps {
-  display: flex;
-  align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   margin-top: 4px;
 }
 
-.pipeline-step-chip {
-  background: var(--bg);
+.pipeline-catalog-pill {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 3px 8px;
+  border-radius: 20px;
+  padding: 5px 12px;
+  cursor: default;
+}
+
+.pipeline-catalog-pill:hover {
+  border-color: var(--accent);
+}
+
+.pipeline-catalog-pill-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.pipeline-catalog-pill-id {
   font-size: 11px;
-  color: var(--accent);
-  white-space: nowrap;
+  color: var(--text-muted);
+  font-family: monospace;
 }
 
 .pipeline-step-arrow {
@@ -1051,3 +1071,130 @@ pre.code-block {
 }
 
 .mb12 { margin-bottom: 12px; }
+.mt16 { margin-top: 16px; }
+.mt24 { margin-top: 24px; }
+
+/* Pipeline execution list */
+.pipeline-exec-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.pipeline-exec-row {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pipeline-exec-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.pipeline-exec-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.pipeline-exec-time {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-left: auto;
+}
+
+.asset-link {
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.asset-link:hover {
+  opacity: 0.8;
+}
+
+.pipeline-exec-steps {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Per-step status chips */
+.pipeline-exec-step {
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.step-pending {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.step-running {
+  background: rgba(245, 158, 11, 0.15);
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.step-done {
+  background: rgba(34, 197, 94, 0.15);
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.step-failed {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: var(--danger);
+  color: var(--danger);
+  cursor: help;
+}
+
+/* ── Detached (standalone) detail window — issue #128 ─────────────────────────
+   Minimal chrome: no global header / tab bar / nav. The pane fills the window
+   and a thin context strip shows which stack the detached view is targeting. */
+body.detail-standalone {
+  min-height: 100vh;
+}
+
+body.detail-standalone main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.detail-standalone-context {
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+/* Collapse the strip entirely when there is no stack context to show, so a
+   detached window truly has no chrome above the pane. */
+.detail-standalone-context:empty {
+  display: none;
+}
+
+body.detail-standalone .assets-side {
+  flex: 1;
+  max-width: none;
+  min-height: 0;
+}

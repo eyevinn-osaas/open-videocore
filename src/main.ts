@@ -18,6 +18,7 @@ import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
+import { pipelinesRouter } from './routes/pipelines.js';
 import { searchRouter } from './routes/search.js';
 import { WebhookDispatcher } from './services/webhook-dispatcher.js';
 import { webhooksRouter } from './routes/webhooks.js';
@@ -51,7 +52,8 @@ import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
-import { InMemoryPipelineRepository } from './data/pipeline-repo.js';
+import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
+import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
@@ -216,6 +218,7 @@ await app.register(provisionRouter, {
   osc: oscContext,
   paramStore,
   operationStore,
+  publicBaseUrl: process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, ''),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly
@@ -458,7 +461,12 @@ const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : und
 // between the assets router (creates executions) and the internal router
 // (advances them from transcode/package callbacks). Declared up front so the
 // callback poller (started on scaler activation) can advance executions.
-const pipelineRepository = new InMemoryPipelineRepository();
+const pipelineRepository = new PerWorkspacePipelineRepository(stackResolver);
+
+// Asset comments (issue #135). In-memory: comments are a simple free-text
+// sub-resource for this iteration (mirrors the ephemeral pipeline repo above).
+// Shared with the assets router, which owns POST/GET /:id/comments.
+const commentRepository = new InMemoryCommentRepository();
 
 // Read the first provisioned stack's Valkey URL from the parameter store, or
 // undefined when no stack is provisioned yet. Self-discovered: there is no
@@ -588,6 +596,7 @@ function activateScaler(redisUrl: string): void {
   assetRouterOptions.packagingRedis = redis;
   jobsRouterOptions.redis = redis;
   encoreCompatRouterOptions.encore = encore;
+  pipelinesRouterOptions.encoreClient = encore;
   internalRouterOptions.packaging = packaging;
   internalRouterOptions.redis = redis;
   scalerRouterOptions.redis = redis;
@@ -612,6 +621,15 @@ async function deactivateScaler(): Promise<void> {
   stopEncoreCallbackPoller?.();
   stopEncoreCallbackPoller = undefined;
 
+  // Destroy all pooled OSC Encore instances before stopping loops.
+  // Without this, instances accumulate across restarts because the Valkey pool
+  // can be cleared (Valkey restart, new deployment) while OSC instances keep
+  // running — the next server startup finds an empty pool and spawns fresh ones.
+  if (scalerRegistry) {
+    await scalerRegistry
+      .teardownAll((msg, err) => app.log.warn({ err }, msg))
+      .catch((err) => app.log.warn({ err }, 'encore-scaler: teardownAll failed'));
+  }
   scalerRegistry?.stopAll();
   scalerRegistry = undefined;
 
@@ -625,6 +643,7 @@ async function deactivateScaler(): Promise<void> {
   assetRouterOptions.packagingRedis = undefined;
   jobsRouterOptions.redis = undefined;
   encoreCompatRouterOptions.encore = undefined;
+  pipelinesRouterOptions.encoreClient = undefined;
   internalRouterOptions.packaging = undefined;
   internalRouterOptions.redis = undefined;
   scalerRouterOptions.redis = undefined;
@@ -707,7 +726,8 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   sceneDetector,
   packaging,
   packagingRedis: sharedRedis,
-  pipelineRepository
+  pipelineRepository,
+  commentRepository
 };
 await app.register(assetsRouter, assetRouterOptions);
 
@@ -717,6 +737,16 @@ const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } =
   redis: sharedRedis
 };
 await app.register(jobsRouter, jobsRouterOptions);
+
+// Cross-asset pipeline execution visibility (issue #161).
+const pipelinesRouterOptions: Parameters<typeof pipelinesRouter>[1] & { prefix: string } = {
+  prefix: '/api/v1/pipelines',
+  pipelineRepository,
+  jobRepository,
+  assetRepository,
+  encoreClient: encore
+};
+await app.register(pipelinesRouter, pipelinesRouterOptions);
 
 // Encore-compatible transcode submission (migration surface). Lets integrators
 // who POST directly to an Encore OSC instance repoint at this API with only a

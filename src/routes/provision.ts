@@ -114,6 +114,11 @@ type ProvisionRouterOptions = {
   // DELETE /:name return 202 immediately with an operationId; the caller polls
   // GET /operations/:id for completion.
   operationStore: OperationStore;
+  // Public base URL (e.g. https://api.example.com) used to build callback URLs
+  // for OSC services. Optional: when omitted, callback URLs are left unset and
+  // services that need them (eyevinn-encore-packager) fall back to their
+  // defaults or operate without callbacks.
+  publicBaseUrl?: string;
 };
 
 // Async operation view returned by GET /operations and GET /operations/:id.
@@ -210,7 +215,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   opts
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { osc, paramStore, onStackChange, getScalerRegistry, operationStore: ops } =
+  const { osc, paramStore, onStackChange, getScalerRegistry, operationStore: ops, publicBaseUrl } =
     opts;
 
   // Operator-supplied credentials (ADR-002). Read once at registration time so
@@ -474,9 +479,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // it empty) would default to 'packaging-queue', which risks consuming jobs
         // intended for other packager instances sharing the same Valkey (#93).
         //
-        // CallbackUrl is left unset for now — the packager create-schema field name
-        // could not be verified from the OSC catalog at the time of writing; wire it
-        // once confirmed (see docs/osc-feedback/incoming-94-packager-queue-callback-config.md).
         currentService = 'eyevinn-encore-packager';
         const pat = osc.getPersonalAccessToken();
         if (!pat) {
@@ -489,6 +491,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           ROOTPASSWORD,
           minioRootPassword
         );
+        // CallbackUrl: the packager POSTs to {CallbackUrl}/packagerCallback/success
+        // and .../failure. The internal route is mounted at /api/v1/internal
+        // (internal.ts), so the base is publicBaseUrl/api/v1/internal.
+        // Omitted when PUBLIC_BASE_URL is unset (local dev without a tunnel).
+        const packagerCallbackUrl = publicBaseUrl
+          ? `${publicBaseUrl}/api/v1/internal`
+          : undefined;
         await provision('eyevinn-encore-packager', {
           RedisUrl: redisUrl,
           RedisQueue: 'encore-packager:jobs',
@@ -496,7 +505,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           PersonalAccessToken: pat,
           AwsAccessKeyId: 'admin',
           AwsSecretAccessKey: packagerS3SecretRef,
-          S3EndpointUrl: minioEndpoint
+          S3EndpointUrl: minioEndpoint,
+          ...(packagerCallbackUrl ? { CallbackUrl: packagerCallbackUrl } : {})
         });
         // The packager is a background queue-consumer — it does not expose a
         // synchronous health endpoint. waitForInstanceReady is skipped; the

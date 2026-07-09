@@ -15,7 +15,7 @@ import type { EncoreClient, EncoreSubmitInput, EncoreSubmitResult } from '../pip
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { EncoreScalerLoop } from './scaler-loop.js';
 import { makeScalingEncoreClient } from './index.js';
-import { destroyInstance, listInstances } from './instance-pool.js';
+import { destroyInstance, listInstances, reconcilePoolFromOsc } from './instance-pool.js';
 import { keys } from './types.js';
 import type { EncoreScalerConfig } from './types.js';
 
@@ -92,6 +92,14 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     return (await this.getOrCreate(decoded.workspaceId)).getJobStatus(encoreJobId);
   }
 
+  async cancel(encoreJobId: string): Promise<void> {
+    const decoded = decodeEncoreJobId(encoreJobId);
+    // Unknown workspace: nothing to cancel — treat as an idempotent no-op,
+    // mirroring getJobStatus above.
+    if (!decoded) return;
+    return (await this.getOrCreate(decoded.workspaceId)).cancel(encoreJobId);
+  }
+
   setMaxInstances(max: number): void {
     this.config.maxInstances = max;
     for (const { loop } of this.loops.values()) {
@@ -106,16 +114,59 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     }
   }
 
-  // Scan Redis for workspaceIds that have an existing pool and start their loops
-  // immediately. This repairs stale activeJobs counts left by a previous server
-  // run without waiting for the first job submission to trigger getOrCreate.
+  // Scan Redis for workspaceIds that have an existing pool OR a pending queue
+  // and start their loops immediately. Pool keys cover the normal restart case
+  // (instances already spawned). Queue keys cover the case where a job was
+  // submitted but no instance was ever spawned yet.
+  //
+  // When a queue key exists but no pool key (or pool is empty), the pool may
+  // have been lost due to an unclean shutdown or Valkey restart while OSC
+  // instances kept running. In that case, reconcilePoolFromOsc() re-discovers
+  // those instances from OSC and re-populates the pool so the loop can dispatch
+  // to them instead of spawning fresh duplicates.
   async resumeExistingWorkspaces(): Promise<void> {
-    const poolPattern = 'encore:pool:*';
-    const existingKeys = await this.config.redis.keys(poolPattern);
-    for (const key of existingKeys) {
-      // key = "encore:pool:{workspaceId}"
-      const workspaceId = key.slice('encore:pool:'.length);
-      if (workspaceId) await this.getOrCreate(workspaceId);
+    const [poolKeys, queueKeys] = await Promise.all([
+      this.config.redis.keys('encore:pool:*'),
+      this.config.redis.keys('encore:queue:*')
+    ]);
+    const workspaceIdsWithPool = new Set<string>();
+    const workspaceIds = new Set<string>();
+    for (const key of poolKeys) {
+      const id = key.slice('encore:pool:'.length);
+      if (id) { workspaceIds.add(id); workspaceIdsWithPool.add(id); }
+    }
+    for (const key of queueKeys) {
+      const id = key.slice('encore:queue:'.length);
+      if (id) workspaceIds.add(id);
+    }
+
+    for (const workspaceId of workspaceIds) {
+      // Reconcile from OSC when the pool is absent or empty — this re-discovers
+      // any instances that survived a Valkey wipe or unclean shutdown so the
+      // loop can dispatch to them rather than spawning duplicates.
+      if (!workspaceIdsWithPool.has(workspaceId)) {
+        let s3Config = this.config.s3Config;
+        if (this.config.resolveS3Config) {
+          s3Config = (await this.config.resolveS3Config(workspaceId)) ?? s3Config;
+        }
+        const scalerConfig = {
+          workspaceId,
+          maxInstances: this.config.maxInstances,
+          minInstances: this.config.minInstances,
+          idleTimeoutMs: this.config.idleTimeoutMs,
+          oscContext: this.config.oscContext,
+          redis: this.config.redis,
+          redisUrl: this.config.redisUrl,
+          getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
+          s3Config,
+          profilesUrl: this.config.profilesUrl,
+          onDispatched: this.config.onDispatched
+        };
+        await reconcilePoolFromOsc(scalerConfig).catch(() => {
+          // OSC unavailable at startup — skip; the loop will spawn fresh instances.
+        });
+      }
+      await this.getOrCreate(workspaceId);
     }
   }
 
@@ -179,6 +230,23 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     for (const inst of instances) {
       await destroyInstance(inst.instanceId, scalerConfig);
     }
+  }
+
+  // Destroy OSC instances for every active workspace, then stop all loops.
+  // Called on graceful shutdown so leaked instances don't accumulate across
+  // server restarts. If a workspace teardown fails it is logged and skipped
+  // so one bad workspace never blocks the others from being cleaned up.
+  async teardownAll(log?: (msg: string, err?: unknown) => void): Promise<void> {
+    const workspaceIds = [...this.loops.keys()];
+    for (const workspaceId of workspaceIds) {
+      try {
+        await this.teardown(workspaceId);
+      } catch (err) {
+        log?.(`encore-scaler: teardownAll failed for workspace ${workspaceId}`, err);
+      }
+    }
+    // stopAll() as a safety net for any loop not already stopped by teardown().
+    this.stopAll();
   }
 
   stopAll(): void {

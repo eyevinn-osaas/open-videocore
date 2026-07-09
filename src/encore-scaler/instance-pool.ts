@@ -16,6 +16,7 @@
 import type { Redis } from 'ioredis';
 import {
   createInstance,
+  listInstances as oscListInstances,
   removeInstance,
   waitForInstanceReady
 } from '@osaas/client-core';
@@ -74,6 +75,74 @@ export async function updateInstance(
   await redis.hset(keys.pool(workspaceId), record.instanceId, JSON.stringify(record));
 }
 
+// Reconcile the Valkey pool for workspaceId against the actual OSC instance
+// list. Intended for startup after a Valkey wipe or unclean shutdown: discovers
+// any scaler-owned Encore instances that are still running on OSC but absent
+// from the pool hash, and re-adds them so the loop can dispatch jobs to them
+// instead of spawning duplicates.
+//
+// Contracts verified (CLAUDE.md rule 7):
+//   - oscListInstances(context, serviceId, token): Promise<any[]>
+//     (@osaas/client-core lib/core.d.ts:65, lib/core.js:160-171)
+//     Returns the raw JSON array from the OSC instances endpoint. Each element
+//     carries at minimum `name: string` and `url: string` (same fields read by
+//     instanceName()/instanceUrl() at spawnInstance time).
+//   - Instance naming: `scaler${workspaceId.replace(/[^a-z0-9]/gi,'').toLowerCase()}${Date.now().toString(36)}`
+//     (instance-pool.ts:88). The prefix `scaler{sanitisedWorkspaceId}` is the
+//     stable part; only instances with that prefix belong to this scaler/workspace.
+//   - updateInstance: writes to encore:pool:{workspaceId} hash (this file:68).
+//   - listInstances (Valkey): reads encore:pool:{workspaceId} hash (this file:52).
+export async function reconcilePoolFromOsc(
+  config: EncoreScalerConfig
+): Promise<number> {
+  const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+  let allOscInstances: OscInstance[];
+  try {
+    allOscInstances = (await oscListInstances(config.oscContext, ENCORE_SERVICE_ID, sat)) as OscInstance[];
+    if (!Array.isArray(allOscInstances)) return 0;
+  } catch {
+    // OSC unavailable — skip reconciliation; the pool stays as-is.
+    return 0;
+  }
+
+  // Instances spawned by this scaler for this workspace are named with this
+  // stable prefix. Using the same sanitisation as spawnInstance (line 88).
+  const prefix = `scaler${config.workspaceId.replace(/[^a-z0-9]/gi, '').toLowerCase()}`;
+  const ours = allOscInstances.filter(
+    (inst) => typeof inst.name === 'string' && inst.name.startsWith(prefix)
+  );
+  if (ours.length === 0) return 0;
+
+  // Read existing pool so we don't overwrite live records (e.g. activeJobs > 0).
+  const existing = await listInstances(config.redis, config.workspaceId);
+  const existingIds = new Set(existing.map((r) => r.instanceId));
+
+  const now = Date.now();
+  let added = 0;
+  for (const inst of ours) {
+    let id: string;
+    let url: string;
+    try {
+      id = instanceName(inst);
+      url = instanceUrl(inst);
+    } catch {
+      continue; // skip malformed OSC entries
+    }
+    if (existingIds.has(id)) continue; // already tracked
+    await updateInstance(config.redis, config.workspaceId, {
+      instanceId: id,
+      url,
+      // callbackListenerUrl: not stored on OSC — will be unknown until next
+      // spawnInstance. Dispatch still works: Encore posts to the callback
+      // listener directly using the URL it was configured with at creation time.
+      activeJobs: 0,
+      lastIdleAt: now
+    });
+    added += 1;
+  }
+  return added;
+}
+
 // Spawn a fresh Encore OSC instance and register it in the pool. The instance
 // name is unique per spawn so concurrent scale-ups never collide.
 // Retries up to 3 times on transient 5xx OSC infrastructure errors (e.g.
@@ -115,7 +184,10 @@ export async function spawnInstance(
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
       // Only retry on transient 5xx / network errors, not on 4xx (bad request).
-      const isTransient = msg.includes('500') || msg.includes('502') || msg.includes('503') || msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
+      const isTransient =
+        msg.includes('500') || msg.includes('502') || msg.includes('503') ||
+        msg.includes('ORCHESTRATOR_UNAVAILABLE') || msg.includes('ORCHESTRATOR_AUTH_TRANSIENT') ||
+        msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
       if (!isTransient || attempt === maxAttempts) throw err;
       // Exponential back-off: 5s, 10s.
       await new Promise((r) => setTimeout(r, attempt * 5_000));
@@ -127,43 +199,80 @@ export async function spawnInstance(
   await waitForInstanceReady(ENCORE_SERVICE_ID, instanceId, config.oscContext);
   const encoreUrl = instanceUrl(instance);
 
-  // Pair this Encore instance with a dedicated callback listener (same name)
-  // configured with this exact Encore URL, so completion callbacks are routed
-  // to the scaler-managed instance rather than a static one. RedisQueue is set
-  // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
-  // eyevinn-encore-packager consumes, so an external packager can't win the
-  // BZPOPMIN race against our poller and swallow our completion messages
-  // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
-  // src/pipeline/encore-callback-poller.ts.
-  const callbackSat = await config.oscContext.getServiceAccessToken(
-    ENCORE_CALLBACK_LISTENER_SERVICE_ID
-  );
-  const callback = (await createInstance(
-    config.oscContext,
-    ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-    callbackSat,
-    {
-      name: instanceId,
-      RedisUrl: config.redisUrl,
-      EncoreUrl: encoreUrl.replace(/\/+$/, ''),
-      RedisQueue: 'ovc:transcode-done'
+  // Everything after this point runs with the Encore instance already live on
+  // OSC. If any step fails (callback listener creation, waitForInstanceReady,
+  // or pool write) we must destroy the Encore instance before re-throwing so
+  // it doesn't become an untracked orphan that causes the next tick to spawn
+  // a duplicate.
+  try {
+    // Pair this Encore instance with a dedicated callback listener (same name)
+    // configured with this exact Encore URL, so completion callbacks are routed
+    // to the scaler-managed instance rather than a static one. RedisQueue is set
+    // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
+    // eyevinn-encore-packager consumes, so an external packager can't win the
+    // BZPOPMIN race against our poller and swallow our completion messages
+    // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
+    // src/pipeline/encore-callback-poller.ts.
+    const callbackSat = await config.oscContext.getServiceAccessToken(
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID
+    );
+    // Retry callback listener creation with the same transient-error logic as
+    // the Encore instance above. The OSC ingress webhook sometimes returns
+    // ORCHESTRATOR_UNAVAILABLE under load; a short back-off is enough.
+    let callback: OscInstance | undefined;
+    let lastCallbackErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        callback = (await createInstance(
+          config.oscContext,
+          ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+          callbackSat,
+          {
+            name: instanceId,
+            RedisUrl: config.redisUrl,
+            EncoreUrl: encoreUrl.replace(/\/+$/, ''),
+            RedisQueue: 'ovc:transcode-done'
+          }
+        )) as OscInstance;
+        break;
+      } catch (err) {
+        lastCallbackErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient =
+          msg.includes('500') || msg.includes('502') || msg.includes('503') ||
+          msg.includes('ORCHESTRATOR_UNAVAILABLE') || msg.includes('ORCHESTRATOR_AUTH_TRANSIENT') ||
+          msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
+        if (!isTransient || attempt === maxAttempts) throw err;
+        await new Promise((r) => setTimeout(r, attempt * 5_000));
+      }
     }
-  )) as OscInstance;
-  await waitForInstanceReady(
-    ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-    instanceId,
-    config.oscContext
-  );
+    if (!callback) throw lastCallbackErr;
+    await waitForInstanceReady(
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+      instanceId,
+      config.oscContext
+    );
 
-  const record: EncoreInstanceRecord = {
-    instanceId,
-    url: encoreUrl,
-    callbackListenerUrl: instanceUrl(callback),
-    activeJobs: 0,
-    lastIdleAt: Date.now()
-  };
-  await updateInstance(config.redis, config.workspaceId, record);
-  return record;
+    const record: EncoreInstanceRecord = {
+      instanceId,
+      url: encoreUrl,
+      callbackListenerUrl: instanceUrl(callback),
+      activeJobs: 0,
+      lastIdleAt: Date.now()
+    };
+    await updateInstance(config.redis, config.workspaceId, record);
+    return record;
+  } catch (err) {
+    // Clean up the already-created Encore instance so it doesn't become an
+    // untracked orphan. Best-effort: swallow cleanup errors so the original
+    // error is what propagates to the caller.
+    try {
+      await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
+    } catch {
+      // Ignore — we're already in an error path.
+    }
+    throw err;
+  }
 }
 
 // Tear down an Encore OSC instance and drop it from the pool hash. Idempotent:
@@ -175,24 +284,32 @@ export async function destroyInstance(
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
   try {
     await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
-    // Best-effort teardown of the paired callback listener (same name). It may
-    // already be gone, so any error is swallowed.
-    try {
-      const callbackSat = await config.oscContext.getServiceAccessToken(
-        ENCORE_CALLBACK_LISTENER_SERVICE_ID
-      );
-      await removeInstance(
-        config.oscContext,
-        ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-        instanceId,
-        callbackSat
-      );
-    } catch {
-      // Listener already removed or unreachable — nothing to do.
-    }
-  } finally {
-    // Always drop the pool record so a stuck instance cannot pin the pool at
-    // maxInstances forever, even if the OSC removeInstance call errored.
-    await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+  } catch (err) {
+    // 404 = instance already gone on OSC — treat as success so the pool record
+    // is still cleaned up below. Any other error means the instance may still
+    // be running: keep the pool record so the next tick retries rather than
+    // spawning a replacement for something that's still alive.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes('404') && !msg.includes('not found')) throw err;
   }
+  // Best-effort teardown of the paired callback listener (same name). It may
+  // already be gone, so any error is swallowed.
+  try {
+    const callbackSat = await config.oscContext.getServiceAccessToken(
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID
+    );
+    await removeInstance(
+      config.oscContext,
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+      instanceId,
+      callbackSat
+    );
+  } catch {
+    // Listener already removed or unreachable — nothing to do.
+  }
+  // Only drop the pool record after OSC removal succeeds (or confirmed gone).
+  // Dropping it on a transient failure would cause the pool to lose track of a
+  // still-running instance, making the next tick spawn a replacement — which is
+  // exactly the runaway-spawning bug this fixes.
+  await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
 }
