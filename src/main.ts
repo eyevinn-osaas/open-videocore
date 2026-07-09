@@ -619,6 +619,15 @@ async function deactivateScaler(): Promise<void> {
   stopEncoreCallbackPoller?.();
   stopEncoreCallbackPoller = undefined;
 
+  // Destroy all pooled OSC Encore instances before stopping loops.
+  // Without this, instances accumulate across restarts because the Valkey pool
+  // can be cleared (Valkey restart, new deployment) while OSC instances keep
+  // running — the next server startup finds an empty pool and spawns fresh ones.
+  if (scalerRegistry) {
+    await scalerRegistry
+      .teardownAll((msg, err) => app.log.warn({ err }, msg))
+      .catch((err) => app.log.warn({ err }, 'encore-scaler: teardownAll failed'));
+  }
   scalerRegistry?.stopAll();
   scalerRegistry = undefined;
 

@@ -114,16 +114,28 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     }
   }
 
-  // Scan Redis for workspaceIds that have an existing pool and start their loops
-  // immediately. This repairs stale activeJobs counts left by a previous server
-  // run without waiting for the first job submission to trigger getOrCreate.
+  // Scan Redis for workspaceIds that have an existing pool OR a pending queue
+  // and start their loops immediately. Pool keys cover the normal restart case
+  // (instances already spawned). Queue keys cover the case where a job was
+  // submitted but no instance was ever spawned yet — without this, a server
+  // restart would leave the queue orphaned forever (the loop is created lazily
+  // on submit, so without a new submit nobody creates it after restart).
   async resumeExistingWorkspaces(): Promise<void> {
-    const poolPattern = 'encore:pool:*';
-    const existingKeys = await this.config.redis.keys(poolPattern);
-    for (const key of existingKeys) {
-      // key = "encore:pool:{workspaceId}"
-      const workspaceId = key.slice('encore:pool:'.length);
-      if (workspaceId) await this.getOrCreate(workspaceId);
+    const [poolKeys, queueKeys] = await Promise.all([
+      this.config.redis.keys('encore:pool:*'),
+      this.config.redis.keys('encore:queue:*')
+    ]);
+    const workspaceIds = new Set<string>();
+    for (const key of poolKeys) {
+      const id = key.slice('encore:pool:'.length);
+      if (id) workspaceIds.add(id);
+    }
+    for (const key of queueKeys) {
+      const id = key.slice('encore:queue:'.length);
+      if (id) workspaceIds.add(id);
+    }
+    for (const workspaceId of workspaceIds) {
+      await this.getOrCreate(workspaceId);
     }
   }
 
@@ -187,6 +199,23 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     for (const inst of instances) {
       await destroyInstance(inst.instanceId, scalerConfig);
     }
+  }
+
+  // Destroy OSC instances for every active workspace, then stop all loops.
+  // Called on graceful shutdown so leaked instances don't accumulate across
+  // server restarts. If a workspace teardown fails it is logged and skipped
+  // so one bad workspace never blocks the others from being cleaned up.
+  async teardownAll(log?: (msg: string, err?: unknown) => void): Promise<void> {
+    const workspaceIds = [...this.loops.keys()];
+    for (const workspaceId of workspaceIds) {
+      try {
+        await this.teardown(workspaceId);
+      } catch (err) {
+        log?.(`encore-scaler: teardownAll failed for workspace ${workspaceId}`, err);
+      }
+    }
+    // stopAll() as a safety net for any loop not already stopped by teardown().
+    this.stopAll();
   }
 
   stopAll(): void {
