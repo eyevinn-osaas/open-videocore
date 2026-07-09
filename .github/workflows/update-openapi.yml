@@ -27,6 +27,8 @@ jobs:
 
       - name: Generate openapi.json
         run: pnpm generate:openapi
+        env:
+          OSC_ACCESS_TOKEN: ci-placeholder
 
       - name: Commit if changed
         run: |
