@@ -22,6 +22,7 @@
 import { ulid } from 'ulid';
 import {
   type Asset,
+  type AssetReadState,
   type AssetRepository,
   type AssetReviewState,
   type AssetStatus,
@@ -30,6 +31,7 @@ import {
   type ListResult,
   type UpdateAssetInput,
   applyMetadata,
+  applyRestore,
   applyReviewState,
   applyStatus,
   clampLimit,
@@ -47,6 +49,12 @@ import {
   toAssetDocument,
   type AssetDocument
 } from './asset-document.js';
+import {
+  ASSET_TOMBSTONE_TYPE,
+  AssetTombstoneSchema,
+  isTombstoneDoc,
+  toTombstoneDocument
+} from './asset-tombstone.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'asset';
@@ -104,9 +112,30 @@ export class CouchAssetRepository implements AssetRepository {
     const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      // A tombstone (resourceType === ASSET_TOMBSTONE_TYPE) is NOT an asset, so
+      // it reads as `undefined` here — every non-410 caller (delivery, files,
+      // pipeline) sees a purged asset as not-found, which is the safe default.
+      // The 410-aware read path uses getState() below instead.
       return undefined;
     }
     return fromDoc(doc);
+  }
+
+  async getState(id: string): Promise<AssetReadState> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc) {
+      return { kind: 'not-found' };
+    }
+    if (isTombstoneDoc(doc)) {
+      return { kind: 'tombstone' };
+    }
+    if (doc.resourceType !== RESOURCE_TYPE) {
+      // Some other resource sharing the id space (should not happen for asset
+      // ids) — treat as not-found rather than leaking a foreign document.
+      return { kind: 'not-found' };
+    }
+    return { kind: 'asset', asset: fromDoc(doc) };
   }
 
   // Resolve by slug (issue #132). Queries the top-level `slug` mirror emitted by
@@ -168,82 +197,18 @@ export class CouchAssetRepository implements AssetRepository {
     if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
       return undefined;
     }
-    // Concurrent-write safety (issue #279): route the read-modify-write through
-    // the shared conflict-retry wrapper (updateWithRetry, src/data/couchdb.ts).
+    // Concurrent-write safety (issues #278/#279/#281): route the read-modify-write
+    // through the shared conflict-retry wrapper (updateWithRetry, src/data/couchdb.ts).
     // A `Document update conflict.` (HTTP 409) from a concurrent writer racing on
     // the same _rev — e.g. a thumbnail write landing between this method's read
-    // and put — is refetched and re-applied rather than surfacing as a terminal
-    // failure. The applied field-merge below is pure (no writes) so it is safe to
-    // re-run per attempt, exactly as updateWithRetry requires.
+    // and put, or the re-drive path of issue #281 racing an in-flight
+    // extraction — is refetched and re-applied rather than surfacing as a
+    // terminal failure. Patch application is extracted into `applyPatch` (issue
+    // #278), which is pure (no writes) so it is safe to re-run per attempt,
+    // exactly as updateWithRetry requires.
     let updated: Asset | undefined;
     const written = await updateWithRetry(couch, id, (current) => {
-      const existing = fromDoc(current);
-      const now = new Date().toISOString();
-      const next: Asset = { ...existing, updatedAt: now };
-      if (patch.name !== undefined) next.name = patch.name;
-      if (patch.description !== undefined) next.description = patch.description;
-      if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
-      if (patch.technicalMetadata !== undefined) {
-        next.technicalMetadata = patch.technicalMetadata;
-        if (patch.technicalMetadata !== null) {
-          next.technicalMetadataError = undefined;
-        }
-      }
-      if (patch.technicalMetadataError !== undefined) {
-        next.technicalMetadataError = patch.technicalMetadataError;
-      }
-      if (patch.manifestUrls !== undefined) {
-        next.manifestUrls = patch.manifestUrls;
-        next.packagingError = undefined;
-      }
-      if (patch.packagingError !== undefined) {
-        next.packagingError = patch.packagingError;
-      }
-      if (patch.renditions !== undefined) {
-        next.renditions = patch.renditions;
-      }
-      if (patch.thumbnails !== undefined) {
-        next.thumbnails = patch.thumbnails;
-      }
-      if (patch.metadata !== undefined) {
-        next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
-      }
-      if (patch.tags !== undefined) {
-        next.tags = normalizeTags(patch.tags);
-      }
-      if (patch.audioTracks !== undefined) {
-        next.audioTracks = patch.audioTracks;
-      }
-      if (patch.subtitleTracks !== undefined) {
-        next.subtitleTracks = patch.subtitleTracks;
-      }
-      if (patch.subtitlesError !== undefined) {
-        // `null` clears the error (successful attach); a string records a failure.
-        next.subtitlesError = patch.subtitlesError ?? undefined;
-      }
-      if (patch.sceneMetadata !== undefined) {
-        next.sceneMetadata = patch.sceneMetadata;
-        // A successful detection clears any stale error.
-        if (patch.sceneMetadata !== null) {
-          next.sceneDetectionError = undefined;
-        }
-      }
-      if (patch.sceneDetectionError !== undefined) {
-        next.sceneDetectionError = patch.sceneDetectionError;
-      }
-      if (patch.versionGroupId !== undefined) {
-        next.versionGroupId = patch.versionGroupId;
-      }
-      if (patch.status !== undefined) {
-        const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
-        next.status = applied.status;
-        next.statusHistory = applied.statusHistory;
-      }
-      // Append provenance for whichever namespaces this patch touched (issue #53).
-      const entries = provenanceForPatch(patch, now);
-      if (entries.length > 0) {
-        next.provenance = [...(existing.provenance ?? []), ...entries];
-      }
+      const next = this.applyPatch(fromDoc(current), patch);
       // Capture the in-memory result to return; updateWithRetry carries _rev and
       // performs the put (put() forces the partition).
       updated = next;
@@ -253,6 +218,79 @@ export class CouchAssetRepository implements AssetRepository {
     // the preflight read and the loop (a concurrent delete); patchFn never ran,
     // so `updated` is still undefined too. Preserve the not-found contract.
     return written ? updated : undefined;
+  }
+
+  // Pure patch application (issue #278/#281): given the current asset and a
+  // patch, compute the next asset. NO writes and NO side effects, so it is safe
+  // to run more than once inside updateWithRetry's retry loop.
+  private applyPatch(existing: Asset, patch: UpdateAssetInput): Asset {
+    const now = new Date().toISOString();
+    const next: Asset = { ...existing, updatedAt: now };
+    if (patch.name !== undefined) next.name = patch.name;
+    if (patch.description !== undefined) next.description = patch.description;
+    if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    if (patch.technicalMetadata !== undefined) {
+      next.technicalMetadata = patch.technicalMetadata;
+      if (patch.technicalMetadata !== null) {
+        next.technicalMetadataError = undefined;
+      }
+    }
+    if (patch.technicalMetadataError !== undefined) {
+      next.technicalMetadataError = patch.technicalMetadataError;
+    }
+    if (patch.manifestUrls !== undefined) {
+      next.manifestUrls = patch.manifestUrls;
+      next.packagingError = undefined;
+    }
+    if (patch.packagingError !== undefined) {
+      next.packagingError = patch.packagingError;
+    }
+    if (patch.renditions !== undefined) {
+      next.renditions = patch.renditions;
+    }
+    if (patch.thumbnails !== undefined) {
+      next.thumbnails = patch.thumbnails;
+    }
+    if (patch.metadata !== undefined) {
+      next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
+    }
+    if (patch.tags !== undefined) {
+      next.tags = normalizeTags(patch.tags);
+    }
+    if (patch.audioTracks !== undefined) {
+      next.audioTracks = patch.audioTracks;
+    }
+    if (patch.subtitleTracks !== undefined) {
+      next.subtitleTracks = patch.subtitleTracks;
+    }
+    if (patch.subtitlesError !== undefined) {
+      // `null` clears the error (successful attach); a string records a failure.
+      next.subtitlesError = patch.subtitlesError ?? undefined;
+    }
+    if (patch.sceneMetadata !== undefined) {
+      next.sceneMetadata = patch.sceneMetadata;
+      // A successful detection clears any stale error.
+      if (patch.sceneMetadata !== null) {
+        next.sceneDetectionError = undefined;
+      }
+    }
+    if (patch.sceneDetectionError !== undefined) {
+      next.sceneDetectionError = patch.sceneDetectionError;
+    }
+    if (patch.versionGroupId !== undefined) {
+      next.versionGroupId = patch.versionGroupId;
+    }
+    if (patch.status !== undefined) {
+      const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
+      next.status = applied.status;
+      next.statusHistory = applied.statusHistory;
+    }
+    // Append provenance for whichever namespaces this patch touched (issue #53).
+    const entries = provenanceForPatch(patch, now);
+    if (entries.length > 0) {
+      next.provenance = [...(existing.provenance ?? []), ...entries];
+    }
+    return next;
   }
 
   async transitionReviewState(
@@ -310,6 +348,84 @@ export class CouchAssetRepository implements AssetRepository {
   async remove(id: string): Promise<Asset | undefined> {
     // Soft delete (see file header): archive rather than destroy.
     return this.update(id, { status: 'archived' });
+  }
+
+  // Undo an archive within the retention window (issue #328, part of #323).
+  // Sibling to remove(): moves an already-`archived` asset back to a live status
+  // (`ready` when the pre-archive status was `ready`, otherwise `failed`) and
+  // appends an audited `archived -> <target>` statusHistory entry. Deliberately
+  // BYPASSES the state machine — the ordinary PATCH path cannot leave `archived`
+  // (ALLOWED_TRANSITIONS.archived stays `[]`) so this is the one sanctioned exit,
+  // consistent with ADR-005 (append the audit entry, never rewrite history).
+  //
+  // Routed through updateWithRetry for the same conflict-retry safety the rest of
+  // the read-modify-write paths use (issues #278/#279/#281): the patchFn is pure
+  // and re-runnable per attempt. A tombstone (purged) doc carries a non-asset
+  // resourceType and so fails the preflight guard, reading as undefined here — the
+  // route maps that to 410 via getState(). Returns undefined when the id is
+  // unknown, purged, or not currently `archived` (nothing to restore).
+  async restore(id: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    if (fromDoc(preflight).status !== 'archived') {
+      return undefined;
+    }
+    let restored: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      // Guard again inside the retry: a concurrent writer could have moved the
+      // asset out of `archived` between the preflight read and this attempt.
+      if (existing.status !== 'archived') {
+        restored = undefined;
+        return toDoc(existing);
+      }
+      const now = new Date().toISOString();
+      const applied = applyRestore(existing.statusHistory, now);
+      const next: Asset = {
+        ...existing,
+        status: applied.status,
+        statusHistory: applied.statusHistory,
+        updatedAt: now,
+        provenance: [
+          ...(existing.provenance ?? []),
+          { at: now, by: 'user', op: 'restore', detail: applied.status }
+        ]
+      };
+      restored = next;
+      return toDoc(next);
+    });
+    return written ? restored : undefined;
+  }
+
+  // Purge an archived asset by REPLACING its document in place with a tombstone
+  // (issue #326, doc-replace per ADR-005). Exposed so the retention sweep slice
+  // (#327) constructs and writes the tombstone through this one path rather than
+  // re-deriving the shape; this slice does not call it on any request route. The
+  // asset's `_rev` is carried so CouchDB accepts the replacement and the
+  // `_changes` feed emits the tombstone body, which drops the asset from the PG
+  // search projection. Returns the tombstone's id, or undefined when the id is
+  // absent or not a live asset (already purged / never existed).
+  async purgeToTombstone(
+    id: string,
+    opts: { purgedAt?: string } = {}
+  ): Promise<string | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const asset = fromDoc(doc);
+    const tombstone = toTombstoneDocument(asset, { purgedAt: opts.purgedAt });
+    // Validate the replacement body, then strip the id/rev envelope fields the
+    // storage layer owns and carry the live `_rev` so the write is an in-place
+    // replacement (not a branch/conflict).
+    const validated = AssetTombstoneSchema.parse(tombstone);
+    const { _id: _ignoredId, _rev: _ignoredRev, ...body } = validated;
+    await couch.put(id, { ...body, resourceType: ASSET_TOMBSTONE_TYPE, _rev: doc._rev });
+    return id;
   }
 }
 

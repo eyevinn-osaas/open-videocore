@@ -63,6 +63,8 @@ import {
   type ProbeRunner
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
+import { validateProfileParams } from '../pipeline/profile-params.js';
+import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
   type GenerateSubtitlesDeps,
@@ -96,7 +98,6 @@ import {
   proxyManifestUrlsFor
 } from '../pipeline/packaging.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
-import type { ProfileRepository } from '../data/profile-repo.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -134,10 +135,22 @@ const customProfileSchema = z.object({
   outputs: z.array(encoreOutputSchema).min(1).max(16)
 });
 
+// profileParams (issue #287): a flat string map forwarded verbatim into the
+// Encore job document's `profileParams` object, which Encore evaluates as SpEL
+// expression properties within the named server-side profile (e.g. crf, preset,
+// height, keyframes for `x264-crf-parametrized`). Verified against the SVT
+// Encore EncoreJob model — `profileParams: Map<String, Any?>` defaulting to
+// `{}` (github.com/svt/encore, encore-common/.../model/EncoreJob.kt). We
+// constrain our contract to string values: Encore accepts them with no coercion
+// and each value lands as a single token in the ffmpeg argument list (no new
+// injection surface). Values omitted -> unchanged default output.
+const profileParamsSchema = z.record(z.string(), z.string());
+
 const transcodeBodySchema = z
   .object({
     profile: z.string().min(1).optional(),
-    customProfile: customProfileSchema.optional()
+    customProfile: customProfileSchema.optional(),
+    profileParams: profileParamsSchema.optional()
   })
   .refine((b) => !(b.profile && b.customProfile), {
     message: 'specify either profile or customProfile, not both'
@@ -570,12 +583,16 @@ type AssetsRouterOptions = {
   // Asset comments (issue #135). Injectable for tests; defaults to an in-memory
   // repository so the comments sub-resource always works.
   commentRepository?: CommentRepository;
-  // Encore transcoding profile store (issue #84). When present, a transcode that
-  // names a stored profile is validated against it before submission: a GPU-only
-  // (NVENC/CUDA) profile that cannot run on this platform tier is rejected 422
-  // rather than submitted to an Encore instance that cannot execute it (issue
-  // #286). When absent (e.g. tests that do not exercise named profiles), the
-  // check is skipped and the profile name is forwarded as before.
+  // Operator-managed Encore transcoding profile store (issue #84). Used by POST
+  // /:id/transcode for two validations before submission:
+  //  - profileParams keys are validated against the SpEL params the chosen
+  //    profile actually declares (issue #290); and
+  //  - a GPU-only (NVENC/CUDA) profile that cannot run on this platform tier is
+  //    rejected 422 rather than submitted to an Encore instance that cannot
+  //    execute it (issue #286).
+  // When absent (e.g. deployments/tests that do not wire the profile store or do
+  // not exercise named profiles), both checks are skipped (permissive) and the
+  // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
 };
 
@@ -655,11 +672,25 @@ const commentSchema = z.object({
   createdAt: z.string()
 });
 
-const ingestUrlSchema = z.object({
-  sourceUrl: z.string().min(1).max(4096),
-  name: z.string().min(1).max(256).optional(),
-  description: z.string().max(2048).optional()
-});
+// URL-pull ingest request body (issue #5). `.strict()` (issue #344): unknown /
+// non-actionable properties are REJECTED with a 400 rather than silently
+// accepted and discarded — a silently-dropped field previously made a
+// dropped-metadata bug expensive to discover. The accepted set is exactly the
+// fields the handler acts on: `sourceUrl`, `name`, `description`, plus `title`
+// and `tags`. `title`/`tags` are persisted to the user-writable `descriptive`
+// namespace (issue #343): the repository maps `name`/`title` -> descriptive.title
+// (asset-document.ts) and `tags` -> descriptive.tags, landing in the same place a
+// later PUT /:id/metadata or POST /:id/tags would set them. `title` wins over
+// `name` when both appear.
+const ingestUrlSchema = z
+  .object({
+    sourceUrl: z.string().min(1).max(4096),
+    name: z.string().min(1).max(256).optional(),
+    description: z.string().max(2048).optional(),
+    title: z.string().min(1).max(256).optional(),
+    tags: tagsSchema.optional()
+  })
+  .strict();
 
 const ingestAcceptedSchema = z.object({
   assetId: z.string(),
@@ -703,7 +734,7 @@ async function resolveEncoreJobUrlForPackaging(
 // carry this format because Encore writes to a configurable S3 output bucket
 // that may differ from the source bucket (ADR-001). Returns null for plain
 // object keys (no scheme prefix) so callers can use the source-bucket storage.
-function parseS3Uri(uri: string): { bucket: string; key: string } | null {
+export function parseS3Uri(uri: string): { bucket: string; key: string } | null {
   const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
   if (!match) return null;
   return { bucket: match[1], key: match[2] };
@@ -738,18 +769,64 @@ function contentTypeForPackagedObject(relativePath: string): string {
   const lower = relativePath.toLowerCase();
   if (lower.endsWith('.m3u8')) return 'application/vnd.apple.mpegurl';
   if (lower.endsWith('.mpd')) return 'application/dash+xml';
+  // CMAF media segments (fragmented .m4s / .cmf*) use the ISO segment media type
+  // (RFC 8216 / ISO BMFF); a whole `.mp4` (e.g. a single-file init or the DASH
+  // init segment) is served as a plain MP4 container.
   if (
     lower.endsWith('.m4s') ||
-    lower.endsWith('.mp4') ||
     lower.endsWith('.cmfv') ||
     lower.endsWith('.cmfa') ||
     lower.endsWith('.cmft')
   ) {
-    return 'video/mp4';
+    return 'video/iso.segment';
   }
+  if (lower.endsWith('.mp4') || lower.endsWith('.m4v')) return 'video/mp4';
+  if (lower.endsWith('.m4a')) return 'audio/mp4';
   if (lower.endsWith('.ts')) return 'video/mp2t';
   if (lower.endsWith('.vtt')) return 'text/vtt';
   return 'application/octet-stream';
+}
+
+// Parse a single-range HTTP `Range` header of the form `bytes=<start>-<end>`
+// against a known object `size`, returning the resolved inclusive byte offsets.
+// Supports the three RFC 7233 single-range forms the players emit for CMAF
+// segment fetches:
+//   - `bytes=START-END`  -> [START, END]
+//   - `bytes=START-`     -> [START, size-1] (open-ended tail)
+//   - `bytes=-SUFFIX`    -> last SUFFIX bytes -> [size-SUFFIX, size-1]
+// Returns { unsatisfiable: true } when the range is well-formed but lies outside
+// the object (the route maps this to 416). Returns undefined when the header is
+// absent or not a single byte-range we can honor, so the caller streams the
+// whole object with 200 (a correct, if unoptimised, response).
+function parseByteRange(
+  rangeHeader: string | undefined,
+  size: number
+): { start: number; end: number } | { unsatisfiable: true } | undefined {
+  if (!rangeHeader) return undefined;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!match) return undefined;
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === '' && rawEnd === '') return undefined;
+
+  let start: number;
+  let end: number;
+  if (rawStart === '') {
+    // Suffix range: final N bytes.
+    const suffix = Number.parseInt(rawEnd, 10);
+    if (!Number.isFinite(suffix) || suffix <= 0) return undefined;
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number.parseInt(rawStart, 10);
+    end = rawEnd === '' ? size - 1 : Number.parseInt(rawEnd, 10);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return undefined;
+  }
+
+  if (start > end || start >= size) {
+    return { unsatisfiable: true };
+  }
+  // Clamp the end to the last byte so an over-long range still resolves.
+  return { start, end: Math.min(end, size - 1) };
 }
 
 function fileNameFromKey(key: string): string {
@@ -793,19 +870,43 @@ async function latestRelocatedLocation(
   return undefined;
 }
 
+// Normalize an object-key or key-prefix so it NEVER embeds the bucket name as
+// its first path segment (issue #342). Object keys in open-videocore follow a
+// single convention: the bucket is carried SEPARATELY (as the storage binding),
+// never inside the key. Rendition `objectKey` (exposed as `s3Uri.key`) and the
+// proxy `/:id/stream/*` route (`outputPrefix(id)/...`) already obey this, but
+// packaged `objectKeyPrefix` — derived from a stored manifest URL whose path is
+// `/<packagedBucket>/packaged/<id>/index.m3u8` — historically kept the bucket as
+// its leading segment, causing off-by-one path errors when the proxy/delivery
+// handlers construct keys.
+//
+// This is also the BACK-COMPAT read shim: assets packaged before #342 persisted
+// the bucket-embedded prefix, so we strip a leading `<bucket>/` here at read time
+// (in ADDITION to normalizing new writes) so already-packaged assets keep
+// resolving. Stripping is guarded on the KNOWN packaged bucket only — an
+// unrelated leading segment that merely resembles a bucket is left untouched.
+function stripBucketPrefix(key: string, bucket: string): string {
+  const clean = key.replace(/^\/+/, '');
+  if (!bucket) return clean;
+  const prefix = `${bucket.replace(/^\/+|\/+$/g, '')}/`;
+  return clean.startsWith(prefix) ? clean.slice(prefix.length) : clean;
+}
+
 // Derive the object-key prefix backing a streaming package from its manifest
 // URL — the manifest's parent "directory" (e.g.
 // `https://minio/packaged/<id>/hls/master.m3u8` -> `packaged/<id>/hls/`). The
 // URL path is used when parseable; otherwise the raw string is treated as a
-// path. Segment objects live under this prefix.
-function objectKeyPrefixFromManifest(manifestUrl: string): string {
+// path. Segment objects live under this prefix. The bucket, if present as the
+// leading path segment, is stripped so the returned prefix follows the
+// bucket-excluded convention (issue #342); pass the effective packaged bucket.
+function objectKeyPrefixFromManifest(manifestUrl: string, bucket: string): string {
   let path = manifestUrl;
   try {
     path = new URL(manifestUrl).pathname;
   } catch {
     // Not an absolute URL; treat the value itself as a path.
   }
-  path = path.replace(/^\/+/, '');
+  path = stripBucketPrefix(path, bucket);
   const lastSlash = path.lastIndexOf('/');
   return lastSlash >= 0 ? path.slice(0, lastSlash + 1) : '';
 }
@@ -815,8 +916,12 @@ function objectKeyPrefixFromManifest(manifestUrl: string): string {
 // `packaged/<id>/index.m3u8`. Used to re-host a stored (proxied/MinIO) manifest
 // URL against an external object-store / CDN origin (issue #213) while keeping
 // the deterministic manifest name. A query string, if any, is dropped: delivery
-// URLs must never carry signed/credential query params.
-function objectKeyFromManifest(manifestUrl: string): string {
+// URLs must never carry signed/credential query params. The internal packaged
+// bucket, if present as the leading path segment, is stripped so the returned
+// key follows the bucket-excluded convention (issue #342) — the external origin
+// (`packagedBase`) already carries its own bucket, so leaving the internal
+// bucket in would double it (`<endpoint>/<extBucket>/<packagedBucket>/...`).
+function objectKeyFromManifest(manifestUrl: string, bucket: string): string {
   let path = manifestUrl;
   try {
     path = new URL(manifestUrl).pathname;
@@ -825,7 +930,7 @@ function objectKeyFromManifest(manifestUrl: string): string {
     const q = path.indexOf('?');
     if (q >= 0) path = path.slice(0, q);
   }
-  return path.replace(/^\/+/, '');
+  return stripBucketPrefix(path, bucket);
 }
 
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
@@ -876,6 +981,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     );
     return true;
+  }
+
+  // Synchronous re-drive of technical metadata extraction (issue #281). Unlike
+  // triggerExtraction (fire-and-forget), this AWAITS the extractor so the caller
+  // observes the settled outcome. Used by the re-drive path of
+  // POST /:id/extract-metadata to recover an asset wedged in `processing` with a
+  // `technicalMetadataError`: on success the extractor clears the error,
+  // populates `technicalMetadata`, and advances `processing -> ready`. The
+  // extractor never throws (it records failures on the asset), so callers read
+  // back the asset to learn whether recovery succeeded. Assumes probe + storage
+  // are configured (the route checks this before calling).
+  async function runExtractionSync(assetId: string, objectKey: string): Promise<void> {
+    if (!opts.probe || !storageFor) {
+      return;
+    }
+    await extractRunner(
+      { assetId, objectKey },
+      {
+        assets: repo,
+        storage: storageFor(),
+        probe: opts.probe,
+        ...opts.extractDeps
+      }
+    );
   }
 
   // Fire-and-forget auto-subtitle generation for a pipeline step (issue #114).
@@ -968,7 +1097,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     pipelineName: keyof typeof BUILT_IN_PIPELINES,
     request: import('fastify').FastifyRequest,
     reply: import('fastify').FastifyReply,
-    encodeOpts?: { profile?: string; customProfile?: EncoreProfile },
+    encodeOpts?: { profile?: string; customProfile?: EncoreProfile; profileParams?: Record<string, string> },
     // Optional per-execution destination override (issue #207). Already
     // validated + trailing-slash-normalized by the edge schema. Persisted on the
     // execution record so #208 (packager relocation) and #210 (delivery) can
@@ -1130,7 +1259,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               sourceBucket: opts.sourceBucket as string,
               outputBucket: opts.outputBucket as string,
               preset: encodeOpts?.profile,
-              customProfile: encodeOpts?.customProfile
+              customProfile: encodeOpts?.customProfile,
+              // profileParams (issue #288): forwarded verbatim into the same
+              // transcode submission path as POST /:id/transcode so SpEL-
+              // parametrised profiles work from execute too. Undefined leaves
+              // execute behaviour unchanged.
+              profileParams: encodeOpts?.profileParams
             },
             { jobs, assets: repo, encore: opts.encore! }
           );
@@ -1238,7 +1372,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           .code(501)
           .send({ error: 'not_configured', message: 'object storage is not configured' });
       }
-      const { sourceUrl, name, description } = request.body;
+      const { sourceUrl, name, title, description, tags } = request.body;
 
       // Validate synchronously so a bad URL is a 400, not a background failure.
       const parsed = parseSource(sourceUrl);
@@ -1251,9 +1385,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         decodeURIComponent(parsed.url.pathname.split('/').filter(Boolean).pop() ?? '') ||
         parsed.url.hostname;
 
+      // Persist editorial title + tags to the user-writable `descriptive`
+      // namespace at creation time (issue #343). `title` (preferred) or the
+      // legacy `name` alias becomes `descriptive.title`; `tags` becomes
+      // `descriptive.tags` — the repository normalizes tags identically to
+      // POST /:id/tags, so a later GET returns the submitted values verbatim.
       const asset = await repo.create({
-        name: name ?? fallbackName,
-        description
+        name: title ?? name ?? fallbackName,
+        description,
+        tags
       });
       const objectKey = `ingest/${asset.id}`;
       await repo.update(asset.id, { objectKey });
@@ -1447,11 +1587,28 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       schema: {
         params: z.object({ id: z.string() }),
-        response: { 200: assetSchema, 404: errorSchema }
+        response: { 200: assetSchema, 404: errorSchema, 410: errorSchema }
       }
     },
     async (request, reply) => {
-      const asset = await resolveAsset(request.params.id);
+      const idOrSlug = request.params.id;
+      // Tombstone semantics (issue #326): a purged archived asset's document is
+      // replaced in place by a tombstone. A read by its former id must return
+      // 410 Gone (the resource existed and was intentionally removed), NOT 404.
+      // getState() surfaces that distinction only for the ULID id path; slugs
+      // fall through to the ordinary slug lookup (a purged asset drops out of the
+      // slug index, so a former slug resolves to 404 as before).
+      if (isUlid(idOrSlug)) {
+        const state = await repo.getState(idOrSlug);
+        if (state.kind === 'tombstone') {
+          return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
+        }
+        if (state.kind === 'asset') {
+          return reply.code(200).send(state.asset);
+        }
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const asset = await resolveAsset(idOrSlug);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -1567,9 +1724,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // proxy/public delivery modes below, which only apply to the per-stack
         // MinIO backend that blocks external GETs.
         if (packagedBase) {
+          const rehostBucket = request.connections?.packagedBucket ?? packagedBucket();
           const rehost = (manifestUrl: string | undefined): string | undefined => {
             if (!manifestUrl) return undefined;
-            return externalObjectUrl(packagedBase, objectKeyFromManifest(manifestUrl));
+            return externalObjectUrl(packagedBase, objectKeyFromManifest(manifestUrl, rehostBucket));
           };
           return reply.code(200).send({
             assetId: asset.id,
@@ -1696,24 +1854,79 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const bucket = request.connections?.packagedBucket ?? packagedBucket();
       const packagedStorage = new WorkspaceStorage(storageClient, bucket);
       const objectKey = `${outputPrefix(asset.id)}/${relative}`;
+      const contentType = contentTypeForPackagedObject(relative);
 
-      let stream: Awaited<ReturnType<WorkspaceStorage['getObject']>>;
+      // stat first so we can (a) return a clean 404 for a missing object without
+      // opening a body stream, (b) advertise Accept-Ranges + Content-Length, and
+      // (c) resolve a Range header against the real object size. statObject
+      // returns undefined for a missing key (mapped to 404 below).
+      let stat: Awaited<ReturnType<WorkspaceStorage['statObject']>>;
       try {
-        stream = await packagedStorage.getObject(objectKey);
+        stat = await packagedStorage.statObject(objectKey);
       } catch (err) {
-        if ((err as { code?: string }).code === 'NoSuchKey' || (err as { code?: string }).code === 'NotFound') {
+        if (
+          (err as { code?: string }).code === 'NoSuchKey' ||
+          (err as { code?: string }).code === 'NotFound'
+        ) {
           return reply.code(404).send({ error: 'not_found' });
         }
         throw err;
       }
+      if (!stat) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
 
-      return reply
-        .header('Content-Type', contentTypeForPackagedObject(relative))
-        // Manifests must not be cached long (segments may roll); segments are
-        // immutable so may be cached. Keep it conservative and let a fronting
-        // CDN/proxy override if desired.
+      // Honor a single HTTP Range request for segment fetches. Manifests are
+      // small and typically fetched whole, but players routinely issue ranged
+      // GETs for CMAF media segments; supporting them keeps byte-range addressed
+      // playback working through the proxy (issue #339). A malformed/multi-range
+      // header falls through to a full 200 response (a valid outcome per RFC 7233).
+      const parsed = parseByteRange(request.headers['range'], stat.size);
+      if (parsed && 'unsatisfiable' in parsed) {
+        return reply
+          .code(416)
+          .header('Content-Range', `bytes */${stat.size}`)
+          .send({ error: 'range_not_satisfiable' });
+      }
+
+      // Manifests must not be cached long (segments may roll); segments are
+      // immutable so may be cached. Keep it conservative and let a fronting
+      // CDN/proxy override if desired. Accept-Ranges advertises range support so
+      // a player knows it can issue ranged segment GETs.
+      reply
+        .header('Content-Type', contentType)
         .header('Cache-Control', 'no-cache')
-        .send(stream);
+        .header('Accept-Ranges', 'bytes');
+
+      try {
+        if (parsed) {
+          const length = parsed.end - parsed.start + 1;
+          const stream = await packagedStorage.getPartialObject(
+            objectKey,
+            parsed.start,
+            length
+          );
+          return reply
+            .code(206)
+            .header('Content-Range', `bytes ${parsed.start}-${parsed.end}/${stat.size}`)
+            .header('Content-Length', String(length))
+            .send(stream);
+        }
+        const stream = await packagedStorage.getObject(objectKey);
+        return reply
+          .header('Content-Length', String(stat.size))
+          .send(stream);
+      } catch (err) {
+        // A key that vanished between stat and read (or a backend NoSuchKey) is a
+        // 404 rather than a 500 so a racing purge does not leak an error.
+        if (
+          (err as { code?: string }).code === 'NoSuchKey' ||
+          (err as { code?: string }).code === 'NotFound'
+        ) {
+          return reply.code(404).send({ error: 'not_found' });
+        }
+        throw err;
+      }
     }
   );
 
@@ -1821,8 +2034,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       // manifestUrls -> streaming fileGroups. `id` is the fixed package type so
       // each format yields at most one stable group id ("hls"/"dash"). The
-      // objectKeyPrefix is derived from the manifest's path so callers can locate
-      // the segment objects that back the package.
+      // objectKeyPrefix is derived from the manifest's path and normalized to
+      // EXCLUDE the packaged bucket (issue #342) so it follows the same
+      // bucket-excluded convention as rendition objectKey and the proxy route —
+      // callers construct segment keys without special-casing an embedded bucket.
+      // Passing the effective packaged bucket also strips the bucket from prefixes
+      // persisted before #342 (back-compat on read).
+      const packagedBucketName = request.connections?.packagedBucket ?? packagedBucket();
       const fileGroups: z.infer<typeof assetFileGroupSchema>[] = [];
       const manifests = asset.manifestUrls;
       if (manifests?.hls) {
@@ -1831,7 +2049,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           type: 'hls-package',
           name: 'HLS',
           manifestUrl: manifests.hls,
-          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.hls)
+          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.hls, packagedBucketName)
         });
       }
       if (manifests?.dash) {
@@ -1840,7 +2058,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           type: 'dash-package',
           name: 'DASH',
           manifestUrl: manifests.dash,
-          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.dash)
+          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.dash, packagedBucketName)
         });
       }
 
@@ -1848,20 +2066,37 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // On-demand re-extraction of technical metadata (issue #6). Workspace-scoped
-  // and behind `authenticate`. Returns 202 Accepted immediately and runs the
-  // ffprobe extraction fire-and-forget; the caller polls GET /:id to observe
-  // `technicalMetadata` / `technicalMetadataError` once it settles.
+  // On-demand (re-)extraction of technical metadata (issues #6, #281).
+  // Workspace-scoped and behind `authenticate`. Two modes:
+  //
+  //   RE-DRIVE (issue #281): when the asset is WEDGED — stuck in `processing`
+  //   with a `technicalMetadataError` set (typically after a prior conflict or
+  //   probe failure) — this runs the extraction SYNCHRONOUSLY and reports the
+  //   settled outcome (200). On success the extractor clears
+  //   `technicalMetadataError`, populates `technicalMetadata`, and advances the
+  //   lifecycle `processing -> ready`. This gives an operator a reliable, single
+  //   call to recover a wedged asset. Idempotent: re-driving an already-`ready`
+  //   asset simply re-runs extraction and stays `ready` (safe no-op). The
+  //   extractor never throws (it records failures on the asset); the resolved
+  //   status is read back and returned so a persistent failure is observable.
+  //
+  //   FIRE-AND-FORGET (issue #6): for a non-wedged asset the extraction is kicked
+  //   off detached and the route returns 202 immediately; the caller polls
+  //   GET /:id to observe `technicalMetadata` / `technicalMetadataError`.
+  //
+  //   200 — re-drive completed synchronously; body reports the resolved status
+  //   202 — extraction accepted (fire-and-forget)
   //   404 — unknown/foreign asset (existence not leaked)
   //   409 — the asset has no stored object yet (nothing to probe)
   //   501 — extraction is not configured on this deployment
   app.post(
     '/:id/extract-metadata',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         response: {
+          200: z.object({ assetId: z.string(), status: z.string() }),
           202: z.object({ assetId: z.string(), status: z.string() }),
           404: errorSchema,
           409: errorSchema,
@@ -1884,6 +2119,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(501).send({
           error: 'not_configured',
           message: 'technical metadata extraction is not configured'
+        });
+      }
+      // A wedged asset (issue #281): stuck in `processing` with a recorded
+      // extraction error. Re-drive synchronously so the caller learns whether
+      // the asset recovered to `ready`.
+      const wedged = asset.status === 'processing' && asset.technicalMetadataError !== undefined;
+      if (wedged) {
+        await runExtractionSync(asset.id, asset.objectKey);
+        const settled = await repo.get(asset.id);
+        return reply.code(200).send({
+          assetId: asset.id,
+          status: settled?.status ?? asset.status
         });
       }
       triggerExtraction(asset.id, asset.objectKey);
@@ -1910,6 +2157,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         body: transcodeBodySchema,
         response: {
           202: transcodeAcceptedSchema,
+          400: errorSchema,
           404: errorSchema,
           409: errorSchema,
           422: errorSchema,
@@ -1941,6 +2189,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (unrunnable) {
         return reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
       }
+      // Validate profileParams keys against the SpEL params the chosen profile
+      // actually declares (issue #290). We resolve the profile YAML from the
+      // operator-managed profile store — the same profiles GET /api/v1/profiles
+      // serves and Encore loads — and reject keys that profile does not declare
+      // with a descriptive 400, so a mistyped SpEL param name is an actionable
+      // error rather than a silently-ignored value. Degrades gracefully: a
+      // custom profile (not in the store) or an unresolvable profile is treated
+      // permissively (validateProfileParams passes an undefined YAML through), so
+      // custom/operator profiles are never falsely rejected. An empty/absent map
+      // always passes.
+      if (request.body.profileParams && !request.body.customProfile) {
+        const profileName = request.body.profile ?? 'program';
+        const stored = opts.profileRepository
+          ? await opts.profileRepository.get(profileName)
+          : undefined;
+        const check = validateProfileParams({
+          profileName,
+          profileYaml: stored?.yaml,
+          profileParams: request.body.profileParams
+        });
+        if (!check.ok) {
+          return reply.code(400).send({
+            error: 'unknown_profile_params',
+            message: check.message
+          });
+        }
+      }
       try {
         const result = await submitTranscode(
           {
@@ -1949,6 +2224,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceObjectKey: asset.objectKey,
             preset: request.body.profile,
             customProfile: request.body.customProfile as EncoreProfile | undefined,
+            profileParams: request.body.profileParams,
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },
@@ -2062,6 +2338,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
           profile: z.string().min(1).optional(),
           customProfile: customProfileSchema.optional(),
+          // profileParams (issue #288): reuses the same flat string map validated
+          // on POST /:id/transcode (profileParamsSchema, issue #287) and forwards
+          // it into the shared transcode submission path so SpEL-parametrised
+          // profiles (x264-crf-parametrized, program-kf) work from execute too.
+          // Omitted -> execute behaviour unchanged.
+          profileParams: profileParamsSchema.optional(),
           // Optional per-execution destination override (issue #207). Validated
           // and trailing-slash-normalized at the edge; persisted on the
           // execution record for #208 (packager relocation) / #210 (delivery).
@@ -2090,7 +2372,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
         request,
         reply,
-        { profile: request.body.profile, customProfile: request.body.customProfile as EncoreProfile | undefined },
+        {
+          profile: request.body.profile,
+          customProfile: request.body.customProfile as EncoreProfile | undefined,
+          profileParams: request.body.profileParams
+        },
         request.body.destinationBucket
       );
       if (!started) return reply; // error already sent
@@ -2797,7 +3083,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.delete(
     '/:id',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         response: { 204: z.null(), 404: errorSchema, 409: errorSchema }
@@ -2815,6 +3101,45 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(204).send(null);
+    }
+  );
+
+  // Undo an archive within the retention window (issue #328, part of the purge
+  // epic #323). Lets an operator revive a soft-deleted asset BEFORE the retention
+  // sweep purges it. The repo's `restore(id)` (sibling to `remove(id)`) bypasses
+  // the state machine — `archived` is otherwise terminal (ALLOWED_TRANSITIONS.
+  // archived stays `[]`) so no ordinary PATCH can revive it — and appends an
+  // audited `archived -> <target>` statusHistory entry (ADR-005: append, never
+  // rewrite). Target status is the pre-archive status when it was `ready`,
+  // otherwise `failed` (see restoreTargetStatus).
+  //   200 — restored asset (now `ready` or `failed`)
+  //   404 — unknown id, OR not currently `archived` (nothing to restore)
+  //   410 — the asset was already purged (its document is now a tombstone)
+  app.post(
+    '/:id/restore',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: assetSchema, 404: errorSchema, 410: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const id = request.params.id;
+      // Tombstone semantics (issue #326): a purged archived asset's document is
+      // replaced in place by a tombstone. Restoring one must return 410 Gone (the
+      // resource existed and was intentionally purged), NOT 404. getState()
+      // surfaces that distinction for the ULID id path.
+      if (isUlid(id)) {
+        const state = await repo.getState(id);
+        if (state.kind === 'tombstone') {
+          return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
+        }
+      }
+      const restored = await repo.restore(id);
+      if (!restored) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(restored);
     }
   );
 };

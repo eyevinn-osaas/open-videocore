@@ -440,6 +440,20 @@ export type ListResult = {
   total: number;
 };
 
+// Discriminated read result for a single asset id (issue #326). Where `get()`
+// collapses "absent" and "purged tombstone" into a single `undefined`, this
+// exposes the distinction so the `GET /:id` route can return 410 Gone for a
+// tombstone (a document that WAS an asset and was purged) vs 404 for a genuinely
+// unknown id. `getState()` is the read primitive the tombstone read-path
+// semantics are built on; `get()` keeps its `Asset | undefined` contract so the
+// dozens of other callers (delivery, files, pipeline) are unaffected — a
+// tombstone reads as `undefined` (not-found) through `get()`, which is the safe
+// default for every non-410 route.
+export type AssetReadState =
+  | { kind: 'asset'; asset: Asset }
+  | { kind: 'tombstone' }
+  | { kind: 'not-found' };
+
 // ---------------------------------------------------------------------------
 // Domain errors. Routes map these to HTTP status codes.
 // ---------------------------------------------------------------------------
@@ -504,6 +518,11 @@ export function isUlid(value: string): boolean {
 export interface AssetRepository {
   create(input: CreateAssetInput): Promise<Asset>;
   get(id: string): Promise<Asset | undefined>;
+  // Read a single id with the tombstone distinction (issue #326). Returns
+  // `{ kind: 'asset' }` for a live asset, `{ kind: 'tombstone' }` for a purged
+  // asset whose document was replaced by a tombstone, and `{ kind: 'not-found' }`
+  // for an unknown id. Used ONLY by `GET /:id` to map a tombstone to 410 Gone.
+  getState(id: string): Promise<AssetReadState>;
   // Resolve an asset by its human-readable slug (issue #131/#132), scoped to the
   // repository's (structurally isolated) workspace. Returns undefined when no
   // asset in this workspace carries the slug. Used by the `/:id` route to accept
@@ -527,6 +546,51 @@ export interface AssetRepository {
   // Soft-delete: transitions the asset to `archived`. Returns the archived
   // asset, or undefined if it does not exist.
   remove(id: string): Promise<Asset | undefined>;
+  // Undo an archive while the asset is still within its retention window
+  // (issue #328, part of the purge epic #323). Sibling to `remove(id)`: where
+  // `remove` archives, `restore` un-archives an already-`archived` asset back to
+  // a live status. The target is the pre-archive status from statusHistory when
+  // it was `ready`, otherwise `failed` (see `restoreTargetStatus`). This is the
+  // ONE audited path that leaves `archived` — it BYPASSES isValidTransition (the
+  // state machine keeps `ALLOWED_TRANSITIONS.archived === []` so no ordinary
+  // PATCH can revive an archived asset) and appends an `archived -> <target>`
+  // statusHistory entry consistent with ADR-005 (append, never rewrite).
+  // Returns the restored asset, or undefined when the id is unknown or the asset
+  // is not currently `archived` (nothing to restore).
+  restore(id: string): Promise<Asset | undefined>;
+}
+
+// Resolve the target status a `restore` (issue #328) moves an archived asset to.
+// The rule: the pre-archive status is the `from` of the most recent transition
+// INTO `archived`; if that pre-archive status was `ready` the asset returns to
+// `ready`, otherwise it returns to `failed`. Restoring to `failed` (rather than
+// e.g. `processing`/`uploading`) gives the operator a single, well-defined live
+// state to re-drive from for every non-ready pre-archive history. Defaults to
+// `failed` when no `-> archived` transition is recorded (defensive).
+export function restoreTargetStatus(history: readonly StatusTransition[]): AssetStatus {
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    if (history[i].to === 'archived') {
+      return history[i].from === 'ready' ? 'ready' : 'failed';
+    }
+  }
+  return 'failed';
+}
+
+// Apply a restore (issue #328): move an already-`archived` asset to its resolved
+// target status and append an audited `archived -> <target>` statusHistory entry.
+// Deliberately does NOT consult isValidTransition — restore is the sanctioned
+// exception to the terminal `archived` state (ALLOWED_TRANSITIONS.archived stays
+// `[]`). The history is appended to, never rewritten (ADR-005). The caller is
+// responsible for having verified `current === 'archived'`.
+export function applyRestore(
+  history: StatusTransition[],
+  now: string
+): { status: AssetStatus; statusHistory: StatusTransition[] } {
+  const target = restoreTargetStatus(history);
+  return {
+    status: target,
+    statusHistory: [...history, { at: now, from: 'archived', to: target }]
+  };
 }
 
 // Build the initial status history entry for a freshly created asset.
@@ -754,6 +818,13 @@ export class InMemoryAssetRepository implements AssetRepository {
   // Keyed by the asset's local id. OSC provides structural isolation, so there
   // is no workspace namespacing on the key.
   private readonly store = new Map<string, Asset>();
+  // Purged-asset tombstones (issue #326), keyed by the former asset's id. Held
+  // in a SEPARATE map so `list()`/`search()`/`get()` — which only ever scan
+  // `store` — exclude tombstones by construction, mirroring the CouchDB tier
+  // where a tombstone carries a distinct `resourceType` and so falls outside
+  // every `{ resourceType: 'asset' }` Mango selector. The value is unused (only
+  // membership matters for the read path); a boolean keeps the intent explicit.
+  private readonly tombstones = new Set<string>();
 
   async create(input: CreateAssetInput): Promise<Asset> {
     if (input.parentId) {
@@ -809,6 +880,32 @@ export class InMemoryAssetRepository implements AssetRepository {
       return undefined;
     }
     return { ...asset };
+  }
+
+  async getState(id: string): Promise<AssetReadState> {
+    const asset = this.store.get(id);
+    if (asset) {
+      return { kind: 'asset', asset: { ...asset } };
+    }
+    if (this.tombstones.has(id)) {
+      return { kind: 'tombstone' };
+    }
+    return { kind: 'not-found' };
+  }
+
+  // Purge an archived asset in place: drop the live record and record a
+  // tombstone under the same id (issue #326). This is the in-memory analogue of
+  // the CouchDB doc-replace; the actual retention sweep (#327) is a separate
+  // slice, but exposing the transition here lets the read-path tests and the
+  // future sweep exercise the same not-found/410 semantics. Returns false when
+  // the id is unknown, so callers can distinguish a no-op.
+  purgeToTombstone(id: string): boolean {
+    if (!this.store.has(id)) {
+      return false;
+    }
+    this.store.delete(id);
+    this.tombstones.add(id);
+    return true;
   }
 
   // Resolve by slug (issue #132). Scans this store, which holds exactly one
@@ -971,6 +1068,32 @@ export class InMemoryAssetRepository implements AssetRepository {
     // Soft delete: transition to `archived` (see couch-asset-repo.ts for the
     // delete-strategy rationale). The route blocks if children exist.
     return this.update(id, { status: 'archived' });
+  }
+
+  async restore(id: string): Promise<Asset | undefined> {
+    // Undo an archive (issue #328). Bypasses the state machine (archived is
+    // terminal for ordinary PATCH) and appends an audited restore entry. A
+    // tombstone (purged) id is absent from `store`, so it reads as not-found
+    // here — the route maps that to 410 Gone via getState().
+    const existing = this.store.get(id);
+    if (!existing || existing.status !== 'archived') {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const applied = applyRestore(existing.statusHistory, now);
+    const next: Asset = {
+      ...existing,
+      status: applied.status,
+      statusHistory: applied.statusHistory,
+      updatedAt: now,
+      // Audited administrative restore (ADR-005 / issue #53). Append-only.
+      provenance: [
+        ...(existing.provenance ?? []),
+        { at: now, by: 'user', op: 'restore', detail: applied.status }
+      ]
+    };
+    this.store.set(id, next);
+    return { ...next };
   }
 }
 

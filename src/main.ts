@@ -15,7 +15,8 @@ import {
 import { provisionRouter } from './routes/provision.js';
 import { optionalServicesRouter } from './routes/optional-services.js';
 import { OperationStore } from './services/operation-store.js';
-import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.js';
+import { ensureParameterStore, paramStoreFromEnv, type StackConfig } from './services/param-store.js';
+import { PACKAGER_SERVICE_ID } from './services/stack.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
@@ -60,16 +61,27 @@ import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
+import { retentionRouter, archiveRetentionMsFromEnv } from './routes/retention.js';
+import {
+  ArchivedAssetPurgeLoop,
+  archivePurgeIntervalMsFromEnv
+} from './pipeline/archived-asset-purge-loop.js';
+import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
+import { reconcileStalledPackages } from './pipeline/stalled-package-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
   packagerOscApiFromContext
 } from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
-import { resolvePublicBaseUrl, resolveEncoreProfilesUrl } from './services/public-base-url.js';
+import {
+  resolvePublicBaseUrl,
+  resolveEncoreProfilesUrl,
+  resolveEncoreProfilesUrlFromParamStore
+} from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
@@ -468,6 +480,21 @@ const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || St
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
 // than left running forever. Defaults to 30 minutes.
 const encoreStallTimeoutMs = parseInt(process.env['ENCORE_STALL_TIMEOUT_MS'] || String(30 * 60 * 1000), 10);
+// Bounded timeout (issue #336) for the stalled-package reconciliation sweep: a
+// pipeline `package` step still `running` after this long — because no packager
+// instance consumed the queued job, the packager stalled, or its completion
+// callback was never delivered — is declared failed with a diagnostic message
+// rather than left running forever (observed 22 min / 7 min stuck runs). The
+// packager callback settles a healthy job long before this fires. Defaults to
+// 15 minutes; override via PACKAGE_STALL_TIMEOUT_MS.
+const packageStallTimeoutMs = parseInt(process.env['PACKAGE_STALL_TIMEOUT_MS'] || String(15 * 60 * 1000), 10);
+
+// Instance-global archive retention window in ms (issue #325, foundation for
+// #323). Read from ARCHIVE_RETENTION_MS at boot; unset/0 = never purge, which is
+// behaviourally identical to today's every-deployment default. Held as a live
+// mutable var so PATCH /api/v1/retention/config hot-swaps it with no restart,
+// mirroring how the scaler config PATCH mutates its live vars.
+let archiveRetentionMs = archiveRetentionMsFromEnv();
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -488,9 +515,33 @@ const encoreProfilesUrl =
 // Encore at the local profile store; #283 confirmed OSC exposes no runtime self-URL,
 // so an explicit value is the only lever.
 const publicBaseUrl = resolvePublicBaseUrl();
-const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(encoreProfilesUrl);
-if (!publicBaseUrl && !process.env['ENCORE_PROFILES_URL_OVERRIDE']) {
-  app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+// Tier 3 (issue #315): resolve an operator-supplied full profiles-index URL from
+// the provisioned stack record at boot, where the parameter store is already
+// awaited (see paramStore above). Undefined when there is no store, no stack, or
+// the field is unset — in which case resolveEncoreProfilesUrl falls through to
+// the remote default, byte-identical to pre-#315 behaviour.
+const paramStoreProfilesUrl =
+  publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
+    ? undefined // env-var seams (tier 1/2) win; skip the param-store read entirely
+    : await resolveEncoreProfilesUrlFromParamStore({
+        paramStore,
+        namespace: STACK_CONFIG_NAMESPACE,
+        onError: (err) =>
+          app.log.warn(
+            { err },
+            'profiles URL: failed to resolve from parameter store; falling back to remote default index'
+          )
+      });
+const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(
+  encoreProfilesUrl,
+  paramStoreProfilesUrl
+);
+if (
+  !publicBaseUrl &&
+  !process.env['ENCORE_PROFILES_URL_OVERRIDE'] &&
+  !paramStoreProfilesUrl
+) {
+  app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set, no parameter-store value / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
 // Live scaler/queue wiring. These are mutable holders, not startup-time
@@ -572,6 +623,33 @@ function activateScaler(redisUrl: string): void {
 
   const redis = new IORedis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
   sharedRedis = redis;
+
+  // Best-effort probe (issue #336): does a packager instance currently exist for
+  // this stack? The packager instance shares the stack name (like every
+  // STACK_SERVICES instance — see services/packager-provisioning.ts), so a
+  // getInstance(name = stackName) is the ground-truth existence check. Used ONLY
+  // to shape the stalled-package diagnostic (present=true => "no completion
+  // signal"; present=false => "no packager instance"). Any failure surfaces as a
+  // thrown probe, which the reconciler catches and renders as present=unknown —
+  // it never gates the bounded timeout.
+  const probePackagerPresent = async (): Promise<boolean> => {
+    if (!paramStore) {
+      throw new Error('parameter store unavailable; cannot resolve stack name');
+    }
+    const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+    if (names.length === 0) {
+      throw new Error('no provisioned stack; cannot resolve packager instance');
+    }
+    const stackName = names[0]!;
+    const packagerApi = packagerOscApiFromContext(oscContext);
+    const sat = await packagerApi.getServiceAccessToken(PACKAGER_SERVICE_ID);
+    const instance = await packagerApi.getInstance(
+      PACKAGER_SERVICE_ID,
+      stackName,
+      sat
+    );
+    return instance !== undefined && instance !== null;
+  };
 
   scalerRegistry = new WorkspaceEncoreScalerRegistry({
     redis,
@@ -655,6 +733,27 @@ function activateScaler(redisUrl: string): void {
           warn: (...a: unknown[]) => app.log.warn(a)
         }
       });
+      // Bound the `package` pipeline step (issue #336) on the same tick: a
+      // `package` step still `running` past packageStallTimeoutMs is failed with
+      // a diagnostic distinguishing "no packager instance" from "no completion
+      // signal". The packager step is advanced ONLY by the packager completion
+      // callback, so without this bound a missing packager / lost callback /
+      // stalled packager job leaves it running forever. Best-effort: the sweep
+      // swallows per-execution errors and never throws into the tick.
+      await reconcileStalledPackages({
+        pipeline: pipelineRepository,
+        // Best-effort presence probe used ONLY to shape the diagnostic message.
+        // It resolves the stack name (the packager instance shares it) and asks
+        // OSC whether a packager instance exists. Any failure -> undefined, and
+        // the message degrades to present=unknown rather than mis-attributing a
+        // cause. Never gates the timeout.
+        packagerPresent: probePackagerPresent,
+        stallTimeoutMs: packageStallTimeoutMs,
+        logger: {
+          info: (...a: unknown[]) => app.log.info(a),
+          warn: (...a: unknown[]) => app.log.warn(a)
+        }
+      });
     }
   });
   encore = scalerRegistry;
@@ -699,36 +798,60 @@ function activateScaler(redisUrl: string): void {
       // Resolve the stack (name + MinIO endpoint + packaged bucket) whose Valkey
       // this activation is bound to. Mirrors resolveStackRedisUrl: the first
       // provisioned stack for the namespace is the default.
+      //
+      // Issue #335: this resolution used to swallow failures — a param-store
+      // error was warn-logged, and an unresolvable stack returned silently — so
+      // the packager was never created, no error surfaced, and packaging hung
+      // invisibly. It now FAILS LOUDLY: a param-store error and unresolvable
+      // coordinates both throw, so the package step transitions to `failed` with
+      // a message identifying the cause instead of no-op'ing.
+      if (!paramStore) {
+        throw new Error(
+          'on-demand packager: parameter store is not configured, cannot resolve stack coordinates for provisioning'
+        );
+      }
       let stackName: string | undefined;
       let minioEndpoint: string | undefined;
       let packagedBucket = outputBucket;
-      if (paramStore) {
-        try {
-          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-          if (names.length > 0) {
-            stackName = names[0];
-            const cfg = await paramStore.loadStackConfig(
-              STACK_CONFIG_NAMESPACE,
-              names[0]!
-            );
-            if (cfg?.minioEndpoint) minioEndpoint = cfg.minioEndpoint;
-            if (cfg?.packagedBucket) packagedBucket = cfg.packagedBucket;
-          }
-        } catch (err) {
-          app.log.warn({ err }, 'on-demand packager: failed to resolve stack coordinates');
+      let stackCfg: StackConfig | undefined;
+      try {
+        const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+        if (names.length > 0) {
+          stackName = names[0];
+          stackCfg = await paramStore.loadStackConfig(
+            STACK_CONFIG_NAMESPACE,
+            names[0]!
+          );
+          if (stackCfg?.minioEndpoint) minioEndpoint = stackCfg.minioEndpoint;
+          if (stackCfg?.packagedBucket) packagedBucket = stackCfg.packagedBucket;
         }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        app.log.error(
+          { err },
+          'on-demand packager: failed to resolve stack coordinates'
+        );
+        throw new Error(
+          `on-demand packager: failed to resolve stack coordinates: ${message}`
+        );
       }
       if (!stackName || !minioEndpoint) {
-        // No resolvable stack coordinates — cannot provision the packager. Do
-        // not throw: packaging enqueues onto the shared queue regardless, and a
-        // manually/previously provisioned packager may still consume it.
-        app.log.warn('on-demand packager: stack coordinates unavailable, skipping ensure');
-        return;
+        // No resolvable stack coordinates — cannot provision the packager onto a
+        // known stack. Fail loudly (issue #335) rather than silently skipping,
+        // which left packaging jobs on a queue with no consumer.
+        app.log.error(
+          { stackName },
+          'on-demand packager: stack coordinates unavailable, cannot provision'
+        );
+        throw new Error(
+          'on-demand packager: stack coordinates unavailable (no provisioned stack or missing MinIO endpoint), cannot provision packager'
+        );
       }
+      const resolvedStackName = stackName;
       const result = await packagerEnsureGuard.run({
         osc: packagerApi,
         coords: {
-          stackName,
+          stackName: resolvedStackName,
           redisUrl,
           minioEndpoint,
           packagedBucket,
@@ -737,10 +860,52 @@ function activateScaler(redisUrl: string): void {
         secrets: {
           minioRootPassword: packagerMinioPassword,
           oscPersonalAccessToken: packagerPat
+        },
+        log: app.log,
+        // Record the created packager in the stack's service inventory (issue
+        // #335 acceptance). The packager shares the stack name and is NOT part of
+        // STACK_SERVICES, so it was previously absent from services[]. We append
+        // it (idempotently) so the inventory reflects reality and deprovision can
+        // see it. Best-effort ground-truth read-modify-write against the stored
+        // config; a failure here rethrows into the ensure step (fail loud).
+        recordInInventory: async (instanceName) => {
+          const current = await paramStore.loadStackConfig(
+            STACK_CONFIG_NAMESPACE,
+            resolvedStackName
+          );
+          if (!current) {
+            app.log.warn(
+              { stackName: resolvedStackName },
+              'on-demand packager: stack config missing, cannot record packager in inventory'
+            );
+            return;
+          }
+          const already = current.services.some(
+            (s) =>
+              s.serviceId === PACKAGER_SERVICE_ID &&
+              s.instanceName === instanceName
+          );
+          if (already) return;
+          const updated: StackConfig = {
+            ...current,
+            services: [
+              ...current.services,
+              { serviceId: PACKAGER_SERVICE_ID, instanceName }
+            ]
+          };
+          await paramStore.storeStackConfig(
+            STACK_CONFIG_NAMESPACE,
+            resolvedStackName,
+            updated
+          );
+          app.log.info(
+            { stackName: resolvedStackName, serviceId: PACKAGER_SERVICE_ID },
+            'on-demand packager: recorded instance in stack inventory'
+          );
         }
       });
       if (result.status === 'created') {
-        app.log.info({ stackName }, 'on-demand packager provisioned');
+        app.log.info({ stackName: resolvedStackName }, 'on-demand packager provisioned');
       }
     };
   }
@@ -900,9 +1065,10 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   packagingRedis: sharedRedis,
   pipelineRepository,
   commentRepository,
-  // Validate a named transcode profile against the store so a GPU-only
-  // (NVENC/CUDA) profile that cannot run on this platform is rejected 422
-  // before submission (issue #286).
+  // Profile store for per-profile profileParams key validation (issue #290)
+  // and for validating a named transcode profile so a GPU-only (NVENC/CUDA)
+  // profile that cannot run on this platform is rejected 422 before submission
+  // (issue #286).
   profileRepository
 };
 await app.register(assetsRouter, assetRouterOptions);
@@ -1053,6 +1219,70 @@ const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string
   }
 };
 await app.register(scalerRouter, scalerRouterOptions);
+
+// Archive retention config (issue #325, foundation for #323). Instance-global,
+// hot-reloadable retention window read from ARCHIVE_RETENTION_MS at boot (unset/0
+// = never purge, identical to today). Registered by reference and mirrors the
+// scaler config mechanism: PATCH /api/v1/retention/config hot-swaps the window
+// via a live mutable var + onConfigChange, no restart required.
+const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: string } = {
+  prefix: '/api/v1/retention',
+  retentionMs: archiveRetentionMsFromEnv(),
+  onConfigChange: (cfg) => {
+    archiveRetentionMs = cfg.retentionMs;
+  }
+};
+await app.register(retentionRouter, retentionRouterOptions);
+
+// Archived-asset retention purge sweep (issue #327, part of #323). An
+// INDEPENDENT unref'd, overlap-guarded interval — NOT folded into the Encore
+// scaler tick — that purges archived assets past the retention window and
+// replaces each with a tombstone. Wired here alongside startEncoreCallbackPoller
+// (started inside activateScaler above). It reads the LIVE `archiveRetentionMs`
+// each tick, so it honours PATCH /api/v1/retention/config and is skipped
+// entirely while retention is unset (0/disabled). All sweep deps are resolved
+// per tick from the (default) stack connections so the sweep targets the same
+// concrete repo + buckets the request path uses.
+//
+// purgeToTombstone is NOT on the AssetRepository interface (it is a concrete
+// method on CouchAssetRepository / InMemoryAssetRepository), so the sweep's
+// `purge` callback resolves the concrete `.assets` repo and invokes it directly.
+const archivedAssetPurgeLoop = new ArchivedAssetPurgeLoop({
+  retentionMs: () => archiveRetentionMs,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a),
+    error: (...a: unknown[]) => app.log.error(a)
+  },
+  sweepDeps: {
+    assets: assetRepository,
+    // Resolve the concrete repo and call its purgeToTombstone (doc-replace to a
+    // tombstone). Present on both concrete implementations; typed loosely here
+    // because it is not on the shared AssetRepository interface.
+    purge: async (assetId: string) => {
+      const conns = await stackResolver.resolve();
+      const concrete = conns.assets as unknown as {
+        purgeToTombstone?: (id: string) => Promise<string | undefined> | boolean;
+      };
+      if (typeof concrete.purgeToTombstone !== 'function') {
+        throw new Error('resolved asset repository does not support purgeToTombstone');
+      }
+      return concrete.purgeToTombstone(assetId);
+    },
+    // Build a WorkspaceStorage per target bucket from the resolved stack's MinIO
+    // client (mirrors GET /:id/files). Returns undefined when object storage is
+    // not configured — the sweep then records the tombstone without object
+    // removal, and a later tick reclaims stragglers once storage is available.
+    storageForBucket: (bucket: string): PurgeStorage | undefined => {
+      const conns = stackResolver.resolveCached();
+      if (!conns?.storageClient) return undefined;
+      return new WorkspaceStorage(conns.storageClient, bucket);
+    },
+    sourceBucket
+  }
+});
+archivedAssetPurgeLoop.start(archivePurgeIntervalMsFromEnv());
+
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
 

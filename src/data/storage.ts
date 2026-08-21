@@ -111,6 +111,19 @@ export class WorkspaceStorage {
     return this.client.getObject(this.bucket, this.scopedKey(localKey));
   }
 
+  // Stream a byte range of an object (partial read), backing HTTP Range requests
+  // for segment fetches through the proxy delivery route (issue #339). Maps to
+  // MinIO's getPartialObject(bucket, key, offset, length?): a `length` of
+  // undefined streams from `offset` to the end of the object. Like getObject,
+  // this uses the stack's admin credentials so the packaged bucket stays private.
+  async getPartialObject(
+    localKey: string,
+    offset: number,
+    length?: number
+  ): Promise<import('stream').Readable> {
+    return this.client.getPartialObject(this.bucket, this.scopedKey(localKey), offset, length);
+  }
+
   // -------------------------------------------------------------------------
   // Multipart / chunked upload (issue #4).
   //
@@ -220,5 +233,49 @@ export class WorkspaceStorage {
       stream.on('end', () => resolve(keys));
       stream.on('error', reject);
     });
+  }
+
+  // List every object key under a prefix, recursively. Drains the full
+  // listObjectsV2 stream so all pages are collected before returning — the
+  // minio client emits one 'data' event per object across every internal
+  // continuation page, so there is no truncation to guard against here.
+  private async listUnderPrefix(prefix: string): Promise<string[]> {
+    const key = this.scopedKey(prefix);
+    const keys: string[] = [];
+    const stream = this.client.listObjectsV2(this.bucket, key, true);
+    return await new Promise<string[]>((resolve, reject) => {
+      stream.on('data', (obj) => {
+        if (obj.name) {
+          keys.push(obj.name);
+        }
+      });
+      stream.on('end', () => resolve(keys));
+      stream.on('error', reject);
+    });
+  }
+
+  // Bulk-delete every object under a prefix (foundation for retention sweep,
+  // issue #325). Pages through all listObjectsV2 results, then removes the
+  // matched objects via removeObjects. A prefix with no objects is a no-op
+  // (removeObjects is never called). removeObjects reports per-object failures
+  // in its response array rather than rejecting, so any reported error is
+  // surfaced by throwing after the batch completes.
+  async removeObjectsUnderPrefix(prefix: string): Promise<void> {
+    const keys = await this.listUnderPrefix(prefix);
+    if (keys.length === 0) {
+      return;
+    }
+    const results = await this.client.removeObjects(this.bucket, keys);
+    const failures = results.filter(
+      (r): r is { Error?: { Code?: string; Message?: string; Key?: string } } =>
+        r != null && r.Error != null
+    );
+    if (failures.length > 0) {
+      const first = failures[0]?.Error;
+      throw new Error(
+        `failed to delete ${failures.length} object(s) under prefix "${prefix}"` +
+          (first?.Key ? `: ${first.Key} (${first.Code ?? 'unknown'})` : '')
+      );
+    }
   }
 }

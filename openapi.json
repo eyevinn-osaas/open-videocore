@@ -248,8 +248,40 @@
                       "enum": [
                         "provisioning",
                         "ready",
-                        "failed"
+                        "failed",
+                        "degraded"
                       ]
+                    },
+                    "reason": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "stack_provisioning",
+                            "stack_provisioning_failed",
+                            "core_capability_missing",
+                            "packaging_capability_missing"
+                          ]
+                        },
+                        "capability": {
+                          "type": "string",
+                          "enum": [
+                            "storage",
+                            "database",
+                            "queue",
+                            "packaging"
+                          ]
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ],
+                      "additionalProperties": false
                     },
                     "minioEndpoint": {
                       "type": "string"
@@ -2298,6 +2330,20 @@
                   "description": {
                     "type": "string",
                     "maxLength": 2048
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "maxItems": 128
                   }
                 },
                 "required": [
@@ -3635,6 +3681,28 @@
                 }
               }
             }
+          },
+          "410": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       },
@@ -4886,6 +4954,29 @@
           }
         ],
         "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "assetId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "assetId",
+                    "status"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "202": {
             "description": "Default Response",
             "content": {
@@ -5054,6 +5145,12 @@
                       "outputs"
                     ],
                     "additionalProperties": false
+                  },
+                  "profileParams": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
                   }
                 },
                 "additionalProperties": false
@@ -5089,6 +5186,28 @@
                   "required": [
                     "jobId",
                     "encoreJobId"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -5444,6 +5563,12 @@
                       "outputs"
                     ],
                     "additionalProperties": false
+                  },
+                  "profileParams": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
                   },
                   "destinationBucket": {
                     "type": "string",
@@ -9664,6 +9789,417 @@
         }
       }
     },
+    "/api/v1/assets/{id}/restore": {
+      "post": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "slug": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "uploading",
+                        "processing",
+                        "ready",
+                        "failed",
+                        "archived"
+                      ]
+                    },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
+                    "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
+                      "type": "string"
+                    },
+                    "objectKey": {
+                      "type": "string"
+                    },
+                    "statusHistory": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "at": {
+                            "type": "string"
+                          },
+                          "from": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ],
+                            "nullable": true
+                          },
+                          "to": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "at",
+                          "from",
+                          "to"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "technicalMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "codec": {
+                          "type": "string"
+                        },
+                        "width": {
+                          "type": "number"
+                        },
+                        "height": {
+                          "type": "number"
+                        },
+                        "durationSeconds": {
+                          "type": "number"
+                        },
+                        "bitrateBps": {
+                          "type": "number"
+                        },
+                        "containerFormat": {
+                          "type": "string"
+                        },
+                        "audioTracks": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "index": {
+                                "type": "number"
+                              },
+                              "codec": {
+                                "type": "string"
+                              },
+                              "channels": {
+                                "type": "number"
+                              },
+                              "sampleRateHz": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "index",
+                              "codec",
+                              "channels",
+                              "sampleRateHz"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "extractedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "width",
+                        "height",
+                        "durationSeconds",
+                        "bitrateBps",
+                        "containerFormat",
+                        "audioTracks",
+                        "extractedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
+                      "type": "string"
+                    },
+                    "manifestUrls": {
+                      "type": "object",
+                      "properties": {
+                        "hls": {
+                          "type": "string"
+                        },
+                        "dash": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "packagingError": {
+                      "type": "string"
+                    },
+                    "renditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "label",
+                          "width",
+                          "height",
+                          "objectKey"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "thumbnails": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "metadata": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "audioTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "channels": {
+                            "type": "number"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "subtitleTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "format": {
+                            "type": "string",
+                            "enum": [
+                              "vtt",
+                              "srt",
+                              "ttml"
+                            ]
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language",
+                          "format"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "status",
+                    "statusHistory",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/jobs/": {
       "get": {
         "parameters": [
@@ -10523,6 +11059,12 @@
                     },
                     "additionalProperties": true
                   },
+                  "profileParams": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
                   "progressCallbackUri": {
                     "type": "string"
                   }
@@ -11307,6 +11849,79 @@
                     "maxInstances",
                     "minInstances",
                     "idleTimeoutMs"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/retention/config": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "retentionMs": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "retentionMs"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "retentionMs": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "retentionMs": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "retentionMs"
                   ],
                   "additionalProperties": false
                 }
