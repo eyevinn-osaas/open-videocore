@@ -42,6 +42,7 @@ import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-clie
 import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
 import type { SceneDetector } from '../pipeline/scene-detector.js';
 import type { Context } from '@osaas/client-core';
+import type { ResolverHealthSignal } from './resolver-health.js';
 
 // Builders that turn a stored optional-service instance name (from the stack
 // record) into the corresponding pipeline-step generator (issue #217). main.ts
@@ -57,6 +58,32 @@ export type OptionalStepBuilders = {
 };
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+
+// Minimal logger surface (compatible with Fastify's logger). Injected so the
+// read-path diagnostics (issue #415, info/warn) and a transient parameter-store
+// refresh failure (issue #419, error) are observable instead of being silently
+// swallowed. Defaults to a noop so callers/tests that don't wire a logger keep
+// working.
+export type StackResolverLogger = {
+  info: (obj: unknown, msg?: string) => void;
+  warn: (obj: unknown, msg?: string) => void;
+  error: (obj: unknown, msg?: string) => void;
+};
+
+const noopLogger: StackResolverLogger = {
+  info: () => {},
+  warn: () => {},
+  error: () => {}
+};
+
+// Maximum staleness bound for the last-known-good fallback (issue #420,
+// architect sign-off condition 1). When a param-store refresh THROWS on a
+// cache-miss but a prior successful ready-stack resolution exists, keep serving
+// that resolution rather than dropping to no-storage — but only while within
+// MAX_STALE_MS measured from the ORIGINAL successful resolve time (12x
+// CACHE_TTL_MS = 1h). Past this bound we drop to no-storage; we never serve a
+// stale ready-stack resolution indefinitely.
+const MAX_STALE_MS = 60 * 60 * 1000; // 1h = 12x CACHE_TTL_MS
 
 export type WorkspaceConnections = {
   assets: AssetRepository;
@@ -90,7 +117,20 @@ export type WorkspaceConnections = {
   sceneDetector: SceneDetector | undefined;
 };
 
-type CacheEntry = { connections: WorkspaceConnections; expiresAt: number };
+// A cached resolution. `fromReadyStack` records whether `connections` were
+// built from a real ready-stack config (buildConnectionsFromStack /
+// isReadyStack) versus an env-override or no-storage in-memory fallback — only
+// the former is eligible for the last-known-good fallback (issue #420,
+// architect invariant: last-known-good applies ONLY to a prior entry built from
+// a real ready-stack config, never to a cached in-memory fallback).
+// `resolvedAt` is the ORIGINAL successful resolve time and is preserved across
+// TTL refreshes so MAX_STALE_MS is measured from first success, not last serve.
+type CacheEntry = {
+  connections: WorkspaceConnections;
+  expiresAt: number;
+  fromReadyStack: boolean;
+  resolvedAt: number;
+};
 
 // True if the value is a non-empty, parseable absolute URL. A partially
 // provisioned stack can persist empty-string coordinates; feeding those to nano
@@ -309,6 +349,17 @@ export class WorkspaceStackResolver {
   private minioPassword: string;
   private couchPassword: string;
   private optionalSteps: OptionalStepBuilders;
+  // Aggregate degraded-resolution signal (issue #422). When supplied the
+  // resolver emits on every degraded fallback (no-storage / stale
+  // last-known-good) so an operator can detect a degraded-but-not-crashed
+  // instance via /health without logs.
+  private resolverHealth: ResolverHealthSignal | undefined;
+  // Diagnostic/observability logger. `info`/`warn` carry the read-path
+  // diagnostics (issue #415: (namespace, stack name) correlation on each
+  // resolve); `error` surfaces a transient parameter-store refresh failure
+  // instead of silently swallowing it (issue #419). Defaults to a noop so
+  // existing callers/tests are unaffected.
+  private log: StackResolverLogger;
 
   constructor(opts: {
     paramStore: ParamStore | undefined;
@@ -319,12 +370,23 @@ export class WorkspaceStackResolver {
     // stack record (issue #217). Optional so callers/tests that don't wire the
     // optional services get the graceful-skip behaviour (steps disabled).
     optionalSteps?: OptionalStepBuilders;
+    // Aggregate degraded-resolution signal (issue #422). Optional so existing
+    // callers/tests are unaffected; when supplied the resolver emits on every
+    // degraded fallback (no-storage / stale last-known-good) so an operator can
+    // detect a degraded-but-not-crashed instance via /health without logs.
+    resolverHealth?: ResolverHealthSignal;
+    // Injected logger so read-path diagnostics (issue #415) and transient
+    // parameter-store refresh failures (issue #419) are observable. Optional;
+    // defaults to a noop for callers/tests that don't wire one.
+    log?: StackResolverLogger;
   }) {
     this.paramStore = opts.paramStore;
     this.oscContext = opts.oscContext;
     this.minioPassword = opts.minioPassword;
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
+    this.resolverHealth = opts.resolverHealth;
+    this.log = opts.log ?? noopLogger;
   }
 
   // Resolve the backing-service connections for a workspace. When `stackName`
@@ -342,12 +404,27 @@ export class WorkspaceStackResolver {
     // bypassing the parameter store entirely.
     const envConnections = buildEnvConnections(this.oscContext);
     if (envConnections) {
-      this.cache.set(cacheKey, { connections: envConnections, expiresAt: Date.now() + CACHE_TTL_MS });
+      // Explicit env override is an intended, healthy configuration — not a
+      // degraded fallback. Clear any prior degraded gauge (issue #422).
+      this.resolverHealth?.markHealthy();
+      // Env-override is not a ready-stack resolution: it is never eligible for
+      // the last-known-good fallback (invariant: env-override path unchanged).
+      this.cache.set(cacheKey, {
+        connections: envConnections,
+        expiresAt: Date.now() + CACHE_TTL_MS,
+        fromReadyStack: false,
+        resolvedAt: Date.now()
+      });
       return envConnections;
     }
 
     const ps = this.paramStore;
-    if (!ps) return buildInMemoryConnections();
+    if (!ps) {
+      // No parameter store configured: the resolver serves no-op in-memory
+      // (no-storage) connections. Signal this degraded state (issue #422).
+      this.resolverHealth?.markNoStorageFallback();
+      return buildInMemoryConnections();
+    }
 
     // Resolve the stack config: an explicit stack name addresses that stack
     // directly; otherwise use the first provisioned stack as the workspace
@@ -355,6 +432,14 @@ export class WorkspaceStackResolver {
     let config: StackConfig | undefined;
     try {
       if (stackName) {
+        // READ-PATH diagnostic (issue #415): the resolver reads by the
+        // X-Stack-Name-derived name under STACK_CONFIG_NAMESPACE. This is the
+        // (namespace, name) pair whose derived key must equal the key the
+        // provision route wrote; the param-store client logs the concrete key.
+        this.log?.info?.(
+          { source: 'x-stack-name', namespace: STACK_CONFIG_NAMESPACE, stackName },
+          'resolver reading stack config by requested name'
+        );
         config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
@@ -362,18 +447,75 @@ export class WorkspaceStackResolver {
         // all storage/asset operations.
         if (!config) {
           const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+          this.log?.info?.(
+            { namespace: STACK_CONFIG_NAMESPACE, requested: stackName, listed: names },
+            'requested stack not found; falling back to first listed stack'
+          );
           if (names.length > 0) {
             config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
           }
         }
       } else {
+        // READ-PATH diagnostic (issue #415): no X-Stack-Name header, so the
+        // resolver uses the FIRST listed stack as the default. If the list is
+        // empty here but the provision route logged a successful write, the
+        // write key and the list prefix disagree — a read-side namespace/key bug.
         const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+        this.log?.info?.(
+          { source: 'default', namespace: STACK_CONFIG_NAMESPACE, listed: names },
+          'resolver reading default stack config (no X-Stack-Name)'
+        );
         if (names.length > 0) {
           config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
         }
       }
-    } catch {
-      // Fall through to in-memory
+    } catch (err) {
+      // A THROWN refresh error means we couldn't refresh — NOT that the stack
+      // ceased to exist (issue #420, architect sign-off). We must no longer
+      // swallow it silently (issue #419): log the real error with message +
+      // stack, the stack identifier, the read namespace (issue #415
+      // correlation), and the outcome, so a subsequent 501 from
+      // GET /api/v1/storage/buckets is traceable — whether we serve
+      // last-known-good or fall through to no-storage.
+      const servingLastKnownGood =
+        !!cached &&
+        cached.fromReadyStack &&
+        Date.now() - cached.resolvedAt < MAX_STALE_MS;
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE,
+          stackName: stackName ?? '(workspace default)',
+          fallback: servingLastKnownGood
+            ? 'last-known-good (stale ready-stack resolution)'
+            : 'in-memory (no object storage)'
+        },
+        'stack resolver: parameter-store refresh failed; serving fallback resolution'
+      );
+      // If a prior successful ready-stack resolution is still in cache and
+      // within the MAX_STALE_MS bound (measured from its ORIGINAL resolve time),
+      // serve that last-known-good resolution rather than dropping to
+      // no-storage — a previously-healthy instance must not return 501 for all
+      // storage ops on a single failed refresh. Only a THROWN error takes this
+      // path: a successful load returning `undefined` (genuine 404 /
+      // never-persisted #413) falls through below and drops to no-storage — we
+      // never fabricate a stack. Ordering (architect condition 2):
+      // last-known-good is the post-failure path only; any future retry (#421)
+      // runs before we get here.
+      if (servingLastKnownGood && cached) {
+        // Serving stale-but-good ready-stack connections is a degraded (but not
+        // crashed) state: signal it so /health surfaces the stale fallback
+        // (issue #422).
+        this.resolverHealth?.markStaleLastKnownGood();
+        // Serve stale-but-good WITHOUT extending expiresAt or resetting
+        // resolvedAt: the entry stays past-TTL so the next request re-attempts a
+        // fresh refresh, and MAX_STALE_MS keeps counting from first success so
+        // we never serve indefinitely.
+        return cached.connections;
+      }
+      // No eligible last-known-good (first-resolve-at-boot, an in-memory/
+      // env-override prior entry, or past MAX_STALE_MS): fall through to
+      // no-storage, unchanged from prior behaviour.
     }
 
     // A partially-provisioned/failed stack must never be treated as a live,
@@ -383,12 +525,32 @@ export class WorkspaceStackResolver {
     // them here. buildConnectionsFromStack also returns null for empty/invalid
     // coordinates (issue #105 defence-in-depth). In every skip case we fall back
     // to no-op in-memory connections so /health and infra routes stay up.
-    const connections =
-      (config && isReadyStack(config)
+    const built =
+      config && isReadyStack(config)
         ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps)
-        : null) ?? buildInMemoryConnections();
+        : null;
 
-    this.cache.set(cacheKey, { connections, expiresAt: Date.now() + CACHE_TTL_MS });
+    // Emit the aggregate degraded-resolution signal (issue #422): a null build
+    // here means we could not connect a ready stack and are dropping to the
+    // no-op in-memory (no-storage) fallback. A live build is healthy and clears
+    // any prior degraded gauge.
+    if (built) {
+      this.resolverHealth?.markHealthy();
+    } else {
+      this.resolverHealth?.markNoStorageFallback();
+    }
+
+    const connections = built ?? buildInMemoryConnections();
+
+    // Only a resolution built from a real ready-stack config is eligible to be
+    // served as last-known-good on a later failed refresh (issue #420
+    // invariant). A no-storage in-memory fallback is not.
+    this.cache.set(cacheKey, {
+      connections,
+      expiresAt: Date.now() + CACHE_TTL_MS,
+      fromReadyStack: built !== null,
+      resolvedAt: Date.now()
+    });
     return connections;
   }
 

@@ -1155,6 +1155,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       }
@@ -1200,11 +1222,15 @@
                     },
                     "skipped": {
                       "type": "boolean"
+                    },
+                    "builtinSeeded": {
+                      "type": "number"
                     }
                   },
                   "required": [
                     "seeded",
-                    "skipped"
+                    "skipped",
+                    "builtinSeeded"
                   ],
                   "additionalProperties": false
                 }
@@ -1396,6 +1422,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       },
@@ -1541,7 +1589,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -1946,7 +1995,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                           },
                           "slug": {
                             "type": "string"
@@ -2325,7 +2375,8 @@
                   "name": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": 256
+                    "maxLength": 256,
+                    "description": "Legacy alias for `title` (issue #347). The editorial title of the asset. `title` and `name` are two input spellings of the SAME canonical field: both persist to `descriptive.title` and are read back as the `name` property on GET /assets/:id, list, and search responses. Prefer `title`; `title` wins when both are supplied."
                   },
                   "description": {
                     "type": "string",
@@ -2334,7 +2385,8 @@
                   "title": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": 256
+                    "maxLength": 256,
+                    "description": "The editorial title of the asset (issue #347). This is the canonical write path for title: it persists to `descriptive.title` and is read back as the `name` property on GET /assets/:id, list, and search responses (there is NO separate top-level `title` field on responses). Accepted as an alias of `name`; `title` wins when both are supplied."
                   },
                   "tags": {
                     "type": "array",
@@ -2449,6 +2501,11 @@
     },
     "/api/v1/assets/search": {
       "get": {
+        "summary": "DEPRECATED \u2014 use GET /api/v1/search/",
+        "tags": [
+          "search"
+        ],
+        "description": "Deprecated free-text alias. Use the canonical `GET /api/v1/search/?q=<term>` endpoint instead, which serves the same free-text results plus tag, mimeType, metadata, and TAMS filters with `total`/`page` pagination. This alias only accepts `q` and returns `{ items }`; it is retained for backward compatibility and will be removed in a future major version.",
         "parameters": [
           {
             "schema": {
@@ -2457,9 +2514,11 @@
             },
             "in": "query",
             "name": "q",
-            "required": true
+            "required": true,
+            "description": "Case-insensitive free-text query matched against the asset title (the canonical `name` field, persisted at `descriptive.title`) and description \u2014 regardless of whether the client set the title through the ingest `title` field or the legacy `name` alias (issue #347)."
           }
         ],
+        "deprecated": true,
         "responses": {
           "200": {
             "description": "Default Response",
@@ -2477,7 +2536,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                           },
                           "slug": {
                             "type": "string"
@@ -2868,7 +2928,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                           },
                           "slug": {
                             "type": "string"
@@ -3320,7 +3381,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -3779,7 +3841,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -4269,7 +4332,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                           },
                           "slug": {
                             "type": "string"
@@ -5151,6 +5215,66 @@
                     "additionalProperties": {
                       "type": "string"
                     }
+                  },
+                  "burnIn": {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "anyOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "sidecarKey"
+                                ]
+                              },
+                              "objectKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "objectKey"
+                            ],
+                            "additionalProperties": false
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "subtitleTrack"
+                                ]
+                              },
+                              "trackId": {
+                                "type": "string",
+                                "minLength": 1
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "trackId"
+                            ],
+                            "additionalProperties": false
+                          }
+                        ],
+                        "description": "Caption source, resolved to one workspace-local sidecar object key. Burn-in supports srt and vtt only; a ttml source (or track) is rejected with 422 (ADR-014 D4)."
+                      },
+                      "forceStyle": {
+                        "type": "string",
+                        "maxLength": 512,
+                        "description": "Optional styling/positioning override. Default styling is whatever the sidecar carries (vtt cue settings convey position/styling; srt conveys none, so the renderer defaults apply). This is NOT a free-form ffmpeg filter string: it is a comma-separated list of 'Key=Value' libass style directives drawn from an allowlist (FontName, FontSize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, Outline, Shadow, Spacing, Alignment, MarginL, MarginR, MarginV, BorderStyle). Positioning is expressed via Alignment (numpad 1-9) and MarginV. Values may only use letters, digits and the limited set '&#.+%- '; any quote, comma (outside the separator), colon, semicolon, backslash or newline is rejected with 422. Example: \"FontName=Sans,FontSize=24,Alignment=2,MarginV=40\"."
+                      }
+                    },
+                    "required": [
+                      "source"
+                    ],
+                    "additionalProperties": false
                   }
                 },
                 "additionalProperties": false
@@ -5181,6 +5305,41 @@
                     },
                     "encoreJobId": {
                       "type": "string"
+                    },
+                    "warning": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "profile_params_unvalidated"
+                          ],
+                          "description": "Stable machine-readable warning code."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Human-readable explanation naming the profile and the unvalidated keys."
+                        },
+                        "profile": {
+                          "type": "string",
+                          "description": "The profile name whose declared params could not be resolved."
+                        },
+                        "unvalidatedKeys": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "The profileParams keys that were forwarded to Encore without validation."
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "profile",
+                        "unvalidatedKeys"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Present only when profileParams validation could not be performed because the profile YAML was unresolvable (a custom profile not in the store, or the profile store was unreachable). The request was still accepted and the keys were forwarded to Encore unchecked."
                     }
                   },
                   "required": [
@@ -6655,7 +6814,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -7166,7 +7326,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -7681,7 +7842,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -8590,7 +8752,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -8988,7 +9151,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -9402,7 +9566,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -9813,7 +9978,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -10298,6 +10464,39 @@
                               "type": "string"
                             }
                           },
+                          "encodeAttempts": {
+                            "type": "number"
+                          },
+                          "encodeAttemptLog": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "index": {
+                                  "type": "number"
+                                },
+                                "startedAt": {
+                                  "type": "string"
+                                },
+                                "endedAt": {
+                                  "type": "string"
+                                },
+                                "classification": {
+                                  "type": "string",
+                                  "enum": [
+                                    "transport",
+                                    "io-retryable",
+                                    "deterministic"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "index",
+                                "startedAt"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -10416,6 +10615,39 @@
                         "type": "string"
                       }
                     },
+                    "encodeAttempts": {
+                      "type": "number"
+                    },
+                    "encodeAttemptLog": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number"
+                          },
+                          "startedAt": {
+                            "type": "string"
+                          },
+                          "endedAt": {
+                            "type": "string"
+                          },
+                          "classification": {
+                            "type": "string",
+                            "enum": [
+                              "transport",
+                              "io-retryable",
+                              "deterministic"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "index",
+                          "startedAt"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -10465,6 +10697,7 @@
         }
       },
       "get": {
+        "description": "Read a single job. For transcode jobs, `encodeAttempts` is the number of Encore dispatches and `encodeAttemptLog` records each dispatch in order (index, startedAt, endedAt?, classification?). This is DISTINCT from `attempts`, which counts ingest/URL-pull attempts. To obtain the elapsed time of the successful encode alone (excluding retries), read the LAST entry of `encodeAttemptLog` and compute endedAt \u2212 startedAt.",
         "parameters": [
           {
             "schema": {
@@ -10541,6 +10774,39 @@
                       "type": "array",
                       "items": {
                         "type": "string"
+                      }
+                    },
+                    "encodeAttempts": {
+                      "type": "number"
+                    },
+                    "encodeAttemptLog": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number"
+                          },
+                          "startedAt": {
+                            "type": "string"
+                          },
+                          "endedAt": {
+                            "type": "string"
+                          },
+                          "classification": {
+                            "type": "string",
+                            "enum": [
+                              "transport",
+                              "io-retryable",
+                              "deterministic"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "index",
+                          "startedAt"
+                        ],
+                        "additionalProperties": false
                       }
                     },
                     "createdAt": {
@@ -11933,6 +12199,11 @@
     },
     "/api/v1/search/": {
       "get": {
+        "summary": "Search assets",
+        "tags": [
+          "search"
+        ],
+        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset in the workspace. Results are paginated via `page`/`pageSize` and returned as `{ assets, total, page }`.",
         "parameters": [
           {
             "schema": {
@@ -11942,7 +12213,8 @@
             },
             "in": "query",
             "name": "q",
-            "required": false
+            "required": false,
+            "description": "Case-insensitive free-text query matched against the asset title (the canonical `name` field, persisted at `descriptive.title`) and description. Matches title whether the client set it through the ingest `title` field or the legacy `name` alias (issue #347)."
           },
           {
             "schema": {
@@ -12027,7 +12299,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset (persisted at `descriptive.title`). The free-text `q` parameter matches against this field regardless of whether the client set the title through the ingest `title` field or the legacy `name` alias."
                           },
                           "description": {
                             "type": "string"

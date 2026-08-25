@@ -64,6 +64,14 @@ import {
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
+import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
+import {
+  resolveBurnInSource,
+  buildSubtitlesFilter,
+  checkBurnInObjectAvailable,
+  validateForceStyle,
+  BURN_IN_FORCE_STYLE_MAX_LENGTH
+} from '../pipeline/burn-in.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
@@ -97,8 +105,14 @@ import {
   packagedRelocationOrigin,
   proxyManifestUrlsFor
 } from '../pipeline/packaging.js';
+import {
+  isManifestPath,
+  rewriteManifest,
+  type ManifestRewriteContext
+} from '../pipeline/manifest-rewrite.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
+import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
@@ -146,11 +160,49 @@ const customProfileSchema = z.object({
 // injection surface). Values omitted -> unchanged default output.
 const profileParamsSchema = z.record(z.string(), z.string());
 
+// Burn-in caption source (issue #388, ADR-014 D2; styling contract hardened by
+// issue #390). Optional + additive: absent => no burn-in, today's transcodes
+// unchanged. `source` is a discriminated union on `type`. Format gating (srt/vtt
+// only, ttml rejected) and objectKey resolution happen in the handler
+// (resolveBurnInSource) so the not-ready/not-found/unsupported cases map to
+// descriptive 4xx responses rather than opaque schema errors.
+//
+// STYLING CONTRACT (issue #390): the default on-screen appearance is WHATEVER THE
+// SIDECAR CARRIES — a vtt sidecar's cue settings convey position/styling; an srt
+// sidecar conveys none, so the burn-in renderer's defaults apply. `forceStyle` is
+// an OPTIONAL, EXPLICIT, VALIDATED override — NOT a free-form ffmpeg filter
+// string. It is a comma-separated list of `Key=Value` libass style directives
+// where every Key is allowlisted (validateForceStyle / BURN_IN_ALLOWED_STYLE_KEYS
+// in ../pipeline/burn-in.ts) and every Value uses a strict safe charset. Any value
+// containing quotes, commas (outside the separator), colons, semicolons,
+// backslashes or newlines — i.e. anything that could escape `force_style='...'`
+// and inject filtergraph content — is REJECTED with a 422 (see the handler). The
+// schema bounds length; the exact allowlist/charset check runs in the handler so
+// the rejection carries a specific, actionable message.
+const burnInSchema = z.object({
+  source: z
+    .discriminatedUnion('type', [
+      z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
+      z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
+    ])
+    .describe(
+      'Caption source, resolved to one workspace-local sidecar object key. Burn-in supports srt and vtt only; a ttml source (or track) is rejected with 422 (ADR-014 D4).'
+    ),
+  forceStyle: z
+    .string()
+    .max(BURN_IN_FORCE_STYLE_MAX_LENGTH)
+    .optional()
+    .describe(
+      "Optional styling/positioning override. Default styling is whatever the sidecar carries (vtt cue settings convey position/styling; srt conveys none, so the renderer defaults apply). This is NOT a free-form ffmpeg filter string: it is a comma-separated list of 'Key=Value' libass style directives drawn from an allowlist (FontName, FontSize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, Outline, Shadow, Spacing, Alignment, MarginL, MarginR, MarginV, BorderStyle). Positioning is expressed via Alignment (numpad 1-9) and MarginV. Values may only use letters, digits and the limited set '&#.+%- '; any quote, comma (outside the separator), colon, semicolon, backslash or newline is rejected with 422. Example: \"FontName=Sans,FontSize=24,Alignment=2,MarginV=40\"."
+    )
+});
+
 const transcodeBodySchema = z
   .object({
     profile: z.string().min(1).optional(),
     customProfile: customProfileSchema.optional(),
-    profileParams: profileParamsSchema.optional()
+    profileParams: profileParamsSchema.optional(),
+    burnIn: burnInSchema.optional()
   })
   .refine((b) => !(b.profile && b.customProfile), {
     message: 'specify either profile or customProfile, not both'
@@ -158,7 +210,36 @@ const transcodeBodySchema = z
 
 const transcodeAcceptedSchema = z.object({
   jobId: z.string(),
-  encoreJobId: z.string()
+  encoreJobId: z.string(),
+  // Non-fatal notice (issue #394). Present ONLY when profileParams validation
+  // could not be performed because the profile YAML was unresolvable — either a
+  // custom profile that is not in the operator profile store, or the profile
+  // store was unreachable. The request was still accepted (202) and the
+  // profileParams keys were forwarded to Encore UNCHECKED. Absent when the keys
+  // were validated against the profile's declared params, or when the request
+  // carried no profileParams at all.
+  warning: z
+    .object({
+      code: z
+        .literal('profile_params_unvalidated')
+        .describe('Stable machine-readable warning code.'),
+      message: z
+        .string()
+        .describe('Human-readable explanation naming the profile and the unvalidated keys.'),
+      profile: z
+        .string()
+        .describe('The profile name whose declared params could not be resolved.'),
+      unvalidatedKeys: z
+        .array(z.string())
+        .describe('The profileParams keys that were forwarded to Encore without validation.')
+    })
+    .describe(
+      'Present only when profileParams validation could not be performed because the ' +
+        'profile YAML was unresolvable (a custom profile not in the store, or the profile ' +
+        'store was unreachable). The request was still accepted and the keys were forwarded ' +
+        'to Encore unchecked.'
+    )
+    .optional()
 });
 
 // Free-form, operator-defined metadata (issue #12). Values must be
@@ -431,7 +512,19 @@ const tracksSchema = z.object({
 
 const assetSchema = z.object({
   id: z.string(),
-  name: z.string(),
+  // Canonical editorial title of the asset (issue #347). This is the ONE
+  // documented location for title on every response — GET /assets/:id, list,
+  // and search all expose title here as `name`. There is no separate top-level
+  // `title` field on responses; on ingest the `title` (or legacy `name`) input
+  // persists to `descriptive.title` (asset-document.ts) and surfaces here.
+  name: z
+    .string()
+    .describe(
+      'Canonical editorial title of the asset. Set on ingest via `title` (or ' +
+        'the legacy `name` alias) and persisted to `descriptive.title`; this ' +
+        'is the single documented location for title across GET, list, and ' +
+        'search responses. There is no separate top-level `title` field.'
+    ),
   // Human-readable, URL-safe slug (issue #131). Present on assets created after
   // slugs were introduced; absent/undefined for pre-existing slug-less assets.
   slug: z.string().optional(),
@@ -685,9 +778,32 @@ const commentSchema = z.object({
 const ingestUrlSchema = z
   .object({
     sourceUrl: z.string().min(1).max(4096),
-    name: z.string().min(1).max(256).optional(),
+    name: z
+      .string()
+      .min(1)
+      .max(256)
+      .optional()
+      .describe(
+        'Legacy alias for `title` (issue #347). The editorial title of the ' +
+          'asset. `title` and `name` are two input spellings of the SAME ' +
+          'canonical field: both persist to `descriptive.title` and are read ' +
+          'back as the `name` property on GET /assets/:id, list, and search ' +
+          'responses. Prefer `title`; `title` wins when both are supplied.'
+      ),
     description: z.string().max(2048).optional(),
-    title: z.string().min(1).max(256).optional(),
+    title: z
+      .string()
+      .min(1)
+      .max(256)
+      .optional()
+      .describe(
+        'The editorial title of the asset (issue #347). This is the ' +
+          'canonical write path for title: it persists to `descriptive.title` ' +
+          'and is read back as the `name` property on GET /assets/:id, list, ' +
+          'and search responses (there is NO separate top-level `title` field ' +
+          'on responses). Accepted as an alias of `name`; `title` wins when ' +
+          'both are supplied.'
+      ),
     tags: tagsSchema.optional()
   })
   .strict();
@@ -761,6 +877,44 @@ function assetsBaseUrl(requestUrl: string): string {
   return prefix;
 }
 
+// True when `value` is an absolute URL (has a scheme + host a player can fetch),
+// false for a bare path like `/openvideocore-packaged/<id>/index.m3u8`. Used by
+// the delivery endpoint (issue #341) to decide whether a resolved manifest URL
+// is already externally resolvable or must be routed through the stream proxy.
+function isAbsoluteUrl(value: string): boolean {
+  try {
+    // The URL constructor throws on a relative/bare path (no base), so a
+    // successful parse means the value carries a scheme + authority.
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The absolute-or-relative URL prefix, up to and INCLUDING the `<id>/stream`
+// segment (no trailing slash), that a proxied manifest's child references must
+// be rewritten against so they resolve back through this route (issue #340).
+// `requestUrl` is the full mounted request path, e.g.
+// `/api/v1/assets/<id>/stream/v0/playlist.m3u8`; `wildcard` is the object path
+// captured by `*` (e.g. `v0/playlist.m3u8`). We strip the wildcard (and its
+// leading slash) off the path to recover `.../assets/<id>/stream`, then prefix
+// the configured PUBLIC_BASE_URL when set (12-factor; mirrors assetsBaseUrl) so
+// the rewritten URLs share the origin the delivery endpoint advertises. Falls
+// back to the same-origin relative path when PUBLIC_BASE_URL is unset.
+function streamProxyBaseUrl(requestUrl: string, wildcard: string): string {
+  const pathOnly = requestUrl.split('?')[0];
+  const suffix = wildcard.replace(/^\/+/, '');
+  // Remove the wildcard tail (and the slash separating it from `stream`).
+  let base = pathOnly;
+  if (suffix.length > 0 && base.endsWith(suffix)) {
+    base = base.slice(0, base.length - suffix.length);
+  }
+  base = base.replace(/\/+$/, '');
+  const configured = process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, '');
+  return configured ? `${configured}${base}` : base;
+}
+
 // Content-Type for a packaged object served through the proxy route (issue
 // #201), inferred from its extension. Covers the CMAF/HLS/DASH file types the
 // packager emits; unknown types fall back to a generic binary stream so the
@@ -785,6 +939,20 @@ function contentTypeForPackagedObject(relativePath: string): string {
   if (lower.endsWith('.ts')) return 'video/mp2t';
   if (lower.endsWith('.vtt')) return 'text/vtt';
   return 'application/octet-stream';
+}
+
+// Buffer a Readable object body into a UTF-8 string. Used only for manifests
+// (small text files) served through the proxy delivery route, which are rewritten
+// before sending (issue #340). Segment bodies are NEVER buffered — they stream
+// through untouched — so this stays bounded to manifest-sized payloads.
+async function readStreamToString(
+  stream: import('stream').Readable
+): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 // Parse a single-range HTTP `Range` header of the form `bytes=<start>-<end>`
@@ -961,6 +1129,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     if (!stored) return undefined;
     if (isProfileRunnable(stored.yaml)) return undefined;
     return `profile "${profileName}" requires GPU (NVENC/CUDA) hardware encoding, which is not available on this platform — choose a CPU-encoded profile`;
+  }
+
+  // Resolve whether a named transcode profile declares colour signalling that is
+  // not carriable at its pixel format (issue #377): e.g. an 8-bit stream tagged
+  // PQ/HLG or BT.2020, HDR10 mastering metadata on a non-PQ output, or mastering
+  // metadata on an HLG output. Returns a human message naming both offending
+  // values so the caller can reject with a clear 422 BEFORE an encode is paid
+  // for, rather than shipping a mistagged output. Returns undefined (allow) when
+  // no profile store is wired, no profile name was given, the named profile is
+  // unknown to the store (forwarded verbatim — Encore resolves or rejects it),
+  // or the profile's colour signalling is carriable (including legitimate 10-bit
+  // SDR and genuine HDR10/HLG profiles).
+  async function uncarriableColourReason(profileName: string | undefined): Promise<string | undefined> {
+    if (!profileName || !opts.profileRepository) return undefined;
+    const stored = await opts.profileRepository.get(profileName);
+    if (!stored) return undefined;
+    const check = validateProfileColourSignalling(stored.yaml);
+    if (check.ok) return undefined;
+    return `profile "${profileName}" declares colour signalling that is not carriable at its pixel format — ${check.reason}`;
   }
 
   // Fire-and-forget technical metadata extraction (issue #6). Detached, never
@@ -1157,6 +1344,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const unrunnable = await unrunnableProfileReason(encodeOpts?.profile);
       if (unrunnable) {
         reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
+        return undefined;
+      }
+      // Reject a profile whose colour signalling is not carriable at its pixel
+      // format (issue #377) before a running execution is created, so a
+      // mistagged (e.g. 8-bit-tagged-PQ) output is never produced.
+      const uncarriable = await uncarriableColourReason(encodeOpts?.profile);
+      if (uncarriable) {
+        reply.code(422).send({ error: 'profile_colour_uncarriable', message: uncarriable });
         return undefined;
       }
     }
@@ -1431,16 +1626,52 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // DEPRECATED free-text alias (issue #346). The canonical, fully-featured search
+  // contract is `GET /api/v1/search/` (routes/search.ts) — it exposes the tiered
+  // exact-filter + free-text surface (`q`, `tags`, `mimeType`, `metadata.<key>`,
+  // TAMS address lookup, pagination) over the wired search projection (#345).
+  //
+  // This endpoint predates that contract and only ever accepted `q` (a free-text
+  // term matched over name/description via AssetRepository.search). Its match
+  // semantics are IDENTICAL to the canonical endpoint's `q` tier (proven by the
+  // #345 parity regression, test/search-parity.test.ts), so it answers the same
+  // asset set for the same query and never returns silently-empty where the
+  // canonical one would answer. It is retained as a backward-compatible alias and
+  // marked `deprecated` in the OpenAPI spec; callers should migrate to
+  // `GET /api/v1/search/?q=<term>`, which additionally returns `{ total, page }`.
   app.get(
     '/search',
     {
-      
       schema: {
-        querystring: z.object({ q: z.string().min(1) }),
+        tags: ['search'],
+        summary: 'DEPRECATED — use GET /api/v1/search/',
+        description:
+          'Deprecated free-text alias. Use the canonical `GET /api/v1/search/?q=<term>` ' +
+          'endpoint instead, which serves the same free-text results plus tag, mimeType, ' +
+          'metadata, and TAMS filters with `total`/`page` pagination. This alias only ' +
+          'accepts `q` and returns `{ items }`; it is retained for backward compatibility ' +
+          'and will be removed in a future major version.',
+        deprecated: true,
+        querystring: z.object({
+          q: z
+            .string()
+            .min(1)
+            .describe(
+              'Case-insensitive free-text query matched against the asset ' +
+                'title (the canonical `name` field, persisted at ' +
+                '`descriptive.title`) and description — regardless of whether ' +
+                'the client set the title through the ingest `title` field or ' +
+                'the legacy `name` alias (issue #347).'
+            )
+        }),
         response: { 200: z.object({ items: z.array(assetSchema) }) }
       }
     },
-    async (request) => {
+    async (request, reply) => {
+      // Advertise the canonical replacement on every response (RFC 8594 style),
+      // so clients can discover the migration target without reading the spec.
+      reply.header('deprecation', 'true');
+      reply.header('link', '</api/v1/search/>; rel="successor-version"');
       const items = await repo.search(request.query.q);
       return { items };
     }
@@ -1758,12 +1989,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           });
         }
         try {
-          const hls = asset.manifestUrls.hls
-            ? resolvePublicManifestUrl(asset.manifestUrls.hls)
-            : undefined;
-          const dash = asset.manifestUrls.dash
-            ? resolvePublicManifestUrl(asset.manifestUrls.dash)
-            : undefined;
+          // In the default `public` mode, `resolvePublicManifestUrl` returns a
+          // genuinely public absolute URL only when PACKAGED_PUBLIC_BASE_URL is
+          // configured. On the zero-config per-stack MinIO backend it hands back
+          // the stored value verbatim (issue #320), which is a bare object-key
+          // path (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
+          // scheme/host and no signature — not fetchable by a player, and OSC
+          // MinIO blocks external presigned/public GETs. When the resolved value
+          // is still non-absolute, route the manifest through the authorized
+          // stream proxy instead (issue #341), mirroring the DELIVERY_MODE=proxy
+          // branch above so `delivery.hls`/`delivery.dash` are always absolute,
+          // resolvable URLs — consistent with how `source` is emitted. The proxy
+          // base is derived from PUBLIC_BASE_URL / request context via
+          // `assetsBaseUrl`, never hardcoded.
+          const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
+          const toAbsolute = (
+            stored: string | undefined,
+            proxyUrl: string | undefined
+          ): string | undefined => {
+            if (!stored) return undefined;
+            const resolved = resolvePublicManifestUrl(stored);
+            return isAbsoluteUrl(resolved) ? resolved : proxyUrl;
+          };
+          const hls = toAbsolute(asset.manifestUrls.hls, proxied.hls);
+          const dash = toAbsolute(asset.manifestUrls.dash, proxied.dash);
           return reply.code(200).send({
             assetId: asset.id,
             urls: { hls, dash },
@@ -1889,10 +2138,52 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           .send({ error: 'range_not_satisfiable' });
       }
 
-      // Manifests must not be cached long (segments may roll); segments are
-      // immutable so may be cached. Keep it conservative and let a fronting
-      // CDN/proxy override if desired. Accept-Ranges advertises range support so
-      // a player knows it can issue ranged segment GETs.
+      // Manifests (.m3u8/.mpd) are rewritten so their child references — variant
+      // playlists, the audio group, CMAF init + media segments, DASH
+      // BaseURL/SegmentTemplate — resolve back through THIS proxy prefix instead
+      // of escaping to a bare object-store host or an unsigned URL (issue #340,
+      // building on #333). The rewrite is a text transform applied ONLY to the
+      // proxied response: the stored bytes are never mutated. Because the
+      // transform changes the body length, a manifest is served whole (200) and
+      // never as a Range slice — Range remains for the (untouched) segment bytes.
+      if (isManifestPath(relative)) {
+        let manifestBody: string;
+        try {
+          const stream = await packagedStorage.getObject(objectKey);
+          manifestBody = await readStreamToString(stream);
+        } catch (err) {
+          if (
+            (err as { code?: string }).code === 'NoSuchKey' ||
+            (err as { code?: string }).code === 'NotFound'
+          ) {
+            return reply.code(404).send({ error: 'not_found' });
+          }
+          throw err;
+        }
+
+        // Proxy base up to and including `<id>/stream` (no trailing slash), so
+        // `<proxyBase>/<relative>` is a proxy URL for a packaged object. Derived
+        // from the request path (minus the wildcard tail), PUBLIC_BASE_URL-aware
+        // so the rewritten URLs share the origin the delivery endpoint advertises.
+        const proxyBase = streamProxyBaseUrl(request.url, request.params['*']);
+        const rewriteCtx: ManifestRewriteContext = {
+          proxyBase,
+          manifestRelativePath: relative,
+          packagedPrefix: outputPrefix(asset.id),
+          packagedBucket: bucket
+        };
+        const rewritten = rewriteManifest(relative, manifestBody, rewriteCtx);
+
+        return reply
+          .header('Content-Type', contentType)
+          .header('Cache-Control', 'no-cache')
+          .send(rewritten);
+      }
+
+      // Segments are immutable so may be cached; manifests handled above. Keep it
+      // conservative and let a fronting CDN/proxy override if desired.
+      // Accept-Ranges advertises range support so a player knows it can issue
+      // ranged segment GETs.
       reply
         .header('Content-Type', contentType)
         .header('Cache-Control', 'no-cache')
@@ -2183,11 +2474,26 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'transcoding is not configured'
         });
       }
+      // Non-fatal warning surfaced in the 202 response when profileParams
+      // validation was SKIPPED (profile YAML unresolvable) — issue #394. Set
+      // inside the skipped branch below; spread into the accepted response only
+      // when present. Undefined when validation ran (passed) or there were no
+      // profileParams.
+      let profileParamsWarning:
+        | { code: 'profile_params_unvalidated'; message: string; profile: string; unvalidatedKeys: string[] }
+        | undefined;
       // Reject a named GPU-only (NVENC/CUDA) profile that cannot execute on this
       // platform tier (issue #286) before submitting to Encore.
       const unrunnable = await unrunnableProfileReason(request.body.profile);
       if (unrunnable) {
         return reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
+      }
+      // Reject a profile whose colour signalling is not carriable at its pixel
+      // format (issue #377) before submitting to Encore, so a mistagged output
+      // (e.g. an 8-bit stream tagged PQ) is never encoded and paid for.
+      const uncarriable = await uncarriableColourReason(request.body.profile);
+      if (uncarriable) {
+        return reply.code(422).send({ error: 'profile_colour_uncarriable', message: uncarriable });
       }
       // Validate profileParams keys against the SpEL params the chosen profile
       // actually declares (issue #290). We resolve the profile YAML from the
@@ -2201,20 +2507,147 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // always passes.
       if (request.body.profileParams && !request.body.customProfile) {
         const profileName = request.body.profile ?? 'program';
-        const stored = opts.profileRepository
-          ? await opts.profileRepository.get(profileName)
-          : undefined;
+        // Resolve the profile YAML while distinguishing a genuine not-found from
+        // an unreachable profile store (issue #392). A store outage makes
+        // ProfileRepository.get() THROW (couch-profile-repo does not catch); the
+        // resolver captures that so a store outage no longer turns a transcode
+        // submit into an uncaught 500. Behaviour stays PERMISSIVE: in BOTH the
+        // not-found and store-unreachable cases we pass an undefined YAML into
+        // validateProfileParams exactly as before, so the request still submits.
+        const resolution = await resolveProfileYaml(opts.profileRepository, profileName);
+        // The resolved status is kept as a local so the sibling issues can
+        // consume the distinction: #393 (logging the store-unreachable case) and
+        // #394 (a response warning field). Neither is implemented here.
         const check = validateProfileParams({
           profileName,
-          profileYaml: stored?.yaml,
+          profileYaml: resolution.status === 'found' ? resolution.yaml : undefined,
           profileParams: request.body.profileParams
         });
+        // When validation was SKIPPED (the profile YAML could not be resolved),
+        // the request still succeeds permissively — but a mistyped profile name
+        // plus a mistyped param name would otherwise pass silently, and a store
+        // outage would silently skip validation for its whole duration. Emit ONE
+        // log line so an operator gets feedback (issue #393). No behavioural
+        // change: the request is still accepted regardless. The same skipped
+        // signal will be surfaced in the response by #394. We distinguish a
+        // store outage (warn — an operator should notice; carry the captured
+        // error) from an ordinary profile-not-found / custom-profile use (info)
+        // via a machine-readable `reason` field.
+        if (check.ok && !check.validated) {
+          const skipped = {
+            profileName: check.profileName,
+            unvalidatedKeys: check.unvalidatedKeys
+          };
+          // Surface the skipped validation as a non-fatal warning in the 202
+          // response (issue #394). The request is still accepted; these keys
+          // were forwarded to Encore unchecked.
+          profileParamsWarning = {
+            code: 'profile_params_unvalidated',
+            message:
+              `profileParams validation was skipped: profile '${check.profileName}' could not be ` +
+              `resolved, so the following keys were forwarded to Encore unchecked: ` +
+              `${check.unvalidatedKeys.join(', ')}.`,
+            profile: check.profileName,
+            unvalidatedKeys: check.unvalidatedKeys
+          };
+          if (resolution.status === 'store-unreachable') {
+            request.log.warn(
+              { ...skipped, reason: 'store-unreachable' as const, err: resolution.error },
+              'profileParams validation skipped: profile store unreachable'
+            );
+          } else {
+            request.log.info(
+              { ...skipped, reason: 'profile-not-found' as const },
+              'profileParams validation skipped: profile not found'
+            );
+          }
+        }
+        // Only a hard reject (`ok: false`) turns into a 400. Both a genuine
+        // pass and the explicit skipped/permissive result (`validated: false`,
+        // profile YAML unresolvable) keep `ok: true` and are request-accepted;
+        // richer handling of the skipped result (logging, response warning) is
+        // deferred to sibling issues #392/#393/#394. (issue #391)
         if (!check.ok) {
           return reply.code(400).send({
             error: 'unknown_profile_params',
             message: check.message
           });
         }
+      }
+      // Burn-in caption source (issue #388, ADR-014). Optional + additive:
+      // resolve the requested source to ONE concrete workspace-local S3 object
+      // key and build the FFmpeg `subtitles=` filter that gets threaded into the
+      // selected profile's VideoEncode filters via profileParams (D3). Format
+      // gating (srt/vtt only) rejects ttml at request time (D4); a referenced
+      // track with no stored file yet is a distinct "not ready" outcome whose
+      // wait/queue policy #389 owns — here we surface it as a 409 so the caller
+      // learns the source is not yet burnable (this issue does not implement the
+      // wait). Absent `burnIn` => no filter, clean rendition (unchanged).
+      let burnInSubtitlesFilter: string | undefined;
+      if (request.body.burnIn) {
+        // Styling override (issue #390): validate the caller's `forceStyle` against
+        // the allowlist + safe charset BEFORE resolving/dispatching. This CLOSES
+        // the filter-injection hole #388 left (raw forwarding into
+        // force_style='...'): a quote/comma/colon/backslash/newline — anything that
+        // could escape the quoting and inject filtergraph content — is rejected
+        // here with a 422 and never reaches buildSubtitlesFilter. Only the
+        // canonical, allowlisted string is composed into the filter.
+        let canonicalForceStyle: string | undefined;
+        if (request.body.burnIn.forceStyle !== undefined && request.body.burnIn.forceStyle.trim() !== '') {
+          const styleCheck = validateForceStyle(request.body.burnIn.forceStyle);
+          if (!styleCheck.ok) {
+            return reply.code(422).send({ error: 'burn_in_invalid_force_style', message: styleCheck.message });
+          }
+          canonicalForceStyle = styleCheck.canonical;
+        }
+        const resolved = resolveBurnInSource(
+          request.body.burnIn.source,
+          asset.subtitleTracks
+        );
+        if (!resolved.ok) {
+          if (resolved.reason === 'track_not_found') {
+            return reply.code(404).send({ error: 'subtitle_track_not_found', message: resolved.message });
+          }
+          if (resolved.reason === 'unsupported_format') {
+            return reply.code(422).send({ error: 'burn_in_unsupported_format', message: resolved.message });
+          }
+          // not_ready: the referenced track exists but its objectKey is still
+          // undefined (asset-repo says the file has not landed). Distinct from
+          // the object-existence race below (#389) — here we have no key at all.
+          return reply.code(409).send({ error: 'burn_in_source_not_ready', message: resolved.message });
+        }
+        // #389: CLOSE the generation race. `resolveBurnInSource` proved the
+        // request NAMES a concrete key; now verify the key's BYTES have actually
+        // landed in the workspace object store BEFORE dispatch. Subtitle
+        // generation is fire-and-forget (subtitle-generator.ts), so a resolved
+        // key — a caller-supplied `sidecarKey`, or a `subtitleTrack.objectKey`
+        // set before the generation callback landed — can point at an object that
+        // does not yet exist or is still zero-length. Either would silently burn
+        // NO captions, so we FAIL the submission with a specific 409
+        // (`burn_in_source_not_available`, distinct from #388's
+        // `burn_in_source_not_ready` no-objectKey case) and never dispatch. The
+        // check reuses WorkspaceStorage.statObject (src/data/storage.ts:92-102),
+        // the same presence plumbing the rest of the routes use, against the
+        // workspace/source bucket where generated sidecars land
+        // (subtitle-generator.ts:101-103 destinationKey). ADR-014 D1/D2 chose the
+        // explicit-source model, so a clear error at submit time is the natural
+        // guarantee (no open-ended wait).
+        if (!storageFor) {
+          // No object store wired on this deployment — we cannot verify the
+          // sidecar exists, so we MUST NOT dispatch a possibly-captionless burn.
+          return reply.code(501).send({
+            error: 'burn_in_storage_unavailable',
+            message: 'burn-in requires object storage to verify the caption source exists, but object storage is not configured on this deployment'
+          });
+        }
+        const availability = await checkBurnInObjectAvailable(resolved.objectKey, storageFor());
+        if (!availability.available) {
+          return reply.code(409).send({
+            error: 'burn_in_source_not_available',
+            message: availability.message
+          });
+        }
+        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, canonicalForceStyle);
       }
       try {
         const result = await submitTranscode(
@@ -2225,12 +2658,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             preset: request.body.profile,
             customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
+            burnInSubtitlesFilter,
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },
           { jobs, assets: repo, encore: opts.encore }
         );
-        return reply.code(202).send(result);
+        return reply
+          .code(202)
+          .send({ ...result, ...(profileParamsWarning ? { warning: profileParamsWarning } : {}) });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
@@ -2774,7 +3210,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // (which shallow-merges), this sets the entire metadata object to the request
   // body, dropping any keys not present. Workspace-scoped and behind
   // `authenticate`.
-  //   200 — metadata replaced, full asset returned
+  //
+  // Title is NOT part of this free-form `metadata`/`custom` bag (issue #347):
+  // the canonical editorial title lives at `descriptive.title` and is exposed on
+  // every response — including the full asset returned here — as the top-level
+  // `name` property. This endpoint never reads or writes title; a `title` key
+  // placed inside the `metadata` body is stored as free-form custom metadata and
+  // has NO effect on the asset's title. Set title via the ingest `title` field.
+  //   200 — metadata replaced, full asset returned (title is the `name` field)
   //   404 — unknown/foreign asset (existence not leaked)
   app.put(
     '/:id/metadata',
