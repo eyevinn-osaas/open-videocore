@@ -31,6 +31,11 @@ import {
   updateInstance
 } from './instance-pool.js';
 import { recordDispatch } from './retry-store.js';
+import { probeCallbackTrust } from './callback-trust-probe.js';
+
+// Default bounded wait for the outbound callback-listener TLS-trust probe
+// (issue #463) when EncoreScalerConfig.callbackTrustTimeoutMs is unset.
+export const DEFAULT_CALLBACK_TRUST_TIMEOUT_MS = 60_000;
 
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
@@ -136,6 +141,16 @@ export class EncoreScalerLoop {
 
     // 5. Dispatch pending jobs to instances with spare capacity.
     for (const inst of instances) {
+      // Gate first-job dispatch on confirmed outbound TLS trust to the paired
+      // callback-listener ingress (issue #463). An instance that has never been
+      // probed is NOT eligible for its first job until the probe passes; an
+      // instance that has already passed once (callbackTrustReady) skips this
+      // entirely, so warm instances incur no added latency. A quarantined
+      // instance is never dispatched to. This never throws into the tick: a
+      // probe failure keeps the job in the queue for a later tick.
+      if (!(await this.ensureCallbackTrust(inst))) {
+        continue; // not eligible this tick — leave its capacity unused
+      }
       while (inst.activeJobs < JOBS_PER_INSTANCE) {
         const claimed = await redis.rpoplpush(
           keys.queue(workspaceId),
@@ -193,6 +208,14 @@ export class EncoreScalerLoop {
     const entries = Object.entries(raw);
     if (entries.length === 0) return; // empty pool — nothing to reconcile
 
+    // Accumulate the externalIds (our encoreJobId) of jobs this reconcile
+    // observes as silently dropped — tracked as running against an instance but
+    // no longer present in that instance's live QUEUED/IN_PROGRESS set with no
+    // completion callback (issue #449, ADR-016 Direction 2). The scaler owns no
+    // repositories, so it only raises the signal via onJobsDropped; the terminal
+    // write is owned by the reconciler/main.ts repo layer.
+    const droppedJobIds: string[] = [];
+
     for (const [instanceId, instanceJson] of entries) {
       try {
         let record: EncoreInstanceRecord;
@@ -206,23 +229,34 @@ export class EncoreScalerLoop {
 
         const token = await getToken();
         const base = record.url.replace(/\/$/, '');
-        // Count both QUEUED and IN_PROGRESS — a freshly dispatched job sits in
-        // QUEUED until Encore picks it up, so counting only IN_PROGRESS would
-        // make the instance look idle immediately after dispatch and trigger a
-        // spurious scale-up on the next tick.
+        // Fetch both QUEUED and IN_PROGRESS job documents (not just counts) — a
+        // freshly dispatched job sits in QUEUED until Encore picks it up, so
+        // counting only IN_PROGRESS would make the instance look idle
+        // immediately after dispatch and trigger a spurious scale-up on the next
+        // tick. We request the documents (size=100) rather than size=1 so we can
+        // read each active job's externalId and thereby tell WHICH tracked jobs
+        // (if any) have silently vanished — the dropped-job signal for #449.
+        // Contract: Encore /encoreJobs/search/findByStatus returns Spring
+        // HATEOAS pages { _embedded: { encoreJobs: [{ id, externalId, ... }] },
+        // page: { totalElements: N } } (verified in
+        // encore-callback-poller.ts:505-508, SVT Encore, 2026-07-07).
         const [resQ, resP] = await Promise.all([
-          fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=1`, {
+          fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=100`, {
             headers: { authorization: `Bearer ${token}` }
           }),
-          fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=1`, {
+          fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=100`, {
             headers: { authorization: `Bearer ${token}` }
           })
         ]);
         if (!resQ.ok || !resP.ok) continue;
 
+        type EncoreJobPage = {
+          _embedded?: { encoreJobs?: Array<{ externalId?: string }> };
+          page?: { totalElements?: number };
+        };
         const [bodyQ, bodyP] = await Promise.all([
-          resQ.json().catch(() => ({})) as Promise<{ page?: { totalElements?: number } }>,
-          resP.json().catch(() => ({})) as Promise<{ page?: { totalElements?: number } }>
+          resQ.json().catch(() => ({})) as Promise<EncoreJobPage>,
+          resP.json().catch(() => ({})) as Promise<EncoreJobPage>
         ]);
         const queuedCount = bodyQ.page?.totalElements;
         const inProgressCount = bodyP.page?.totalElements;
@@ -235,6 +269,42 @@ export class EncoreScalerLoop {
             `[encore-scaler] reconcile: correcting stale activeJobs for instance ${instanceId}: ` +
               `tracked=${record.activeJobs} actual=${actualCount}`
           );
+
+          // tracked > actual is the silently-dropped signal (ADR-016): a job we
+          // think is running has left Encore's active set with no completion.
+          // Resolve exactly which of our jobs vanished by diffing the jobs we
+          // track against this instance (jobInstance hash, written at dispatch,
+          // scaler-loop.ts:290) — restricted to those still marked `running`
+          // (jobStatus hash, scaler-loop.ts:291) — against the externalIds
+          // Encore still reports active. Anything tracked-running for this
+          // instance that Encore no longer lists is dropped.
+          if (actualCount < record.activeJobs) {
+            const activeExternalIds = new Set<string>();
+            for (const j of bodyQ._embedded?.encoreJobs ?? []) {
+              if (j.externalId) activeExternalIds.add(j.externalId);
+            }
+            for (const j of bodyP._embedded?.encoreJobs ?? []) {
+              if (j.externalId) activeExternalIds.add(j.externalId);
+            }
+
+            const trackedInstances = await redis.hgetall(keys.jobInstance(workspaceId));
+            const trackedStatuses = await redis.hgetall(keys.jobStatus(workspaceId));
+            for (const [jobId, mappedInstanceId] of Object.entries(trackedInstances)) {
+              if (mappedInstanceId !== instanceId) continue;
+              // Only jobs still locally marked running are candidates; a job the
+              // callback poller / cancel already settled has a terminal status.
+              const st = (trackedStatuses[jobId] ?? '').toUpperCase();
+              if (st !== 'RUNNING' && st !== 'QUEUED') continue;
+              if (activeExternalIds.has(jobId)) continue; // still live on Encore
+              droppedJobIds.push(jobId);
+              // Overwrite the stale Valkey status (written `running` at dispatch,
+              // scaler-loop.ts:291) so a subsequent makeScalingEncoreClient
+              // getJobStatus (index.ts:41) agrees with the durable job record and
+              // does not re-report `running` (ADR-016 Point 3).
+              await redis.hset(keys.jobStatus(workspaceId), jobId, 'FAILED');
+            }
+          }
+
           record.activeJobs = actualCount;
           // Do NOT update lastIdleAt here. The idle clock must only advance when
           // the callback poller confirms the completion (via decrementActiveJobs).
@@ -254,6 +324,115 @@ export class EncoreScalerLoop {
         continue;
       }
     }
+
+    // Raise the dropped-job signal (issue #449, ADR-016). The scaler owns no
+    // repositories, so main.ts wires onJobsDropped to drive each id to a
+    // terminal `failed` state through the shared idempotent settle path.
+    // Best-effort: a hook failure must never break the tick, exactly as the
+    // other repo-bridge hooks are treated (scaler-loop.ts:341-347).
+    if (droppedJobIds.length > 0 && this.config.onJobsDropped) {
+      try {
+        await this.config.onJobsDropped(droppedJobIds);
+      } catch (err) {
+        console.error(
+          '[encore-scaler] onJobsDropped error (workspace=%s):',
+          workspaceId,
+          err
+        );
+      }
+    }
+  }
+
+  // First-job readiness gate (issue #463): confirm this instance's OUTBOUND TLS
+  // trust path to its per-instance callback-listener ingress is established
+  // before the instance is marked eligible for its first job. Returns true when
+  // the instance may receive jobs this tick, false when it must be skipped.
+  //
+  // Idempotency / no added latency for warm instances:
+  //   - callbackTrustReady === true  -> already confirmed, return true, no probe.
+  //   - callbackTrustQuarantinedAt set -> previously timed out, skip (false).
+  //   - callbackListenerUrl undefined -> nothing to probe against (e.g. an
+  //     instance re-discovered from OSC where the listener URL is unknown, see
+  //     instance-pool.ts:135-137). Fail open: allow dispatch as before so this
+  //     gate never regresses the reconcile-from-OSC path.
+  //
+  // The gate is a bounded WAIT across re-probes, not a single shot (issue #463).
+  // The tick loop re-invokes this each tick, so we probe again on later ticks:
+  //   - On success the record is stamped callbackTrustReady=true and persisted
+  //     so no future tick re-probes.
+  //   - A probe failure (tls-trust, connection, OR timeout) while still inside
+  //     the bounded window is NOT quarantining — we return false (ineligible
+  //     this tick) so a later tick re-probes. This lets the transient PKIX race
+  //     (the ingress cert becomes trusted ~35s after spawn) resolve instead of
+  //     permanently sidelining an instance on an early fast-fail PKIX error.
+  //   - Only once the elapsed time since the FIRST probe exceeds the bounded
+  //     deadline do we quarantine the instance and emit a structured error
+  //     (instanceId + ingress hostname) rather than throw into the tick loop.
+  //
+  // callbackTrustTimeoutMs plays TWO roles here (intentionally the same value):
+  //   1. the per-probe AbortSignal window for a single HTTPS handshake, and
+  //   2. the overall cross-tick bounded-wait deadline measured from the first
+  //      probe. A PKIX/handshake failure fast-fails (~1s) and does NOT consume
+  //      the AbortSignal window, so the deadline is what actually bounds the
+  //      wait across re-probes.
+  private async ensureCallbackTrust(inst: EncoreInstanceRecord): Promise<boolean> {
+    if (inst.callbackTrustReady) return true;
+    if (inst.callbackTrustQuarantinedAt) return false;
+    // No listener URL to probe (reconciled-from-OSC instance): fail open.
+    if (!inst.callbackListenerUrl) return true;
+
+    const timeoutMs =
+      this.config.callbackTrustTimeoutMs ?? DEFAULT_CALLBACK_TRUST_TIMEOUT_MS;
+    let hostname = inst.callbackListenerUrl;
+    try {
+      hostname = new URL(inst.callbackListenerUrl).hostname;
+    } catch {
+      // keep the raw URL for logging if it does not parse
+    }
+
+    // Stamp (and persist) the first-probe epoch so the bounded-wait deadline
+    // survives across ticks and instances reloaded from Valkey.
+    if (inst.callbackTrustFirstProbeAt === undefined) {
+      inst.callbackTrustFirstProbeAt = Date.now();
+      await updateInstance(this.config.redis, this.config.workspaceId, inst);
+    }
+
+    const result = await probeCallbackTrust(inst.callbackListenerUrl, timeoutMs);
+
+    if (result.ok) {
+      inst.callbackTrustReady = true;
+      inst.callbackTrustConfirmedAt = Date.now();
+      await updateInstance(this.config.redis, this.config.workspaceId, inst);
+      return true;
+    }
+
+    // Probe failed. If we are still inside the bounded wait, do NOT quarantine —
+    // stay ineligible this tick and let a later tick re-probe so the transient
+    // PKIX/handshake race can resolve. This treats tls-trust, connection, and a
+    // per-probe timeout identically while the deadline has not been exceeded.
+    const elapsedMs = Date.now() - inst.callbackTrustFirstProbeAt;
+    if (elapsedMs <= timeoutMs) {
+      return false;
+    }
+
+    // Bounded wait EXCEEDED: quarantine the instance from job assignment and
+    // surface a structured, queryable error (instanceId + ingress hostname). Do
+    // NOT throw — keep the tick non-fatal.
+    inst.callbackTrustQuarantinedAt = Date.now();
+    await updateInstance(this.config.redis, this.config.workspaceId, inst);
+    console.error(
+      '[encore-scaler] callback-trust bounded wait exceeded — quarantining instance from job assignment',
+      {
+        workspaceId: this.config.workspaceId,
+        instanceId: inst.instanceId,
+        callbackIngressHostname: hostname,
+        errorClass: result.errorClass,
+        detail: result.detail,
+        timeoutMs,
+        elapsedMs
+      }
+    );
+    return false;
   }
 
   // POST a queued job's raw Encore payload to a chosen instance and record the
@@ -310,8 +489,16 @@ export class EncoreScalerLoop {
       if (onEncodeDispatched) {
         try {
           await onEncodeDispatched(job.jobId, attemptNumber);
-        } catch {
-          // Swallowed: dispatch itself succeeded; only durable capture is lost.
+        } catch (err) {
+          // Best-effort by design (never re-queue an already-dispatched job),
+          // but the failure must be OBSERVABLE (issue #451): a silently dropped
+          // append left dispatched jobs with attempts:0 and no encodeAttemptLog.
+          console.warn(
+            '[encore-scaler] dispatch: onEncodeDispatched failed to durably append encode attempt %d for %s:',
+            attemptNumber,
+            job.jobId,
+            err
+          );
         }
       }
       if (encoreUuid && encoreUuid !== job.jobId) {
@@ -341,8 +528,14 @@ export class EncoreScalerLoop {
       if (onDispatched) {
         try {
           await onDispatched(job.jobId);
-        } catch {
-          // Swallowed: dispatch itself succeeded.
+        } catch (err) {
+          // Best-effort by design, but observable (issue #451): a dropped
+          // queued->running flip must not vanish silently either.
+          console.warn(
+            '[encore-scaler] dispatch: onDispatched failed to advance job %s to running:',
+            job.jobId,
+            err
+          );
         }
       }
       return true;

@@ -1291,6 +1291,25 @@ body.detail-standalone .assets-side {
   padding: 12px 16px 0;
 }
 
+/* Honest-cap disclosure: shown when the jobs endpoint's true total exceeds the
+ * bounded newest-100 window we fetch (the endpoint has no server-side
+ * sort/filter/search). Warns the operator that filters + counts apply to that
+ * window only. Toggled via the element's `hidden` attribute in jobs-table.js. */
+.ops-table-truncation {
+  margin: 8px 16px 0;
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--warning);
+  border: 1px solid var(--warning);
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.ops-table-truncation[hidden] {
+  display: none;
+}
+
 .ops-table-filters {
   display: flex;
   flex-wrap: wrap;
@@ -1304,6 +1323,23 @@ body.detail-standalone .assets-side {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* Operator-facing caveat shown when a page-scoped narrowing filter (date-range,
+   or search+status) is active — the backend cannot narrow these server-side, so
+   the pager total reflects the full unfiltered set. See public/assets-table.js
+   and the friction log in the eng-open-videocore-agents repo. */
+.ops-table-caveat {
+  padding: 8px 16px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.ops-table-caveat[hidden] {
+  display: none;
 }
 
 .ops-table-scroll {
@@ -1338,4 +1374,96 @@ body.detail-standalone .assets-side {
 .ops-sort-arrow {
   font-size: 10px;
   color: var(--text-muted);
+}
+
+/* Jobs-table filter controls (issue #370). Small, labelled inputs that sit in
+ * the shared .ops-table-filters bar. Colours reuse the app's CSS variables. */
+.ops-filter-slot-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ops-filter-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.ops-filter-select,
+.ops-filter-date,
+.ops-filter-search {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 8px;
+  background: var(--surface, #1a1a1a);
+  color: var(--text, #eee);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+}
+
+.ops-filter-search {
+  min-width: 220px;
+}
+
+.ops-filter-select:focus-visible,
+.ops-filter-date:focus-visible,
+.ops-filter-search:focus-visible {
+  outline: 2px solid var(--accent, #6366f1);
+  outline-offset: 1px;
+}
+
+/* Assets table filter controls (issue #369). Each control is a <label> that
+   stacks a small caption over its input inside an .ops-filter-slot. */
+.ops-table-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.ops-table-filters label > span {
+  font-weight: 500;
+}
+
+.ops-table-filters select,
+.ops-table-filters input {
+  font: inherit;
+  padding: 5px 8px;
+}
+
+/* Logs table — level badges (issue #371). `level` is an OPTIONAL log field; the
+   cell shows a coloured pill per severity when present, else a dash. */
+.log-level {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.log-level-debug {
+  background: var(--surface-muted, #2a2a2a);
+  color: var(--text-muted, #999);
+}
+.log-level-info {
+  background: rgba(56, 139, 253, 0.16);
+  color: #6cb0ff;
+}
+.log-level-warn {
+  background: rgba(210, 153, 34, 0.18);
+  color: #e3b341;
+}
+.log-level-error {
+  background: rgba(248, 81, 73, 0.18);
+  color: #ff7b72;
+}
+
+/* The message column carries the free-text search target; let it breathe. */
+.log-message {
+  white-space: pre-wrap;
+  word-break: break-word;
 }

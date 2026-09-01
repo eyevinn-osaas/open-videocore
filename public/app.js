@@ -8,6 +8,17 @@
  * only with fully-escaped, controlled template strings.
  */
 
+import { createJobsTable } from './jobs-table.js';
+// Shared assets-table wiring (issue #369). Composes the merged shared table
+// primitive (#367/#372) and URL-state contract (#368/#373) against the verified
+// GET /api/v1/assets/ + GET /api/v1/search/ contracts. See public/assets-table.js.
+import { createAssetsTable } from './assets-table.js';
+// Shared logs-table wiring (issue #371). Composes the merged shared table
+// primitive (#367/#372) in CURSOR paging mode and the URL-state contract
+// (#368/#373) against the verified GET /api/v1/logs/ contract. See
+// public/logs-table.js.
+import { createLogsTable } from './logs-table.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -448,17 +459,17 @@ function setupTabs() {
 }
 
 // ─── ASSETS TAB ──────────────────────────────────────────────────────────────
-
-// Assets tab pagination state.
-const ASSETS_PAGE_SIZE = 20;
-// `wedgedOnly` (issue #282) toggles the client-side filter that shows only assets
-// stuck in `processing` with a `technicalMetadataError` set.
-const assetsState = { offset: 0, total: 0, wedgedOnly: false };
+//
+// The table itself (sort / filter / pagination + URL state) is provided by the
+// shared assets-table wiring in public/assets-table.js (issue #369), which
+// composes the merged shared table primitive (#367/#372) and URL-state contract
+// (#368/#373) against the verified GET /api/v1/assets/ + GET /api/v1/search/
+// contracts. This tab owns only the surrounding chrome: the upload/ingest modals
+// and the detail side panel. `assetsTable` holds the live instance so the modals
+// and row actions can trigger a reload.
+let assetsTable = null;
 
 async function renderAssetsTab(container) {
-  assetsState.offset = 0;
-  assetsState.wedgedOnly = false;
-
   // Layout: full-height table on the left, detail side panel on the right (hidden initially).
   const layout = document.createElement('div');
   layout.className = 'assets-layout';
@@ -474,10 +485,6 @@ async function renderAssetsTab(container) {
   header.innerHTML = [
     '<span class="section-title">Assets</span>',
     '<div class="flex-gap">',
-    '  <label class="wedged-filter" title="Show only assets stuck in processing with a metadata extraction error">',
-    '    <input type="checkbox" id="assets-wedged-only" />',
-    '    <span>Needs attention</span>',
-    '  </label>',
     '  <button id="btn-open-upload" class="header-btn">Upload File</button>',
     '  <button id="btn-open-ingest" class="header-btn">Ingest URL</button>',
     '  <button id="assets-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
@@ -485,28 +492,53 @@ async function renderAssetsTab(container) {
   ].join('');
   main.appendChild(header);
 
-  const tableScroll = document.createElement('div');
-  tableScroll.className = 'assets-table-scroll';
-  tableScroll.id = 'assets-table-wrap';
-  main.appendChild(tableScroll);
-
-  const pagination = document.createElement('div');
-  pagination.className = 'pagination';
-  pagination.id = 'assets-pagination';
-  pagination.style.display = 'none';
-  pagination.innerHTML = [
-    '<span class="page-indicator" id="assets-page-indicator"></span>',
-    '<button id="assets-prev" class="btn-ghost">Previous</button>',
-    '<button id="assets-next" class="btn-ghost">Next</button>',
-  ].join('');
-  main.appendChild(pagination);
-
   // ── Side detail panel (created on demand) ──
   const detailPanel = document.createElement('div');
   detailPanel.id = 'asset-detail';
   detailPanel.className = 'assets-side';
   detailPanel.style.display = 'none';
   layout.appendChild(detailPanel);
+
+  // ── Shared assets table (sort / filter / pagination + URL state) ──
+  // The status filter (a proper lifecycle-state select) subsumes the old
+  // "Needs attention" checkbox: operators isolate `processing` via the status
+  // filter; the per-row "Needs attention" badge + inline Re-drive action are
+  // preserved by the table's Status/Actions column renderers.
+  assetsTable = createAssetsTable({
+    apiFetch,
+    renderBadge,
+    renderTags,
+    fmtDate,
+    isAssetWedged,
+    onRowClick: function (id) {
+      showAssetDetail(id, detailPanel);
+    },
+    onDelete: async function (id) {
+      if (!confirm('Archive asset ' + id + '?')) return false;
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(id), { method: 'DELETE' });
+        return true;
+      } catch (err) {
+        alert('Error: ' + err.message);
+        return false;
+      }
+    },
+    onRedrive: async function (id) {
+      // Re-run the extractor synchronously via the recovery path of
+      // POST /assets/:id/extract-metadata (200 { assetId, status }, issue #281).
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(id) + '/extract-metadata', {
+          method: 'POST',
+          body: JSON.stringify({}),
+        });
+        return true;
+      } catch (err) {
+        alert('Re-drive failed: ' + err.message);
+        return false;
+      }
+    },
+  });
+  main.appendChild(assetsTable.el);
 
   // ── Upload modal ──
   header.querySelector('#btn-open-upload').addEventListener('click', function() {
@@ -552,7 +584,7 @@ async function renderAssetsTab(container) {
             throw new Error(err.message || err.error || 'Upload failed: HTTP ' + uploadRes.status);
           }
           close();
-          await loadAssets(detailPanel);
+          if (assetsTable) assetsTable.reload();
         } catch (err) {
           showMsg(uploadProgress, 'Error: ' + err.message, 'error');
           uploadBtn.disabled = false;
@@ -590,7 +622,7 @@ async function renderAssetsTab(container) {
           if (titleVal) reqBody.title = titleVal;
           await apiFetch('/assets/ingest-url', { method: 'POST', body: JSON.stringify(reqBody) });
           close();
-          await loadAssets(detailPanel);
+          if (assetsTable) assetsTable.reload();
         } catch (err) {
           showMsg(msgEl, 'Error: ' + err.message, 'error');
         }
@@ -599,177 +631,8 @@ async function renderAssetsTab(container) {
   });
 
   header.querySelector('#assets-refresh').addEventListener('click', function() {
-    loadAssets(detailPanel);
+    if (assetsTable) assetsTable.reload();
   });
-  // "Needs attention" toggle (issue #282): filter the list down to wedged
-  // assets (processing + technicalMetadataError). Reset paging so the filtered
-  // view starts at the first page.
-  header.querySelector('#assets-wedged-only').addEventListener('change', function(e) {
-    assetsState.wedgedOnly = !!e.target.checked;
-    assetsState.offset = 0;
-    loadAssets(detailPanel);
-  });
-  pagination.querySelector('#assets-prev').addEventListener('click', function() {
-    if (assetsState.offset >= ASSETS_PAGE_SIZE) {
-      assetsState.offset -= ASSETS_PAGE_SIZE;
-      loadAssets(detailPanel);
-    }
-  });
-  pagination.querySelector('#assets-next').addEventListener('click', function() {
-    if (assetsState.offset + ASSETS_PAGE_SIZE < assetsState.total) {
-      assetsState.offset += ASSETS_PAGE_SIZE;
-      loadAssets(detailPanel);
-    }
-  });
-
-  await loadAssets(detailPanel);
-}
-
-async function loadAssets(detailPanel) {
-  const wrap = document.getElementById('assets-table-wrap');
-  const pagination = document.getElementById('assets-pagination');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-  const loader = loadingEl();
-  wrap.appendChild(loader);
-
-  let assets = [];
-  try {
-    // When the "Needs attention" filter is active, narrow server-side to
-    // `processing` (the only status a wedged asset can hold — ASSET_STATUSES,
-    // src/data/asset-repo.ts:28) via the list endpoint's `status` query param
-    // (listQuerySchema, src/routes/assets.ts:187-192), then keep only the rows
-    // that also carry a `technicalMetadataError`. The `technicalMetadataError`
-    // field is part of the list item shape (assetSchema in listSchema), so the
-    // client can decide wedged-ness without a second request.
-    let qs = 'limit=' + ASSETS_PAGE_SIZE + '&offset=' + assetsState.offset;
-    if (assetsState.wedgedOnly) qs += '&status=processing';
-    const res = await apiFetch('/assets?' + qs);
-    if (Array.isArray(res)) {
-      assets = res;
-      assetsState.total = res.length;
-    } else {
-      assets = (res && (res.items || res.assets)) || [];
-      assetsState.total = (res && typeof res.total === 'number') ? res.total : assets.length;
-    }
-    if (assetsState.wedgedOnly) {
-      assets = filterWedgedAssets(assets);
-      // The server total counts all `processing` assets, not just wedged ones;
-      // reflect the filtered count so paging/indicator stay honest for this page.
-      assetsState.total = assets.length;
-    }
-  } catch (err) {
-    wrap.innerHTML = '';
-    showMsg(wrap, 'Failed to load assets: ' + err.message, 'error');
-    if (pagination) pagination.style.display = 'none';
-    return;
-  }
-  loader.remove();
-
-  if (assets.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'empty';
-    empty.textContent = assetsState.wedgedOnly
-      ? 'No assets need attention.'
-      : (assetsState.offset > 0 ? 'No more assets.' : 'No assets found.');
-    wrap.appendChild(empty);
-    if (pagination) pagination.style.display = 'none';
-    return;
-  }
-
-  // Build table using escaped values
-  const rows = assets.map(function(a) {
-    var thumb = a.thumbnails && a.thumbnails.length
-      ? '<img src="/api/v1/assets/' + escHtml(a.id) + '/thumbnails/0" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
-      : '<div class="thumb-xs thumb-placeholder"></div>';
-    // Wedged assets (issue #282): stuck in `processing` with a
-    // `technicalMetadataError`. Flag them with a badge (the error text is the
-    // tooltip so the operator sees the reason on hover) and offer an inline
-    // re-drive action that hits POST /assets/:id/extract-metadata.
-    var wedged = isAssetWedged(a);
-    var statusCell = renderBadge(a.status);
-    if (wedged) {
-      statusCell += ' <span class="badge badge-attention asset-wedged-flag" data-id="' + escHtml(a.id) +
-        '" title="' + escHtml(a.technicalMetadataError) + '">Needs attention</span>';
-    }
-    var actionsCell =
-      (wedged
-        ? '<button class="btn-ghost asset-redrive-btn" data-id="' + escHtml(a.id) +
-          '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
-        : '') +
-      '<button class="btn-danger asset-delete-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Archive</button>';
-    return '<tr data-id="' + escHtml(a.id) + '"' + (wedged ? ' class="row-wedged"' : '') + '>' +
-      '<td style="width:52px;padding:4px 6px">' + thumb + '</td>' +
-      '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
-      '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
-      '<td>' + statusCell + '</td>' +
-      '<td>' + renderTags(a.tags) + '</td>' +
-      '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
-      '<td>' + actionsCell + '</td>' +
-      '</tr>';
-  }).join('');
-
-  const table = document.createElement('table');
-  table.innerHTML = '<thead><tr><th></th><th>ID</th><th>Name / Title</th><th>Status</th><th>Tags</th><th>Created</th><th>Actions</th></tr></thead>' +
-    '<tbody>' + rows + '</tbody>';
-  wrap.appendChild(table);
-
-  // Row click opens the side detail panel; the row highlights.
-  table.querySelectorAll('tbody tr').forEach(function(tr) {
-    tr.addEventListener('click', function() {
-      table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
-      tr.classList.add('row-selected');
-      showAssetDetail(tr.dataset.id, detailPanel);
-    });
-  });
-
-  table.querySelectorAll('.asset-delete-btn').forEach(function(btn) {
-    btn.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      if (!confirm('Archive asset ' + btn.dataset.id + '?')) return;
-      try {
-        await apiFetch('/assets/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
-        await loadAssets(detailPanel);
-      } catch (err) {
-        alert('Error: ' + err.message);
-      }
-    });
-  });
-
-  // Inline re-drive (issue #282). Re-runs the extractor synchronously via the
-  // recovery path of POST /assets/:id/extract-metadata (200 { assetId, status }
-  // per issue #281). We reload the list afterwards so the resulting status
-  // change is reflected (a recovered asset drops out of the "Needs attention"
-  // view and shows `ready`; a still-failing one stays flagged).
-  table.querySelectorAll('.asset-redrive-btn').forEach(function(btn) {
-    btn.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      var prev = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = 'Re-driving…';
-      try {
-        await apiFetch('/assets/' + encodeURIComponent(btn.dataset.id) + '/extract-metadata',
-          { method: 'POST', body: JSON.stringify({}) });
-        await loadAssets(detailPanel);
-      } catch (err) {
-        btn.disabled = false;
-        btn.textContent = prev;
-        alert('Re-drive failed: ' + err.message);
-      }
-    });
-  });
-
-  // Pagination controls
-  if (pagination) {
-    const totalPages = Math.max(1, Math.ceil(assetsState.total / ASSETS_PAGE_SIZE));
-    const currentPage = Math.floor(assetsState.offset / ASSETS_PAGE_SIZE) + 1;
-    pagination.style.display = 'flex';
-    pagination.querySelector('#assets-page-indicator').textContent =
-      'Page ' + currentPage + ' of ' + totalPages + ' (' + assetsState.total + ' assets)';
-    pagination.querySelector('#assets-prev').disabled = assetsState.offset === 0;
-    pagination.querySelector('#assets-next').disabled =
-      assetsState.offset + ASSETS_PAGE_SIZE >= assetsState.total;
-  }
 }
 
 async function showAssetDetail(id, detailPanel) {
@@ -1320,16 +1183,20 @@ async function renderAssetDetailBody(id, bodyEl) {
 }
 
 // ─── JOBS TAB ────────────────────────────────────────────────────────────────
+//
+// The jobs table is composed from the shared ops-UI table primitive
+// (public/ops-ui-table.js) + the URL-state contract (public/table-url-state.js)
+// via public/jobs-table.js. app.js only owns the surrounding tab chrome (header,
+// detail side panel, watch-folder footer, poll timer) and injects its fetch +
+// formatting helpers into the table. Sort/filter/pagination/URL-state all live
+// in the shared primitives — none of it is reinvented here (issue #370).
 
-// Jobs tab pagination + polling state.
-const JOBS_PAGE_SIZE = 20;
-const jobsState = { offset: 0, total: 0, selectedId: null };
 let jobsPollTimer = null;
+// The live jobs-table instance for the current tab render (used by the poll
+// timer and the in-panel cancel refresh).
+let jobsTableInstance = null;
 
 async function renderJobsTab(container) {
-  jobsState.offset = 0;
-  jobsState.selectedId = null;
-
   // Layout: full-height table on the left, detail side panel on the right (hidden initially).
   const layout = document.createElement('div');
   layout.className = 'assets-layout';
@@ -1350,22 +1217,6 @@ async function renderJobsTab(container) {
   ].join('');
   main.appendChild(header);
 
-  const tableScroll = document.createElement('div');
-  tableScroll.className = 'assets-table-scroll';
-  tableScroll.id = 'jobs-table-wrap';
-  main.appendChild(tableScroll);
-
-  const pagination = document.createElement('div');
-  pagination.className = 'pagination';
-  pagination.id = 'jobs-pagination';
-  pagination.style.display = 'none';
-  pagination.innerHTML = [
-    '<span class="page-indicator" id="jobs-page-indicator"></span>',
-    '<button id="jobs-prev" class="btn-ghost">Previous</button>',
-    '<button id="jobs-next" class="btn-ghost">Next</button>',
-  ].join('');
-  main.appendChild(pagination);
-
   // ── Side detail panel (created on demand) ──
   const detailPanel = document.createElement('div');
   detailPanel.id = 'job-detail';
@@ -1373,20 +1224,28 @@ async function renderJobsTab(container) {
   detailPanel.style.display = 'none';
   layout.appendChild(detailPanel);
 
+  // ── Jobs table (shared primitive + URL-state contract) ──
+  // The table owns sort/filter/pagination + URL sync; app.js injects the fetch
+  // helper and the formatters, plus row-select and cancel callbacks that reuse
+  // the existing detail panel and the existing DELETE /jobs/:id path.
+  const jobsTable = createJobsTable({
+    apiFetch,
+    fmtDate,
+    renderBadge,
+    onSelect: function(jobId) {
+      showJobDetail(jobId, detailPanel);
+    },
+    onCancel: function(jobId) {
+      return apiFetch('/jobs/' + encodeURIComponent(jobId), { method: 'DELETE' }).then(function() {
+        if (jobId && detailPanel.style.display !== 'none') showJobDetail(jobId, detailPanel);
+      });
+    },
+  });
+  jobsTableInstance = jobsTable;
+  main.appendChild(jobsTable.el);
+
   header.querySelector('#jobs-refresh').addEventListener('click', function() {
-    loadJobs(detailPanel);
-  });
-  pagination.querySelector('#jobs-prev').addEventListener('click', function() {
-    if (jobsState.offset >= JOBS_PAGE_SIZE) {
-      jobsState.offset -= JOBS_PAGE_SIZE;
-      loadJobs(detailPanel);
-    }
-  });
-  pagination.querySelector('#jobs-next').addEventListener('click', function() {
-    if (jobsState.offset + JOBS_PAGE_SIZE < jobsState.total) {
-      jobsState.offset += JOBS_PAGE_SIZE;
-      loadJobs(detailPanel);
-    }
+    jobsTable.refresh();
   });
 
   // ── Background service status (watch folder) — compact footer in the main column ──
@@ -1440,113 +1299,20 @@ async function renderJobsTab(container) {
   }
   refreshWatchFolderStatus();
 
-  await loadJobs(detailPanel);
+  await jobsTable.refresh();
 
-  // Auto-refresh the table (only the table, not the whole tab) every 5s.
+  // Auto-refresh the table (only the table, not the whole tab) every 5s. The
+  // table re-fetches its bounded working window and re-applies the current
+  // sort/filter/page client-side; `silent` avoids the loading flash.
   if (jobsPollTimer) clearInterval(jobsPollTimer);
   jobsPollTimer = setInterval(function() {
-    if (document.getElementById('jobs-table-wrap')) {
-      loadJobs(detailPanel, true);
+    if (jobsTable.el.isConnected) {
+      jobsTable.refresh(true);
     } else {
       clearInterval(jobsPollTimer);
       jobsPollTimer = null;
     }
   }, DETAIL_POLL_INTERVAL_MS);
-}
-
-async function loadJobs(detailPanel, silent) {
-  const wrap = document.getElementById('jobs-table-wrap');
-  const pagination = document.getElementById('jobs-pagination');
-  if (!wrap) return;
-  let loader = null;
-  if (!silent) {
-    wrap.innerHTML = '';
-    loader = loadingEl();
-    wrap.appendChild(loader);
-  }
-
-  let jobs = [];
-  try {
-    const qs = 'limit=' + JOBS_PAGE_SIZE + '&offset=' + jobsState.offset;
-    const res = await apiFetch('/jobs?' + qs);
-    jobs = (res && res.items) || [];
-    jobsState.total = (res && typeof res.total === 'number') ? res.total : jobs.length;
-  } catch (err) {
-    if (silent) return;
-    wrap.innerHTML = '';
-    showMsg(wrap, 'Failed to load jobs: ' + err.message, 'error');
-    if (pagination) pagination.style.display = 'none';
-    return;
-  }
-  if (loader) loader.remove();
-  wrap.innerHTML = '';
-
-  if (jobs.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'empty';
-    empty.textContent = jobsState.offset > 0 ? 'No more jobs.' : 'No jobs yet.';
-    wrap.appendChild(empty);
-    if (pagination) pagination.style.display = 'none';
-    return;
-  }
-
-  const rows = jobs.map(function(j) {
-    const selected = j.id === jobsState.selectedId ? ' class="row-selected"' : '';
-    return '<tr data-id="' + escHtml(j.id) + '"' + selected + '>' +
-      '<td class="cell-id">' + escHtml(j.id) + '</td>' +
-      '<td>' + escHtml(j.type) + '</td>' +
-      '<td>' + renderBadge(j.status) + '</td>' +
-      '<td class="cell-id">' + escHtml(j.assetId || '—') + '</td>' +
-      '<td>' + (j.progress != null ? escHtml(j.progress + '%') : '—') + '</td>' +
-      '<td>' + escHtml(fmtDate(j.createdAt)) + '</td>' +
-      '<td>' +
-        ((j.status === 'running' || j.status === 'pending')
-          ? '<button class="btn-danger job-cancel-btn" data-id="' + escHtml(j.id) + '" style="font-size:12px;padding:3px 8px;">Cancel</button>'
-          : '') +
-      '</td>' +
-      '</tr>';
-  }).join('');
-
-  const table = document.createElement('table');
-  table.innerHTML = '<thead><tr>' +
-    '<th>ID</th><th>Type</th><th>Status</th><th>Asset ID</th><th>Progress</th><th>Created</th><th></th>' +
-    '</tr></thead><tbody>' + rows + '</tbody>';
-  wrap.appendChild(table);
-
-  table.querySelectorAll('tbody tr').forEach(function(tr) {
-    tr.addEventListener('click', function() {
-      table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
-      tr.classList.add('row-selected');
-      jobsState.selectedId = tr.dataset.id;
-      showJobDetail(tr.dataset.id, detailPanel);
-    });
-  });
-
-  table.querySelectorAll('.job-cancel-btn').forEach(function(btn) {
-    btn.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      btn.disabled = true;
-      try {
-        await apiFetch('/jobs/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
-        await loadJobs(detailPanel);
-        if (jobsState.selectedId === btn.dataset.id) showJobDetail(btn.dataset.id, detailPanel);
-      } catch (err) {
-        btn.disabled = false;
-        alert('Error: ' + err.message);
-      }
-    });
-  });
-
-  if (pagination) {
-    const totalPages = Math.max(1, Math.ceil(jobsState.total / JOBS_PAGE_SIZE));
-    const currentPage = Math.floor(jobsState.offset / JOBS_PAGE_SIZE) + 1;
-    pagination.style.display = 'flex';
-    pagination.querySelector('#jobs-page-indicator').textContent =
-      'Page ' + currentPage + ' of ' + totalPages + ' (' + jobsState.total + ' total)';
-    pagination.querySelector('#jobs-prev').disabled = jobsState.offset === 0;
-    pagination.querySelector('#jobs-next').disabled =
-      jobsState.offset + JOBS_PAGE_SIZE >= jobsState.total;
-  }
 }
 
 async function showJobDetail(id, detailPanel) {
@@ -1565,9 +1331,10 @@ async function showJobDetail(id, detailPanel) {
   detailPanel.querySelector('#close-job-detail').addEventListener('click', function() {
     detailPanel.style.display = 'none';
     detailPanel.innerHTML = '';
-    jobsState.selectedId = null;
-    var table = document.querySelector('#jobs-table-wrap table');
-    if (table) table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
+    if (jobsTableInstance) jobsTableInstance.setSelected(null);
+    if (jobsTableInstance && jobsTableInstance.el) {
+      jobsTableInstance.el.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
+    }
   });
 
   detailPanel.querySelector('#popout-job-detail').addEventListener('click', function() {
@@ -1585,7 +1352,7 @@ async function showJobDetail(id, detailPanel) {
     },
     afterCancel: function() {
       showJobDetail(id, detailPanel);
-      loadJobs(detailPanel);
+      if (jobsTableInstance) jobsTableInstance.refresh();
     },
   });
 }
@@ -3954,10 +3721,50 @@ async function renderTranscodersTab(container) {
   await load();
 }
 
+// ─── Logs tab ────────────────────────────────────────────────────────────────
+// The logs table itself (cursor paging, time-range + message filters, order
+// toggle, URL-state sync) lives entirely in the shared primitive composed by
+// public/logs-table.js (issue #371). app.js only owns the surrounding tab chrome
+// (header + Refresh button) and injects its fetch + date formatter. Unlike the
+// jobs tab there is NO auto-poll: logs are append-only and cursor-paged, so a
+// background poll would fight the operator's in-flight cursor page; Refresh is
+// explicit instead.
+
+let logsTableInstance = null;
+
+async function renderLogsTab(container) {
+  const layout = document.createElement('div');
+  layout.className = 'assets-layout';
+  container.appendChild(layout);
+
+  const main = document.createElement('div');
+  main.className = 'assets-main';
+  layout.appendChild(main);
+
+  const header = document.createElement('div');
+  header.className = 'assets-main-header';
+  header.innerHTML = [
+    '<span class="section-title">Logs</span>',
+    '<div class="flex-gap">',
+    '  <button id="logs-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
+    '</div>',
+  ].join('');
+  main.appendChild(header);
+
+  const logsTable = createLogsTable({ apiFetch, fmtDate });
+  logsTableInstance = logsTable;
+  main.appendChild(logsTable.el);
+
+  header.querySelector('#logs-refresh').addEventListener('click', function () {
+    logsTable.reload();
+  });
+}
+
 // ─── Tab renderer registry ───────────────────────────────────────────────────
 
 TAB_RENDERERS['assets'] = renderAssetsTab;
 TAB_RENDERERS['jobs'] = renderJobsTab;
+TAB_RENDERERS['logs'] = renderLogsTab;
 TAB_RENDERERS['transcoders'] = renderTranscodersTab;
 TAB_RENDERERS['pipelines'] = renderPipelinesTab;
 TAB_RENDERERS['profiles'] = renderProfilesTab;

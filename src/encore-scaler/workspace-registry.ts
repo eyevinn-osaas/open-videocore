@@ -25,6 +25,10 @@ export type WorkspaceEncoreScalerConfig = {
   maxInstances: number;
   minInstances?: number;
   idleTimeoutMs: number;
+  // Bounded wait (ms) forwarded to every per-workspace scaler loop for the
+  // outbound callback-listener TLS-trust probe that gates first-job dispatch
+  // (issue #463). Undefined uses the loop's built-in default.
+  callbackTrustTimeoutMs?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   tickIntervalMs?: number;
@@ -49,6 +53,12 @@ export type WorkspaceEncoreScalerConfig = {
   // outcomes (issue #273). The scaler owns no repos, so main.ts supplies the
   // repo-driven sweep here.
   reconcileFailedTranscodes?: () => Promise<void>;
+  // Forwarded to every per-workspace scaler loop: invoked by reconcile() when it
+  // detects tracked jobs silently dropped from an Encore instance's active set
+  // with no completion callback (issue #449). The scaler owns no repos, so
+  // main.ts drives each id to a terminal `failed` state via the shared settle
+  // path.
+  onJobsDropped?: (encoreJobIds: string[]) => Promise<void>;
 };
 
 export class WorkspaceEncoreScalerRegistry implements EncoreClient {
@@ -70,6 +80,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       maxInstances: this.config.maxInstances,
       minInstances: this.config.minInstances,
       idleTimeoutMs: this.config.idleTimeoutMs,
+      callbackTrustTimeoutMs: this.config.callbackTrustTimeoutMs,
       oscContext: this.config.oscContext,
       redis: this.config.redis,
       redisUrl: this.config.redisUrl,
@@ -78,7 +89,8 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       profilesUrl: this.config.profilesUrl,
       onDispatched: this.config.onDispatched,
       onEncodeDispatched: this.config.onEncodeDispatched,
-      reconcileFailedTranscodes: this.config.reconcileFailedTranscodes
+      reconcileFailedTranscodes: this.config.reconcileFailedTranscodes,
+      onJobsDropped: this.config.onJobsDropped
     };
 
     const loop = new EncoreScalerLoop(scalerConfig);

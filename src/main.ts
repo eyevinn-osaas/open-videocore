@@ -63,6 +63,8 @@ import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { retentionRouter, archiveRetentionMsFromEnv } from './routes/retention.js';
+import { logsRouter } from './routes/logs.js';
+import { LogStore } from './services/log-store.js';
 import {
   ArchivedAssetPurgeLoop,
   archivePurgeIntervalMsFromEnv
@@ -70,7 +72,10 @@ import {
 import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
-import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
+import {
+  reconcileFailedTranscodes,
+  settleFailedTranscode
+} from './pipeline/failed-transcode-reconciler.js';
 import { reconcileStalledPackages } from './pipeline/stalled-package-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
@@ -110,6 +115,16 @@ const app = Fastify({ logger: true, maxParamLength: 500 });
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
 
+// Route inventory for the spec/route parity check (issue #480). The onRoute
+// hook fires synchronously for every route as it is registered — added here,
+// before any router, so it captures the complete surface. It is a pure
+// read-only collector with no request-path effect; the collected list is only
+// consumed when OPENAPI_ROUTE_DUMP points at a file (see after app.listen).
+const registeredRoutes: Array<{ method: string | string[]; url: string }> = [];
+app.addHook('onRoute', (routeOptions) => {
+  registeredRoutes.push({ method: routeOptions.method, url: routeOptions.url });
+});
+
 // Pass binary/media upload bodies through as a stream for PUT /:id/upload.
 // Registered before plugins so child scopes inherit these parsers.
 // The route handler reads request.body as a Readable and pipes it to MinIO.
@@ -142,6 +157,7 @@ await app.register(fastifySwagger, {
       { name: 'optional-services', description: 'Per-optional-service (auto-subtitles, scene-detect) provision, deprovision, and status' },
       { name: 'storage', description: 'Bucket and object-storage management' },
       { name: 'admin', description: 'Operational status and background service control' },
+      { name: 'logs', description: 'Cursor-paged operational log stream' },
     ],
     components: {
       securitySchemes: {
@@ -296,6 +312,13 @@ app.addHook('preHandler', async (request) => {
 });
 
 const operationStore = new OperationStore();
+
+// In-memory operational log store backing GET /api/v1/logs (issue #473). There
+// is no persistent log store today; this is the minimal append-only, sequence-
+// keyed source that satisfies cursor paging + the log record shape, modelled on
+// operationStore above. Registered by reference so future producers can append
+// to the same instance the router reads.
+const logStore = new LogStore();
 
 await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
@@ -502,6 +525,13 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
+// Bounded wait (issue #463) for the outbound TLS-trust probe to a freshly
+// spawned instance's per-instance callback-listener ingress before that instance
+// is eligible for its FIRST job. Closes the race between the ingress certificate
+// becoming ready/trusted and the instance beginning to process (and fail) its
+// first job. On timeout the instance is quarantined from job assignment rather
+// than dispatched to. Defaults to 60s; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
+const encoreCallbackTrustTimeoutMs = parseInt(process.env['ENCORE_CALLBACK_TRUST_TIMEOUT_MS'] || String(60 * 1000), 10);
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -685,6 +715,9 @@ function activateScaler(redisUrl: string): void {
     oscContext,
     maxInstances: encoreMaxInstances,
     idleTimeoutMs: encoreIdleTimeoutMs,
+    // Gate first-job dispatch on confirmed outbound callback-listener TLS trust
+    // (issue #463): bounded wait before a freshly spawned instance is eligible.
+    callbackTrustTimeoutMs: encoreCallbackTrustTimeoutMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
@@ -794,6 +827,41 @@ function activateScaler(redisUrl: string): void {
           warn: (...a: unknown[]) => app.log.warn(a)
         }
       });
+    },
+    // When the scaler's reconcile() detects that tracked jobs have silently
+    // vanished from an Encore instance's live QUEUED/IN_PROGRESS set with no
+    // completion callback (issue #449, ADR-016 Direction 2 — reconcile-driven
+    // terminal settle), it raises the ids here. The scaler owns no repositories,
+    // so main.ts performs the terminal write: resolve each id to its Job (by the
+    // encoreJobId / externalId it was submitted with, as onDispatched does) and
+    // route it through the SAME idempotent settle path the #273 sweep uses
+    // (completeTranscode({ success: false }) + pipeline-lock release). Reusing
+    // settleFailedTranscode guarantees identical asset/pipeline side-effects and
+    // first-terminal-write-wins idempotency, so a late SUCCESSFUL callback cannot
+    // clobber the settle. Best-effort per id: one job's failure never blocks the
+    // rest, and the scaler already swallows a thrown hook.
+    onJobsDropped: async (encoreJobIds: string[]) => {
+      for (const encoreJobId of encoreJobIds) {
+        try {
+          const found = await jobRepository.findByEncoreJobId(encoreJobId);
+          if (!found) continue;
+          await settleFailedTranscode(
+            {
+              jobs: jobRepository,
+              assets: assetRepository,
+              pipeline: pipelineRepository,
+              logger: {
+                info: (...a: unknown[]) => app.log.info(a),
+                warn: (...a: unknown[]) => app.log.warn(a)
+              }
+            },
+            found.job,
+            'dropped by Encore: gone from active set with no completion'
+          );
+        } catch (err) {
+          app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');
+        }
+      }
     }
   });
   encore = scalerRegistry;
@@ -964,6 +1032,18 @@ function activateScaler(redisUrl: string): void {
     // "packaging-queue"; overridable so the poller can target a differently
     // named packager queue without a code change.
     packagingQueueKey: process.env['PACKAGING_QUEUE_KEY'],
+    // #464: bounds for the independent job-status reconciliation sweep. All keep
+    // the poller's own defaults (30s interval, page size 100, no instance cap)
+    // when the env var is unset, so behaviour is unchanged out of the box.
+    sweepIntervalMs: process.env['ENCORE_SWEEP_INTERVAL_MS']
+      ? parseInt(process.env['ENCORE_SWEEP_INTERVAL_MS'], 10)
+      : undefined,
+    sweepPageSize: process.env['ENCORE_SWEEP_PAGE_SIZE']
+      ? parseInt(process.env['ENCORE_SWEEP_PAGE_SIZE'], 10)
+      : undefined,
+    sweepMaxInstances: process.env['ENCORE_SWEEP_MAX_INSTANCES']
+      ? parseInt(process.env['ENCORE_SWEEP_MAX_INSTANCES'], 10)
+      : undefined,
     logger: app.log
   });
 
@@ -1209,14 +1289,17 @@ const onObjectStored =
       }
     : undefined;
 
-if (storageAvailable) {
-  await app.register(assetUploadRouter, {
-    prefix: '/api/v1/assets',
-    repository: assetRepository,
-    storageFor,
-    onObjectStored
-  });
-}
+// Registered UNCONDITIONALLY (mirroring assetsRouter above, main.ts:1184) so
+// the upload/multipart routes always enter the route tree and therefore the
+// generated OpenAPI spec (issue #479). When object storage is not wired,
+// storageFor is undefined and every storage-backed handler responds 501
+// not_configured rather than the whole router silently disappearing.
+await app.register(assetUploadRouter, {
+  prefix: '/api/v1/assets',
+  repository: assetRepository,
+  storageFor: storageAvailable ? storageFor : undefined,
+  onObjectStored
+});
 
 // Watch-folder ingest (issue #16). Opt-in via WATCH_FOLDER_ENABLED=true. It is
 // a global background service watching a single source bucket, so it needs a
@@ -1273,6 +1356,12 @@ const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: 
   }
 };
 await app.register(retentionRouter, retentionRouterOptions);
+
+// Operational logs listing (issue #473). Cursor/sequence-paged, newest-first,
+// append-only log stream over the in-memory logStore. Offset paging is
+// deliberately excluded (#371): only a bounded `limit` + opaque `cursor`, so
+// appended entries never shift an in-flight page.
+await app.register(logsRouter, { prefix: '/api/v1/logs', logStore });
 
 // Archived-asset retention purge sweep (issue #327, part of #323). An
 // INDEPENDENT unref'd, overlap-guarded interval — NOT folded into the Encore
@@ -1369,6 +1458,22 @@ app.addHook('onClose', async () => {
 
 const port = parseInt(process.env['PORT'] || '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
+
+// Spec/route parity check support (issue #480). When OPENAPI_ROUTE_DUMP is set,
+// the app has now finished registering every router (onRoute has fired for all
+// of them). Write the captured route inventory to that path and exit cleanly,
+// BEFORE the background loops below spin up — those need live OSC connectivity
+// that the parity check does not. This makes the enumeration reuse the real
+// boot path (identical to generate-openapi.sh) rather than a hand-maintained
+// route list that could itself drift.
+const routeDumpPath = process.env['OPENAPI_ROUTE_DUMP'];
+if (routeDumpPath) {
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(routeDumpPath, JSON.stringify(registeredRoutes, null, 2));
+  app.log.info({ routeDumpPath, count: registeredRoutes.length }, 'openapi route dump written; exiting');
+  await app.close();
+  process.exit(0);
+}
 
 // Boot-time reachability self-check for the local Encore profiles index (#284).
 // The server is now listening and every router (incl. profilesRouter) is
