@@ -7,23 +7,44 @@
 // observability for the pull worker — clients poll GET /api/v1/jobs/:id to see
 // status, progress, and any terminal error.
 
-import type { FailureClass } from '../encore-scaler/retry-policy.js';
+import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
 
 // ---------------------------------------------------------------------------
 // Job model + lifecycle
 // ---------------------------------------------------------------------------
+
+// Caller-facing interruption reasons (#515). A job may be non-terminally
+// interrupted by an infrastructure/topology event (NOT a media failure) and
+// auto-recovered. This is the distinguishable, clearly-recoverable reason a
+// caller reads to tell an interruption apart from a genuine `failed` outcome.
+//
+// Currently the only value is 'interrupted_by_scaledown': the job's shared
+// worker pool scaled a worker away mid-job (#513 drain boundary), so the work
+// was lost to a topology event and re-enqueued. It maps 1:1 from the internal
+// 'interrupted_by_scaledown' FailureClass (src/encore-scaler/retry-policy.ts)
+// but is a SEPARATE caller-facing vocabulary so the internal set can evolve
+// without changing the public contract. It is a modelled as an additive,
+// OPTIONAL field so the existing `status` enum stays backward compatible: an
+// interrupted job stays `running` (it is being auto-retried) and merely gains
+// this reason annotation rather than transitioning to a new status value.
+export const JOB_INTERRUPTION_REASONS = ['interrupted_by_scaledown'] as const;
+export type JobInterruptionReason = (typeof JOB_INTERRUPTION_REASONS)[number];
 
 // A single dispatch of a transcode job to an Encore instance (ADR-012, #379).
 // Persisted durably on the Job record so the attempt history outlives the
 // TTL'd Valkey retry keys (#380). `startedAt` is stamped when the scaler
 // dispatches the attempt; `endedAt`/`classification` are populated on
 // completion by the poller (#381). `classification` reuses the retry policy's
-// FailureClass (src/encore-scaler/retry-policy.ts:70) — do NOT redefine it.
+// MessageFailureClass (src/encore-scaler/retry-policy.ts) — the message-derived
+// subset only. A completed encode attempt always ended with (or without) an Encore
+// failure message; the topology-event class 'interrupted_by_scaledown' (#514) is
+// NEVER a completed-attempt classification, so it is intentionally excluded from
+// this caller-facing field. Do NOT redefine it.
 export type EncodeAttempt = {
   index: number;
   startedAt: string;
   endedAt?: string;
-  classification?: FailureClass;
+  classification?: MessageFailureClass;
 };
 
 // Job lifecycle. A job is created `pending`. Transcode jobs then sit `queued`
@@ -87,6 +108,21 @@ export type Job = {
   // durably alongside the Valkey counter at dispatch time; clearing the Valkey
   // retry state does NOT clear this log.
   encodeAttemptLog?: EncodeAttempt[];
+  // --- Recoverable interruption surfacing (#515) ---
+  // True when this job was interrupted by an infrastructure/topology event
+  // (not a media failure) and is being auto-retried. Additive and optional:
+  // absent (not false) on jobs that were never interrupted. The job's `status`
+  // stays `running` while interrupted — this flag, together with
+  // `interruptionReason`, is how a caller distinguishes a recoverable
+  // interruption from a genuine `failed` outcome (#515). Set at the scaler's
+  // drain boundary via the onJobInterrupted hook; the value is not cleared on
+  // the subsequent successful re-dispatch, so a completed job that WAS once
+  // interrupted still reflects that it recovered.
+  interrupted?: boolean;
+  // The distinguishable, clearly-recoverable reason the job was interrupted
+  // (#515). Present only when `interrupted` is true. Today the only value is
+  // 'interrupted_by_scaledown' (worker pool scaled a worker away mid-job).
+  interruptionReason?: JobInterruptionReason;
   createdAt: string;
   updatedAt: string;
 };
@@ -123,6 +159,12 @@ export type UpdateJobInput = {
   // be patched (and so applyJobPatch carries them through unchanged).
   encodeAttempts?: number;
   encodeAttemptLog?: EncodeAttempt[];
+  // Recoverable interruption surfacing (#515). Patched at the scaler's drain
+  // boundary (via main.ts's onJobInterrupted hook) to annotate a job that was
+  // interrupted by scale-down and re-enqueued. These are additive annotations
+  // ONLY; they do NOT drive a status transition (the job stays `running`).
+  interrupted?: boolean;
+  interruptionReason?: JobInterruptionReason;
 };
 
 const ALLOWED_JOB_TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
@@ -171,7 +213,7 @@ export interface JobRepository {
   // undefined if the job id is unknown.
   appendEncodeAttempt(
     id: string,
-    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined>;
   // Durably close out the latest (open) encode-attempt on completion (ADR-012,
   // #381): stamp its `endedAt` and, for failures, the retry `classification`
@@ -181,7 +223,7 @@ export interface JobRepository {
   // updated job, or undefined if the job id is unknown.
   finalizeEncodeAttempt(
     id: string,
-    patch: { endedAt?: string; classification?: FailureClass }
+    patch: { endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined>;
 }
 
@@ -237,6 +279,8 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.renditionAssetIds !== undefined) next.renditionAssetIds = patch.renditionAssetIds;
   if (patch.encodeAttempts !== undefined) next.encodeAttempts = patch.encodeAttempts;
   if (patch.encodeAttemptLog !== undefined) next.encodeAttemptLog = patch.encodeAttemptLog;
+  if (patch.interrupted !== undefined) next.interrupted = patch.interrupted;
+  if (patch.interruptionReason !== undefined) next.interruptionReason = patch.interruptionReason;
   return next;
 }
 
@@ -251,7 +295,7 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
 // actual dispatch. `startedAt` defaults to now when omitted.
 export function appendEncodeAttemptToJob(
   existing: Job,
-  attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass },
+  attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: MessageFailureClass },
   now: string
 ): Job {
   const log = existing.encodeAttemptLog ? [...existing.encodeAttemptLog] : [];
@@ -285,7 +329,7 @@ export function appendEncodeAttemptToJob(
 // field still has a single non-zero reading rather than staying absent.
 export function finalizeLatestEncodeAttemptOnJob(
   existing: Job,
-  patch: { endedAt?: string; classification?: FailureClass },
+  patch: { endedAt?: string; classification?: MessageFailureClass },
   now: string
 ): Job {
   const endedAt = patch.endedAt ?? now;
@@ -382,7 +426,7 @@ export class InMemoryJobRepository implements JobRepository {
 
   async appendEncodeAttempt(
     id: string,
-    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined> {
     const existing = this.store.get(id);
     if (!existing) {
@@ -395,7 +439,7 @@ export class InMemoryJobRepository implements JobRepository {
 
   async finalizeEncodeAttempt(
     id: string,
-    patch: { endedAt?: string; classification?: FailureClass }
+    patch: { endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined> {
     const existing = this.store.get(id);
     if (!existing) {
