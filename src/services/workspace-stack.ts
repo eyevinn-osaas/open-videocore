@@ -26,6 +26,7 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
+import type { AuditEmitter } from '../data/audit-emit.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { InMemorySearchRepository } from '../data/inmemory-search-repo.js';
@@ -36,6 +37,11 @@ import { InMemoryPipelineRepository, type PipelineRepository } from '../data/pip
 import type { SearchRepository } from '../data/search-repo.js';
 import type { WebhookRepository } from '../data/webhook-repo.js';
 import type { CollectionRepository } from '../data/collection-repo.js';
+import {
+  CouchAuditRepository,
+  InMemoryAuditRepository,
+  type AuditRepository
+} from '../data/audit-repo.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
@@ -91,6 +97,14 @@ export type WorkspaceConnections = {
   search: SearchRepository;
   webhooks: WebhookRepository;
   collections: CollectionRepository;
+  // Audit store for this stack. Backed by CouchAuditRepository in production and
+  // InMemoryAuditRepository on the in-memory/env paths, so it is always present.
+  // Exposes BOTH the read-only query surface (issue #565, consumed by
+  // PerWorkspaceAuditRepository.query) and the append-only `record()` write
+  // primitive (issue #564, consumed by PerWorkspaceAuditEmitter.record). Typed as
+  // the intersection so a single field serves both wrappers; both concrete repos
+  // satisfy it.
+  audit: AuditRepository & AuditEmitter;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
   storageFor: StorageFactory | undefined;
@@ -181,11 +195,16 @@ function buildConnectionsFromStack(
 
   const assets = new CouchAssetRepository(wc);
   const jobs = new CouchJobRepository(wc);
-  const search = new CouchSearchRepository(wc);
-  const webhooks = new CouchWebhookRepository(wc);
   const collections = new CouchCollectionRepository(wc);
+  // Search projects both assets and collections (issue #561). The collection
+  // repo is passed so collection hits are reconstructed by the same
+  // authoritative mapping and surfaced distinctly from asset hits.
+  const search = new CouchSearchRepository(wc, collections);
+  const webhooks = new CouchWebhookRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
+  // Audit store over the same per-stack CouchDB connection (issue #564).
+  const audit = new CouchAuditRepository(wc);
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -216,6 +235,7 @@ function buildConnectionsFromStack(
     search,
     webhooks,
     collections,
+    audit,
     profiles,
     pipelines,
     storageFor,
@@ -251,6 +271,10 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let search: SearchRepository;
   let webhooks: WebhookRepository;
   let collections: CollectionRepository;
+  // Audit store: always present (CouchAuditRepository on the couch env path,
+  // InMemoryAuditRepository otherwise). Exposes both the #565 query surface and
+  // the #564 record() write primitive.
+  let audit: AuditRepository & AuditEmitter;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
 
@@ -260,18 +284,22 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     const wc = () => new StackCouch(server, dbName);
     assets = new CouchAssetRepository(wc);
     jobs = new CouchJobRepository(wc);
-    search = new CouchSearchRepository(wc);
-    webhooks = new CouchWebhookRepository(wc);
     collections = new CouchCollectionRepository(wc);
+    // Search projects assets + collections (issue #561).
+    search = new CouchSearchRepository(wc, collections);
+    webhooks = new CouchWebhookRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
+    audit = new CouchAuditRepository(wc);
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
     jobs = new InMemoryJobRepository();
-    search = new InMemorySearchRepository(mem);
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
+    audit = new InMemoryAuditRepository();
+    // Search projects assets + collections (issue #561).
+    search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
     pipelines = new InMemoryPipelineRepository();
   }
@@ -303,7 +331,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
@@ -322,13 +350,15 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
 function buildInMemoryConnections(): WorkspaceConnections {
   const assets = new InMemoryAssetRepository();
   const jobs = new InMemoryJobRepository();
-  const search = new InMemorySearchRepository(assets);
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
+  const audit = new InMemoryAuditRepository();
+  // Search projects assets + collections (issue #561).
+  const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
   return {
-    assets, jobs, search, webhooks, collections, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',
@@ -552,6 +582,57 @@ export class WorkspaceStackResolver {
       resolvedAt: Date.now()
     });
     return connections;
+  }
+
+  // Resolve the EFFECTIVE stack identity a request routes to (issue #615).
+  //
+  // This is the single source of truth for "which stack does this request
+  // belong to", used to KEY the transcode/scaler coordinates (Encore pool,
+  // Valkey queue, MinIO S3 endpoint) so they are resolved per request rather
+  // than pinned to whichever stack was provisioned first in the process.
+  //
+  // Resolution mirrors resolve(): an explicit `requestedStackName` (from the
+  // X-Stack-Name header) addresses that stack directly when a config exists for
+  // it; otherwise (no header, or the requested name has no stored config) the
+  // FIRST provisioned stack for the namespace is the workspace default. Returns
+  // `undefined` only when no stack is provisioned at all (or the parameter store
+  // is unconfigured) — callers then fall back to the fixed deployment context.
+  //
+  // CRITICAL (issue #615): a requested name that HAS a stored config is returned
+  // verbatim and is NEVER silently rewritten to the first-listed stack, so two
+  // healthy stacks in one workspace can never share a mis-resolved client.
+  async resolveStackName(requestedStackName?: string): Promise<string | undefined> {
+    const ps = this.paramStore;
+    if (!ps) return undefined;
+    try {
+      if (requestedStackName) {
+        const config = await ps.loadStackConfig(
+          STACK_CONFIG_NAMESPACE,
+          requestedStackName
+        );
+        // A requested name that resolves to a real config wins verbatim; the
+        // request routes to exactly the stack it named regardless of provision
+        // order. Only when the requested name has NO stored config do we fall
+        // through to the workspace default (a stale UI selection must not break
+        // routing), matching resolve()'s fallback semantics.
+        if (config) return requestedStackName;
+      }
+      const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+      return names.length > 0 ? names[0] : undefined;
+    } catch (err) {
+      // A parameter-store read failure is not authority to invent a stack: log
+      // and return undefined so the caller uses the fixed deployment context
+      // (unchanged pre-#615 behaviour) rather than a fabricated name.
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE,
+          requestedStackName: requestedStackName ?? '(workspace default)'
+        },
+        'stack resolver: failed to resolve effective stack name'
+      );
+      return undefined;
+    }
   }
 
   // Synchronous read of already-resolved connections from cache. Returns

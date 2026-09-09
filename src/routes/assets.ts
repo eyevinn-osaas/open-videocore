@@ -17,12 +17,17 @@ import { randomUUID } from 'node:crypto';
 import {
   ASSET_REVIEW_STATES,
   ASSET_STATUSES,
+  DeleteProtectedError,
   HasChildrenError,
   InMemoryAssetRepository,
   InvalidReviewTransitionError,
   InvalidStateTransitionError,
   MAX_LIMIT,
   ParentNotFoundError,
+  ReferencedByJobError,
+  STORAGE_BYTE_CLASSES,
+  STORAGE_TIERS,
+  defaultStorageTiering,
   isUlid,
   normalizeTags,
   SUBTITLE_FORMATS,
@@ -45,8 +50,10 @@ import {
   type TamsQueryAddress
 } from '../tams/tams-query-contract.js';
 import { WorkspaceAccessError } from '../data/guard.js';
+import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
+import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
 import {
   SourceTooLargeError,
   WorkspaceStorage,
@@ -61,8 +68,14 @@ import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
 import {
   extractTechnicalMetadata,
   type ExtractDeps,
+  type ExternalProbeSource,
   type ProbeRunner
 } from '../pipeline/metadata-extractor.js';
+import {
+  UnknownSourceBackendError,
+  type StorageBackendRegistry
+} from '../services/storage-backend-registry.js';
+import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
@@ -98,6 +111,11 @@ import {
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
+import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
+import {
+  backendOutputDestination,
+  DEFAULT_BACKEND_ID
+} from '../services/storage-backend-registry.js';
 import {
   deliveryMode,
   manifestUrlsForLocation,
@@ -118,6 +136,8 @@ import { isProfileRunnable } from '../services/profile-runnability.js';
 import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
+import { isJobThroughputCapExceededError } from '../encore-scaler/job-throughput-cap.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
 import {
   rewrap,
@@ -135,6 +155,38 @@ const statusSchema = z.enum(ASSET_STATUSES);
 
 // Editorial review state (issue #134), distinct from lifecycle `status`.
 const reviewStateSchema = z.enum(ASSET_REVIEW_STATES);
+
+// Storage-tier state (ADR-019, issue #556), distinct from lifecycle `status`.
+// The physical byte-location axis (`hot` | `archive`) tracked per byte class,
+// plus any in-flight rehydrate. REPRESENTATION ONLY — no relocation/restore
+// execution here. `archive` is the tier value; the string `archived` is the
+// lifecycle status and is NEVER used as a tier (ADR-019 D1/D6).
+const storageTierSchema = z.enum(STORAGE_TIERS);
+const storageByteClassSchema = z.enum(STORAGE_BYTE_CLASSES);
+const rehydrateStateSchema = z.object({
+  byteClass: storageByteClassSchema.describe('The byte class being restored from archive back to hot.'),
+  startedAt: z.string().describe('ISO timestamp the restore was requested/started.')
+});
+const storageTieringSchema = z.object({
+  // Tier per byte class (ADR-019 D3). Every class is present with a concrete
+  // value; a fresh/existing asset defaults every class to `hot`.
+  tiers: z
+    .record(storageByteClassSchema, storageTierSchema)
+    .describe(
+      'Physical storage tier (`hot` | `archive`) per byte class (source, ' +
+        'renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle ' +
+        '`status`; `archive` is a byte location, never the `archived` status ' +
+        '(ADR-019 D1/D3/D6). Defaults to every class `hot`.'
+    ),
+  // In-flight rehydrate indicator (ADR-019 D4). Empty when no restore is running.
+  rehydrating: z
+    .array(rehydrateStateSchema)
+    .describe(
+      'Byte classes with an archive->hot restore currently in flight, each with ' +
+        'its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). ' +
+        'Representation only — this API does not execute the restore.'
+    )
+});
 
 // A custom Encore profile a caller may supply instead of a named preset. Kept
 // permissive (forwarded to Encore) but bounded so it cannot be abused.
@@ -322,7 +374,79 @@ const tamsLookupQuerySchema = z.object({
   )
 });
 
+// External-identifier resolver path params (issue #576, ADR-019). The lookup key
+// is the `{ namespace, id }` pair modelled by #575 and persisted under
+// `administrative.externalIdentifiers[]` (asset-document.ts). Both components are
+// REQUIRED and non-empty, matching the persisted `ExternalIdentifierSchema`
+// grammar (`namespace`/`id` are each `z.string().min(1)`), so the resolver's
+// accepted grammar is 1:1 with the stored grammar. An empty component is
+// rejected at the boundary with 400 before the handler runs. `id` is an opaque
+// upstream foreign key (UUID / numeric / slug), so it stays a free-form string.
+const externalIdParamsSchema = z.object({
+  namespace: z
+    .string()
+    .min(1)
+    .describe(
+      'Upstream system-of-record label the external id belongs to (e.g. ' +
+        '`ingest-mam`, `rights-registry`). Required, non-empty.'
+    ),
+  id: z
+    .string()
+    .min(1)
+    .describe(
+      'Opaque foreign-key value in that system (UUID / numeric id / slug). ' +
+        'Required, non-empty.'
+    )
+});
+
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
+
+// Machine-readable body for a 504 when a required stack dependency (queue/
+// Valkey, Encore, storage) is unreachable or times out on the transcode path
+// (issue #616). Names the failing dependency and its endpoint so a caller can
+// branch on `dependency` without string-matching the message.
+const dependencyUnreachableSchema = z.object({
+  error: z.literal('dependency_unreachable'),
+  dependency: z.enum(['queue', 'encore', 'storage']),
+  endpoint: z.string(),
+  message: z.string()
+});
+
+// Machine-readable body for a 429 when the operator-configured job-throughput
+// cap is exceeded on the transcode submit path (issue #580). Names the configured
+// ceiling and observed outstanding-job count so a caller can back off and retry.
+const jobThroughputCapSchema = z.object({
+  error: z.literal('job_throughput_cap_exceeded'),
+  cap: z.number(),
+  outstanding: z.number(),
+  message: z.string()
+});
+
+// Explicit delete-lock (ADR-020 decision 3, issue #568) as surfaced on the API.
+// Field names/types mirror ADR-020 exactly: locked, reason?, lockedAt, lockedBy?.
+const deleteLockSchema = z.object({
+  locked: z.boolean(),
+  reason: z.string().optional(),
+  lockedAt: z.string(),
+  lockedBy: z.string().optional()
+});
+
+// The shared blocked-delete envelope (ADR-020 decision 1, issue #568). EXTENDS
+// the existing `{ error, message? }` shape rather than diverging: adds the
+// required `reason` enum and the required `blockedBy` object. For the explicit
+// -lock case `reason` is `delete_protected` and both id arrays are empty (the
+// block is intrinsic to the document, not a foreign reference). The other two
+// reason members are reserved by ADR-020 for sibling sub-issues (OUT OF SCOPE
+// here) but declared so the response schema is the single shared contract.
+const deleteBlockedSchema = z.object({
+  error: z.literal('delete_blocked'),
+  message: z.string().optional(),
+  reason: z.enum(['referenced_by_job', 'member_of_collection', 'delete_protected']),
+  blockedBy: z.object({
+    jobIds: z.array(z.string()),
+    collectionIds: z.array(z.string())
+  })
+});
 
 // Delivery URL response (issue #14). Closes the pipeline loop: a client asks for
 // playback/download URLs for an asset and gets back whatever delivery surface is
@@ -561,6 +685,20 @@ const assetSchema = z.object({
   // Editorial review state (issue #134), INDEPENDENT of `status`. Optional so
   // pre-existing assets serialized before reviewState existed still validate.
   reviewState: reviewStateSchema.optional(),
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent = unlocked;
+  // when present with `locked: true` the asset is delete-protected. Set/cleared
+  // only via PUT/DELETE /:id/lock (the dedicated system path), never the
+  // editorial update path.
+  deleteLock: deleteLockSchema.optional(),
+  // Storage-tier state (ADR-019, issue #556), INDEPENDENT of `status` and
+  // `reviewState`: the physical byte-location axis (`hot` | `archive`) per byte
+  // class plus any in-flight rehydrate. Always present on responses: the response
+  // serializer `.default()`s it to every class `hot` with nothing rehydrating for
+  // any asset lacking explicit tier state (new/existing/pre-#556 assets), so the
+  // axis surfaces concretely without back-filling persistence. This is
+  // representation only — the API exposes the state but does not relocate bytes
+  // or run rehydrates.
+  storageTiering: storageTieringSchema.default(() => defaultStorageTiering()),
   parentId: z.string().optional(),
   // Version-chain linkage (issue #118), DISTINCT from `parentId`. Present only
   // on outputs produced by a clip/export/rewrap run with `asVersion`. Absent on
@@ -633,6 +771,14 @@ type AssetsRouterOptions = {
   // Defaults to the real fire-and-forget extractor.
   extract?: typeof extractTechnicalMetadata;
   extractDeps?: Partial<ExtractDeps>;
+  // External storage-backend registry (issue #547/#548, ADR-017). When present,
+  // POST /ingest-url may reference a registered external backend by id or name
+  // via `sourceBackend`: the ingest sources bytes from that bucket (the
+  // probe/transcode jobs read `s3://bucket/key` in place using the registered
+  // endpoint + credential references) instead of pulling into OSC-managed
+  // storage. When absent, `sourceBackend` is rejected (registry not configured)
+  // and ingest behaves exactly as before (OSC-managed default source).
+  storageBackendRegistry?: StorageBackendRegistry;
   // Auto-subtitles (issue #114). `subtitleGenerator` calls the OSC
   // eyevinn-auto-subtitles (Whisper) service (a stub in tests). When absent (or
   // no object storage), the OPTIONAL `subtitles` pipeline step skips gracefully —
@@ -654,6 +800,16 @@ type AssetsRouterOptions = {
   // Encore transcode client (issue #8). When absent, POST /:id/transcode
   // responds 501 (Encore not configured on this deployment).
   encore?: EncoreClient;
+  // Resolve the EFFECTIVE stack identity a transcode request routes to (issue
+  // #615). Given the request's X-Stack-Name header (or undefined for the
+  // workspace default), returns the stack name to KEY the Encore auto-scaler
+  // pool / Valkey queue / MinIO endpoint by, so a request against a healthy
+  // named stack is never routed to whichever stack was provisioned first in the
+  // process. When absent (tests, env-override single-stack deployments) or when
+  // it resolves undefined (no provisioned stack / store unconfigured), the
+  // transcode path falls back to the fixed DEPLOYMENT_CONTEXT — unchanged
+  // pre-#615 behaviour.
+  resolveStackContext?: (requestedStackName?: string) => Promise<string | undefined>;
   // S3 bucket names Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
@@ -715,6 +871,11 @@ type AssetsRouterOptions = {
   // not exercise named profiles), both checks are skipped (permissive) and the
   // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
+  // Best-effort audit emission (issue #564). Wired to the append-only audit
+  // store's `record()` write primitive. When absent, mutations proceed
+  // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
+  // logged, never propagated — no route becomes newly failable.
+  audit?: AuditEmitter;
 };
 
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
@@ -832,7 +993,23 @@ const ingestUrlSchema = z
           'on responses). Accepted as an alias of `name`; `title` wins when ' +
           'both are supplied.'
       ),
-    tags: tagsSchema.optional()
+    tags: tagsSchema.optional(),
+    sourceBackend: z
+      .string()
+      .min(1)
+      .max(256)
+      .optional()
+      .describe(
+        'Reference (id or name) to a registered external storage backend ' +
+          '(issue #548, ADR-017) to source the asset bytes from, instead of the ' +
+          'OSC-managed default storage. The backend must be registered (POST ' +
+          '/storage/backends) and serve the `source` (or `both`) role. When set, ' +
+          '`sourceUrl` addresses the object WITHIN that backend as ' +
+          '`s3://<bucket>/<key>` (bucket may be omitted to use the registered ' +
+          "backend's bucket, i.e. `s3:///<key>` or a bare `<key>`). No external " +
+          'credentials are ever supplied inline: the registered endpoint + ' +
+          'credentials are reused server-side. Omit for the default source.'
+      )
   })
   .strict();
 
@@ -840,6 +1017,39 @@ const ingestAcceptedSchema = z.object({
   assetId: z.string(),
   jobId: z.string()
 });
+
+// Derive the object key WITHIN a registered external backend's bucket from the
+// ingest `sourceUrl` (issue #548). Three accepted forms, all credential-free:
+//   - `s3://<bucket>/<key>` — the bucket must match the registered backend's
+//     bucket (a mismatch is rejected so a caller cannot redirect a registered
+//     credential at an arbitrary bucket);
+//   - `s3:///<key>` — empty authority, uses the registered bucket;
+//   - a bare `<key>` (no scheme) — uses the registered bucket.
+// Returns the leading-slash-stripped key. Throws SourceValidationError (-> 400)
+// on an empty key or a bucket mismatch.
+export function externalObjectKeyFromSourceUrl(
+  sourceUrl: string,
+  registeredBucket: string
+): string {
+  let raw = sourceUrl.trim();
+  if (/^s3:\/\//i.test(raw)) {
+    const withoutScheme = raw.replace(/^s3:\/\//i, '');
+    const slash = withoutScheme.indexOf('/');
+    const bucket = slash === -1 ? withoutScheme : withoutScheme.slice(0, slash);
+    const key = slash === -1 ? '' : withoutScheme.slice(slash + 1);
+    if (bucket && bucket !== registeredBucket) {
+      throw new SourceValidationError(
+        `s3 bucket "${bucket}" does not match the registered backend bucket`
+      );
+    }
+    raw = key;
+  }
+  const key = raw.replace(/^\/+/, '');
+  if (!key) {
+    throw new SourceValidationError('sourceUrl must address an object key within the backend bucket');
+  }
+  return key;
+}
 
 // Resolve the Encore job URL for packaging by looking up the instance URL from
 // the Redis pool using the encoreJobId → instanceId → EncoreInstanceRecord chain.
@@ -1212,6 +1422,17 @@ function objectKeyFromManifest(manifestUrl: string, bucket: string): string {
 
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
+
+  // Router-layer method→action authorisation gate (ADR-018 decision 2, seam 1;
+  // issue #554). Registered plugin-scoped so it runs on EVERY asset route
+  // (Fastify encapsulation) before the handler: it derives the action from the
+  // HTTP method (GET/HEAD→read, POST/PUT/PATCH→write, DELETE→delete) and calls
+  // authorize(role, 'asset'). Denials are a fail-closed 403 with the stable
+  // AUTHZ_FORBIDDEN_ERROR reason code, distinct from the 401 presence gate
+  // (decision 5). Per ADR-018 decision 4 each asset is authorised independently
+  // against the caller's workspace role — no cascade from any collection.
+  app.addHook('preHandler', resourceAuthorizationPreHandler('asset'));
+
   const repo = opts.repository ?? new InMemoryAssetRepository();
   const jobs = opts.jobRepository ?? new InMemoryJobRepository();
   const comments = opts.commentRepository ?? new InMemoryCommentRepository();
@@ -1223,6 +1444,27 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const rewrapRunner = opts.rewrap ?? rewrap;
   const clipRunnerOrchestrator = opts.clip ?? runClip;
   const storageFor = opts.storageFor;
+  // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
+  const audit = opts.audit;
+
+  // Resolve the scaler/Encore context key for a transcode request (issue #615).
+  // The scaler auto-scaler partitions its Encore pool, Valkey queue keys, and
+  // MinIO S3-endpoint resolution by this context string (encodeEncoreJobId's
+  // contextId — see pipeline/transcode.ts). Pre-#615 this was the fixed
+  // DEPLOYMENT_CONTEXT, so every transcode routed to whichever stack was
+  // provisioned first. We now key by the EFFECTIVE stack identity the per-stack
+  // resolver reports for THIS request's X-Stack-Name, so a request against a
+  // healthy named stack reaches that stack regardless of provisioning order.
+  // Falls back to DEPLOYMENT_CONTEXT when no resolver is wired (tests /
+  // env-override) or when it resolves undefined (no provisioned stack), leaving
+  // single-stack behaviour byte-identical.
+  async function transcodeContext(request: import('fastify').FastifyRequest): Promise<string> {
+    if (!opts.resolveStackContext) return DEPLOYMENT_CONTEXT;
+    const header = request.headers['x-stack-name'];
+    const requested = typeof header === 'string' && header.length > 0 ? header : undefined;
+    const resolved = await opts.resolveStackContext(requested);
+    return resolved ?? DEPLOYMENT_CONTEXT;
+  }
 
   // Resolve whether a named transcode profile can execute on this platform tier
   // (issue #286). Returns a human message when the profile is a stored GPU-only
@@ -1263,12 +1505,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
   // configured. Returns true when an extraction was actually kicked off.
-  function triggerExtraction(assetId: string, objectKey: string): boolean {
+  function triggerExtraction(
+    assetId: string,
+    objectKey: string,
+    externalSource?: ExternalProbeSource
+  ): boolean {
     if (!opts.probe || !storageFor) {
       return false;
     }
     void extractRunner(
-      { assetId, objectKey },
+      { assetId, objectKey, ...(externalSource ? { externalSource } : {}) },
       {
         assets: repo,
         storage: storageFor(),
@@ -1428,20 +1674,23 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         reply.code(501).send({ error: 'not_configured', message: 'packaging is not configured' });
         return undefined;
       }
-      if (!asset.objectKey) {
-        reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
+    }
+    // Unified source-object resolution (issue #612): every first step below
+    // consumes the asset's source object, so gate them all through the ONE
+    // shared resolver. A source-less asset now fails identically here and in the
+    // single-operation routes (POST /:id/{transcode,package,thumbnails,clip,
+    // export,extract-metadata}) — a consistent 409 no_object.
+    if (
+      firstStep === 'transcode' ||
+      firstStep === 'package' ||
+      firstStep === 'extract-metadata' ||
+      firstStep === 'thumbnail' ||
+      firstStep === 'subtitles' ||
+      firstStep === 'scene-detect'
+    ) {
+      if (!requireSourceObject(asset, reply)) {
         return undefined;
       }
-    }
-    if (
-      (firstStep === 'extract-metadata' ||
-        firstStep === 'thumbnail' ||
-        firstStep === 'subtitles' ||
-        firstStep === 'scene-detect') &&
-      !asset.objectKey
-    ) {
-      reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
-      return undefined;
     }
 
     void firstStep; // pre-flight above used firstStep; execution drives the loop
@@ -1520,6 +1769,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     const now = () => new Date().toISOString();
     const stepsCopy: StepExecution[] = execution.steps.map((s) => ({ ...s }));
 
+    // Unified source-object resolution (issue #612): every source-consuming step
+    // below reads the SAME resolved location. Pre-flight above already 409'd a
+    // source-less asset whose first step needs the source; resolving once here
+    // means the loop can never diverge from the single-operation routes.
+    const resolvedSource = tryResolveSourceObject(asset);
+    const sourceObjectKey = resolvedSource?.objectKey ?? '';
+
     // Execute steps synchronously until we hit an asynchronous step (transcode/
     // package) which completes via an OSC callback, or run out of steps. The
     // fire-and-forget steps (extract-metadata, thumbnail) settle immediately.
@@ -1527,12 +1783,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       for (let i = 0; i < stepsCopy.length; i++) {
         const step = stepsCopy[i];
         if (step.name === 'extract-metadata') {
-          triggerExtraction(asset.id, asset.objectKey as string);
+          triggerExtraction(asset.id, sourceObjectKey);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
         if (step.name === 'thumbnail') {
-          triggerThumbnail(asset.id, asset.objectKey as string, request);
+          triggerThumbnail(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -1541,7 +1797,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // gracefully when unconfigured) and settle the step immediately. The
           // generator records its own success/failure on the asset and never
           // throws into this loop, so the step never fails the pipeline.
-          triggerSubtitles(asset.id, asset.objectKey as string, request);
+          triggerSubtitles(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -1550,18 +1806,42 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // skip gracefully when unconfigured) and settle the step immediately. The
           // detector records its own success/failure on the asset and never throws
           // into this loop, so the step never fails the pipeline.
-          triggerSceneDetect(asset.id, asset.objectKey as string, request);
+          triggerSceneDetect(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
         if (step.name === 'transcode') {
+          // Resolve the transcode output bucket from the caller's per-stack
+          // packaged bucket (issue #638). request.connections.packagedBucket is
+          // the stack's persisted `packagedStorage.bucket` (workspace-stack.ts
+          // config.packagedBucket, sourced from the parameter store at provision
+          // time per ADR-002). Fall back to opts.outputBucket — the deployment-
+          // wide MINIO_PACKAGED_BUCKET default — only when no per-stack value
+          // exists (e.g. the env-override path). The output PATH template
+          // (transcode/<assetId>/<jobId>/) is unchanged; only the bucket changes.
+          const resolvedOutputBucket =
+            request.connections?.packagedBucket ?? (opts.outputBucket as string);
           const result = await submitTranscode(
             {
-              workspaceId: DEPLOYMENT_CONTEXT,
+              // Key the scaler pool/queue/S3 endpoint by the EFFECTIVE stack
+              // this request routes to (issue #615), not the fixed deployment
+              // context, so a pipeline execution against a healthy named stack
+              // is not pinned to whichever stack was provisioned first.
+              workspaceId: await transcodeContext(request),
               sourceAssetId: asset.id,
-              sourceObjectKey: asset.objectKey as string,
-              sourceBucket: opts.sourceBucket as string,
-              outputBucket: opts.outputBucket as string,
+              sourceObjectKey,
+              // Read the transcode INPUT from the resolved stack's per-stack
+              // source bucket (StackConfig.sourceBucket, param-store key
+              // `sourceBucket` per ADR-002; carried on WorkspaceConnections.
+              // sourceBucket) rather than the deployment-wide boot default
+              // (opts.sourceBucket from MINIO_SOURCE_BUCKET) — issue #639. The
+              // fallback preserves the env-override / single-stack deployments
+              // where request.connections is absent. Mirrors the existing
+              // per-stack resolution used by the thumbnail/rewrap paths
+              // (request.connections?.sourceBucket ?? …). Output/packaged
+              // resolution (resolvedOutputBucket) is issue #638.
+              sourceBucket: request.connections?.sourceBucket ?? (opts.sourceBucket as string),
+              outputBucket: resolvedOutputBucket,
               preset: encodeOpts?.profile,
               customProfile: encodeOpts?.customProfile,
               // profileParams (issue #288): forwarded verbatim into the same
@@ -1570,7 +1850,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               // execute behaviour unchanged.
               profileParams: encodeOpts?.profileParams
             },
-            { jobs, assets: repo, encore: opts.encore! }
+            { jobs, assets: repo, encore: opts.encore!, audit, auditLog: request.log }
           );
           stepsCopy[i] = {
             ...step,
@@ -1634,6 +1914,31 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     if (err instanceof HasChildrenError) {
       return reply.code(409).send({ error: 'has_children', message: err.message });
     }
+    // Explicit delete-lock (ADR-020 decision 1, issue #568): the shared
+    // `delete_blocked` envelope with reason `delete_protected` and EMPTY
+    // blockedBy arrays (the block is intrinsic to the document, not a foreign
+    // reference).
+    if (err instanceof DeleteProtectedError) {
+      return reply.code(409).send({
+        error: 'delete_blocked',
+        message: err.message,
+        reason: 'delete_protected',
+        blockedBy: { jobIds: [], collectionIds: [] }
+      });
+    }
+    // In-flight job reference (ADR-020 decision 1, issue #569): the same shared
+    // `delete_blocked` envelope, reason `referenced_by_job`, with the
+    // referencing job ids named in `blockedBy.jobIds` so the caller can wait
+    // for or cancel them. An active reference is a hard block (decision 2), so
+    // `?force=true` never reaches this branch as a bypass.
+    if (err instanceof ReferencedByJobError) {
+      return reply.code(409).send({
+        error: 'delete_blocked',
+        message: err.message,
+        reason: 'referenced_by_job',
+        blockedBy: { jobIds: err.jobIds, collectionIds: [] }
+      });
+    }
     if (err instanceof SourceValidationError) {
       return reply.code(400).send({ error: 'invalid_source', message: err.message });
     }
@@ -1652,6 +1957,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     { schema: { body: createSchema, response: { 201: assetSchema } } },
     async (request, reply) => {
       const asset = await repo.create(request.body);
+      // Audit: asset created (issue #564). One entry, targetId = new asset id.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.created',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: { name: asset.name, status: asset.status }
+        },
+        request.log
+      );
       return reply.code(201).send(asset);
     }
   );
@@ -1676,7 +1993,72 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           .code(501)
           .send({ error: 'not_configured', message: 'object storage is not configured' });
       }
-      const { sourceUrl, name, title, description, tags } = request.body;
+      const { sourceUrl, name, title, description, tags, sourceBackend } = request.body;
+
+      // --- External-backend source (issue #548, ADR-017 D4) --------------
+      // When the request references a registered external backend, we source the
+      // bytes FROM that bucket instead of the OSC-managed default. Rather than
+      // pulling into OSC-managed storage (which would need the literal secret the
+      // registry never returns — see osc-feedback/incoming-issue548-…), the
+      // downstream probe/transcode jobs read `s3://<bucket>/<key>` in place using
+      // the registered endpoint + `{{secrets.<name>}}` references (ADR-017 C3).
+      // No external credential is ever placed inline in the request or in the
+      // stored job record (the job's sourceUrl is `s3://bucket/key`, credential-
+      // free) — issue #548 acceptance.
+      if (sourceBackend !== undefined) {
+        if (!opts.storageBackendRegistry) {
+          return reply.code(501).send({
+            error: 'not_configured',
+            message: 'storage-backend registry is not configured'
+          });
+        }
+        let source: ExternalProbeSource;
+        try {
+          const creds = await opts.storageBackendRegistry.resolveSourceCredentials(
+            STACK_CONFIG_NAMESPACE,
+            sourceBackend
+          );
+          const objectKeyInBucket = externalObjectKeyFromSourceUrl(sourceUrl, creds.bucket);
+          source = {
+            bucket: creds.bucket,
+            objectKey: objectKeyInBucket,
+            awsAccessKeyId: creds.awsAccessKeyId,
+            awsSecretAccessKey: creds.awsSecretAccessKey,
+            ...(creds.s3EndpointUrl ? { s3EndpointUrl: creds.s3EndpointUrl } : {}),
+            ...(creds.awsRegion ? { awsRegion: creds.awsRegion } : {}),
+            ...(creds.awsSessionToken ? { awsSessionToken: creds.awsSessionToken } : {})
+          };
+        } catch (err) {
+          if (err instanceof UnknownSourceBackendError) {
+            return reply.code(err.statusCode).send({ error: 'bad_request', message: err.message });
+          }
+          throw err;
+        }
+
+        const extFallbackName =
+          decodeURIComponent(source.objectKey.split('/').filter(Boolean).pop() ?? '') ||
+          source.bucket;
+        const extAsset = await repo.create({
+          name: title ?? name ?? extFallbackName,
+          description,
+          tags
+        });
+        // The recorded source is the credential-free `s3://bucket/key` locator;
+        // the object already lives in the external bucket, so no byte-pull runs
+        // and the asset advances straight to `processing`.
+        const extObjectKey = `s3://${source.bucket}/${source.objectKey}`;
+        await repo.update(extAsset.id, { objectKey: extObjectKey, status: 'processing' });
+        const extJob = await jobs.create({
+          type: 'ingest-url',
+          assetId: extAsset.id,
+          sourceUrl: extObjectKey
+        });
+        await jobs.update(extJob.id, { status: 'running' });
+        await jobs.update(extJob.id, { status: 'done', progress: 100 });
+        // Fire-and-forget probe against the external source (job reads in place).
+        triggerExtraction(extAsset.id, extObjectKey, source);
+        return reply.code(202).send({ assetId: extAsset.id, jobId: extJob.id });
+      }
 
       // Validate synchronously so a bad URL is a 400, not a background failure.
       const parsed = parseSource(sourceUrl);
@@ -1902,6 +2284,56 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       // Forward-compat paginated envelope even though v1 is single-match.
       return reply.code(200).send({ items: [resolved], limit: MAX_LIMIT, offset: 0, total: 1 });
+    }
+  );
+
+  // External-identifier resolver route (issue #576, ADR-019). Resolves an
+  // upstream `{ namespace, id }` correlation to AT MOST ONE asset, so a Media
+  // Developer round-tripping with an upstream system of record can fetch the
+  // open-videocore asset by their own foreign key.
+  //
+  // A DEDICATED resolver PATH (not a `GET /?externalId=…` query filter on the
+  // list endpoint), mirroring the `/by-tams-address` precedent above: its
+  // single-match, 404-on-unknown semantics differ from list semantics, and the
+  // two-part composite key expresses cleanly as `/{namespace}/{id}` without the
+  // colon-delimited `externalId=ns:id` ambiguity (an upstream id may itself
+  // contain a colon, e.g. a URN). Registered BEFORE the `/:id` param route so the
+  // static `/by-external-id` segment is never shadowed by the param (Fastify's
+  // radix router prefers the static segment; the registration order makes it
+  // explicit).
+  //
+  // Index-backed, NOT a linear scan: the resolution delegates to
+  // AssetRepository.getByExternalId, which the CouchDB backend serves with a
+  // Mango `$elemMatch` push-down over `administrative.externalIdentifiers`
+  // (couch-asset-repo.ts) — the same array-index push-down as the TAMS flow
+  // lookup — so CouchDB filters within the tenant database rather than the route
+  // paging the whole asset set.
+  //
+  // Error -> status mapping:
+  //   - empty `namespace` / `id` -> 400 (enforced by externalIdParamsSchema
+  //     before the handler runs).
+  //   - well-formed pair with no matching asset -> 404 (existence not leaked).
+  app.get(
+    '/by-external-id/:namespace/:id',
+    {
+      schema: {
+        summary: 'Resolve an asset by an upstream external identifier',
+        description:
+          'Resolve a single asset by the `{ namespace, id }` external identifier ' +
+          'correlated to it (ADR-019). `namespace` labels the upstream system of ' +
+          'record; `id` is the opaque foreign key in that system. Returns the asset ' +
+          'when exactly one carries the pair, or 404 when none does.',
+        params: externalIdParamsSchema,
+        response: { 200: assetSchema, 400: errorSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const { namespace, id } = request.params;
+      const asset = await repo.getByExternalId(namespace, id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(asset);
     }
   );
 
@@ -2580,12 +3012,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to extract metadata from'
-        });
-      }
+      // Unified source-object resolution (issue #612): every source-consuming
+      // operation resolves the source through this ONE code path so a missing
+      // source fails identically (409 no_object) everywhere.
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.probe || !storageFor) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -2597,14 +3028,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // the asset recovered to `ready`.
       const wedged = asset.status === 'processing' && asset.technicalMetadataError !== undefined;
       if (wedged) {
-        await runExtractionSync(asset.id, asset.objectKey);
+        await runExtractionSync(asset.id, source.objectKey);
         const settled = await repo.get(asset.id);
         return reply.code(200).send({
           assetId: asset.id,
           status: settled?.status ?? asset.status
         });
       }
-      triggerExtraction(asset.id, asset.objectKey);
+      triggerExtraction(asset.id, source.objectKey);
       return reply.code(202).send({ assetId: asset.id, status: 'extracting' });
     }
   );
@@ -2632,8 +3063,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           404: errorSchema,
           409: errorSchema,
           422: errorSchema,
+          429: jobThroughputCapSchema,
           501: errorSchema,
-          502: errorSchema
+          502: errorSchema,
+          504: dependencyUnreachableSchema
         }
       }
     },
@@ -2642,12 +3075,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to transcode'
-        });
-      }
+      // Unified source-object resolution (issue #612).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.encore || !opts.sourceBucket || !opts.outputBucket) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -2829,25 +3259,72 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         }
         burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, canonicalForceStyle);
       }
+      // Resolve the transcode output bucket from the caller's per-stack packaged
+      // bucket (issue #638). request.connections.packagedBucket is the stack's
+      // persisted `packagedStorage.bucket` (workspace-stack.ts config.packagedBucket,
+      // from the parameter store at provision time per ADR-002); fall back to the
+      // deployment-wide opts.outputBucket (MINIO_PACKAGED_BUCKET) only when no
+      // per-stack value exists. Output PATH template is unchanged.
+      const resolvedOutputBucket =
+        request.connections?.packagedBucket ?? opts.outputBucket;
       try {
         const result = await submitTranscode(
           {
-            workspaceId: DEPLOYMENT_CONTEXT,
+            // Key the scaler pool/queue/S3 endpoint by the EFFECTIVE stack this
+            // request routes to (issue #615), resolved from X-Stack-Name, not
+            // the fixed deployment context — so a transcode against a healthy
+            // named stack reaches that stack regardless of provisioning order.
+            workspaceId: await transcodeContext(request),
             sourceAssetId: asset.id,
-            sourceObjectKey: asset.objectKey,
+            sourceObjectKey: source.objectKey,
             preset: request.body.profile,
             customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
             burnInSubtitlesFilter,
-            sourceBucket: opts.sourceBucket,
-            outputBucket: opts.outputBucket
+            // Read the transcode INPUT from the resolved stack's per-stack
+            // source bucket (StackConfig.sourceBucket, param-store key
+            // `sourceBucket` per ADR-002; carried on WorkspaceConnections.
+            // sourceBucket) rather than the deployment-wide boot default
+            // (opts.sourceBucket from MINIO_SOURCE_BUCKET) — issue #639. The
+            // fallback preserves the env-override / single-stack deployments
+            // where request.connections is absent. Output/packaged resolution
+            // (resolvedOutputBucket) is issue #638.
+            sourceBucket: request.connections?.sourceBucket ?? opts.sourceBucket,
+            outputBucket: resolvedOutputBucket
           },
-          { jobs, assets: repo, encore: opts.encore }
+          { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log }
         );
         return reply
           .code(202)
           .send({ ...result, ...(profileParamsWarning ? { warning: profileParamsWarning } : {}) });
       } catch (err) {
+        // A stack dependency (queue/Valkey, Encore, storage) was unreachable or
+        // did not respond within the bounded deadline (#616). Fail fast with a
+        // 504 that NAMES the dependency + endpoint, and log server-side with
+        // enough detail (stack, dependency, endpoint, cause) to diagnose without
+        // a live repro — never let the connection drop silently.
+        if (isDependencyUnreachableError(err)) {
+          request.log.error(
+            {
+              err,
+              dependency: err.dependency,
+              endpoint: err.endpoint,
+              stackName: err.stackName,
+              operation: err.operation,
+              reason: err.reason,
+              timeoutMs: err.timeoutMs
+            },
+            'transcode submit failed: stack dependency unreachable'
+          );
+          return reply.code(504).send(err.toResponseBody());
+        }
+        // Optional operator-configured job-throughput cap exceeded (issue #580):
+        // accepting this job would push the deployment past its outstanding-job
+        // ceiling. Return the documented machine-readable 429 + reason code so a
+        // client can back off, rather than silently queueing unboundedly.
+        if (isJobThroughputCapExceededError(err)) {
+          return reply.code(err.statusCode).send(err.toResponseBody());
+        }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
       }
@@ -2963,10 +3440,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // Optional per-execution destination override (issue #207). Validated
           // and trailing-slash-normalized at the edge; persisted on the
           // execution record for #208 (packager relocation) / #210 (delivery).
-          destinationBucket: destinationBucketSchema.optional()
+          destinationBucket: destinationBucketSchema.optional(),
+          // Optional reference (id OR name) to a registered external storage
+          // backend (issue #549, ADR-017 D4). When set, this execution's
+          // transcode/package OUTPUT is written to that backend's bucket instead
+          // of OSC-managed default storage, resolved to the backend's NON-SECRET
+          // coordinates at job time (credentials stay in OSC secrets). Mutually
+          // exclusive with `destinationBucket` (both name an output destination).
+          externalBackend: z.string().trim().min(1).max(256).optional()
         }),
         response: {
           202: pipelineExecutionSchema,
+          400: errorSchema,
           404: z.object({ error: z.string() }),
           409: errorSchema,
           422: errorSchema,
@@ -2983,6 +3468,57 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Resolve an optional registered external backend reference (issue #549)
+      // to the per-execution destination the relocation path consumes. Done here
+      // (before startPipelineExecution) so a dangling/unconfigured reference is a
+      // clean synchronous error and the downstream path stays destination-only.
+      let destinationBucket = request.body.destinationBucket;
+      if (request.body.externalBackend !== undefined) {
+        if (destinationBucket !== undefined) {
+          return reply.code(400).send({
+            error: 'invalid_request',
+            message:
+              'externalBackend and destinationBucket are mutually exclusive; specify only one output destination'
+          });
+        }
+        if (!opts.storageBackendRegistry) {
+          return reply.code(501).send({
+            error: 'not_configured',
+            message: 'external storage backends are not configured on this deployment'
+          });
+        }
+        const record = await opts.storageBackendRegistry.resolveForOutput(
+          DEPLOYMENT_CONTEXT,
+          request.body.externalBackend
+        );
+        // Explicitly referencing the implicit OSC-managed default (id 'default')
+        // means "use the default output path" — resolveForOutput returns
+        // undefined for it (ADR-017 D3, it is not an external backend), so we
+        // leave destinationBucket unset and fall through rather than 422. Any
+        // OTHER unresolved reference is a dangling backend -> 422.
+        if (!record) {
+          if (request.body.externalBackend !== DEFAULT_BACKEND_ID) {
+            return reply.code(422).send({
+              error: 'unknown_backend',
+              message: `no registered external storage backend matches "${request.body.externalBackend}"`
+            });
+          }
+          // 'default' -> no override, default output path (field omitted).
+        } else {
+          // Only write-capable roles can receive packaged output (ADR-017 D4:
+          // 'packaged'/'both' fan their credential to the packager; 'source' is
+          // read-only for ingest and 'archive' fans only to source-reader
+          // consumers — see mappingsForRole, storage-backend-registry.ts). Any
+          // non-write role is rejected via this allowlist.
+          if (record.role !== 'packaged' && record.role !== 'both') {
+            return reply.code(422).send({
+              error: 'backend_role',
+              message: `storage backend "${request.body.externalBackend}" is registered for the "${record.role}" role and cannot receive output; register it with role "packaged" or "both"`
+            });
+          }
+          destinationBucket = backendOutputDestination(record);
+        }
+      }
       const started = await startPipelineExecution(
         asset,
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
@@ -2993,7 +3529,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           customProfile: request.body.customProfile as EncoreProfile | undefined,
           profileParams: request.body.profileParams
         },
-        request.body.destinationBucket
+        destinationBucket
       );
       if (!started) return reply; // error already sent
       return reply.code(202).send(started);
@@ -3141,12 +3677,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to extract thumbnails from'
-        });
-      }
+      // Unified source-object resolution (issue #612).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.thumbnailExtractor || !storageFor) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -3166,7 +3699,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const thumbnails = await thumbnailRunner(
           {
             assetId: asset.id,
-            objectKey: asset.objectKey,
+            objectKey: source.objectKey,
             timecodes: request.body.timecodes
           },
           {
@@ -3217,12 +3750,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to re-wrap'
-        });
-      }
+      // Unified source-object resolution (issue #612).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.rewrapRunner || !storageFor) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -3246,7 +3776,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const child = await rewrapRunner(
           {
             sourceAssetId: asset.id,
-            objectKey: asset.objectKey,
+            objectKey: source.objectKey,
             targetFormat: request.body.targetFormat,
             outputName: request.body.outputName,
             asVersion: request.body.asVersion
@@ -3287,12 +3817,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to clip'
-        });
-      }
+      // Unified source-object resolution (issue #612).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.clipRunner || !storageFor) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -3303,7 +3830,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const child = await clipRunnerOrchestrator(
           {
             sourceAssetId: asset.id,
-            objectKey: asset.objectKey,
+            objectKey: source.objectKey,
             startSeconds: request.body.startSeconds,
             endSeconds: request.body.endSeconds,
             outputName: request.body.outputName,
@@ -3417,6 +3944,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Audit: asset metadata edited (issue #564). Emitted only on a real edit
+      // (the asset resolved); a 404 is not a mutation and produces no entry.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.metadata_updated',
+          targetType: 'asset',
+          targetId: updated.id,
+          detail: { keys: Object.keys(request.body ?? {}) }
+        },
+        request.log
+      );
       return reply.code(200).send(updated);
     }
   );
@@ -3695,9 +4235,37 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
+      // Capture the pre-patch status so a lifecycle transition can be audited
+      // with an accurate `from` and only when the status actually changed. Read
+      // ONCE here (before the write) so no extra read is added on the hot path
+      // when no status field is present.
+      const priorStatus =
+        request.body.status !== undefined
+          ? (await repo.get(request.params.id))?.status
+          : undefined;
       const updated = await repo.update(request.params.id, request.body);
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
+      }
+      // Audit: lifecycle/status transition (issue #564). Exactly one entry, and
+      // ONLY when the PATCH carried a `status` that moved the asset to a new
+      // lifecycle state (a no-op same-status PATCH is not a transition).
+      if (
+        request.body.status !== undefined &&
+        priorStatus !== undefined &&
+        priorStatus !== updated.status
+      ) {
+        emitAudit(
+          audit,
+          {
+            actor: originActor('user'),
+            action: 'asset.status_changed',
+            targetType: 'asset',
+            targetId: updated.id,
+            detail: { from: priorStatus, to: updated.status }
+          },
+          request.log
+        );
       }
       return reply.code(200).send(updated);
     }
@@ -3709,10 +4277,40 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       schema: {
         params: z.object({ id: z.string() }),
-        response: { 204: z.null(), 404: errorSchema, 409: errorSchema }
+        // 409 covers BOTH the pre-existing `has_children` block (the base
+        // `{ error, message? }` envelope) and the new explicit-lock
+        // `delete_blocked` envelope (ADR-020). A union keeps the has_children
+        // serialization unchanged while adding the richer lock shape.
+        response: { 204: z.null(), 404: errorSchema, 409: z.union([deleteBlockedSchema, errorSchema]) }
       }
     },
     async (request, reply) => {
+      // Explicit delete-lock (ADR-020 decisions 1 & 2, issue #568). A locked
+      // asset is a HARD block: this guard is unconditional and runs BEFORE the
+      // archive, so `?force=true` cannot bypass it (force is never consulted
+      // here). Cleared only via DELETE /:id/lock. Surfaces the shared
+      // `delete_blocked` envelope with reason `delete_protected` (empty
+      // blockedBy) via DeleteProtectedError in the error handler.
+      const existing = await repo.get(request.params.id);
+      if (existing?.deleteLock?.locked) {
+        throw new DeleteProtectedError(request.params.id);
+      }
+      // In-flight job reference (ADR-020 decision 1, issue #569). Block deletion
+      // while any active (pending/queued/running) transcode or ingest job still
+      // references this asset as its source `assetId` — deleting it would
+      // corrupt an in-flight pipeline. This is a HARD block: it runs before the
+      // archive and force is never consulted (ADR-020 decision 2 — only settled
+      // jobs are forceable, and those are excluded by findActiveByAssetId). The
+      // richer `delete_blocked` envelope names the blocking job ids so the
+      // caller can wait for or cancel them. Ordered after the explicit lock per
+      // the fixed reason precedence delete_protected > referenced_by_job.
+      const activeJobs = await jobs.findActiveByAssetId(request.params.id);
+      if (activeJobs.length > 0) {
+        throw new ReferencedByJobError(
+          request.params.id,
+          activeJobs.map((j) => j.id)
+        );
+      }
       // Block deletion while children (renditions) still reference this asset.
       const childCount = await repo.countChildren(request.params.id);
       if (childCount > 0) {
@@ -3723,7 +4321,83 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!removed) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Audit: asset deleted/archived (issue #564). One entry on a real archive;
+      // a blocked (409) or unknown (404) delete never reaches here, so no entry.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.archived',
+          targetType: 'asset',
+          targetId: removed.id,
+          detail: { status: removed.status }
+        },
+        request.log
+      );
       return reply.code(204).send(null);
+    }
+  );
+
+  // Explicit delete-lock set/clear (ADR-020 decision 3, issue #568). A DEDICATED
+  // system write path for the `administrative.deleteLock` flag — chosen as a
+  // `/:id/lock` sub-resource with PUT (set) / DELETE (clear), mirroring the
+  // existing action-endpoint conventions in this router (cf. the `/:id/lock`
+  // sibling to `/:id/review-state`, `/:id/restore`, and the PUT/DELETE
+  // `/:id/audio-tracks` pattern). It is INTENTIONALLY separate from the
+  // editorial PATCH `/:id` and PUT `/:id/metadata` paths so the system-owned
+  // lock can never be set/cleared through ordinary metadata edits (ADR-005:
+  // `administrative` is not user-writable). The repo appends a `lock`/`unlock`
+  // provenance entry so the change is traceable.
+  //   200 — lock set, full asset returned (deleteLock present + locked)
+  //   404 — unknown/foreign asset (existence not leaked)
+  app.put(
+    '/:id/lock',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        // `reason` (operator note) and `lockedBy` (actor) are optional, matching
+        // ADR-020 decision 3's optional sub-fields.
+        body: z
+          .object({
+            reason: z.string().max(1024).optional(),
+            lockedBy: z.string().max(256).optional()
+          })
+          .default({}),
+        response: { 200: assetSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.setDeleteLock(request.params.id, {
+        locked: true,
+        reason: request.body.reason,
+        lockedBy: request.body.lockedBy
+      });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
+    }
+  );
+
+  // Clear the explicit delete-lock (ADR-020 decision 3, issue #568). The ONLY
+  // way to lift protection — `?force=true` on DELETE /:id does NOT (ADR-020
+  // decision 2). Appends an `unlock` provenance entry.
+  //   200 — lock cleared, full asset returned (deleteLock absent)
+  //   404 — unknown/foreign asset
+  app.delete(
+    '/:id/lock',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: assetSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.setDeleteLock(request.params.id, { locked: false });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
     }
   );
 

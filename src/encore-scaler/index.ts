@@ -8,6 +8,12 @@
 
 import { keys, type EncoreScalerConfig, type QueuedJob } from './types.js';
 import { toEncorePayload, type EncoreClient } from '../pipeline/encore-client.js';
+import {
+  resolveDependencyTimeoutMs,
+  sanitizeEndpoint,
+  withDependencyTimeout
+} from './dependency-timeout.js';
+import { assertUnderJobThroughputCap } from './job-throughput-cap.js';
 
 export { EncoreScalerLoop } from './scaler-loop.js';
 export { encoreScalerRouter } from './encore-scaler-router.js';
@@ -18,16 +24,52 @@ export type { EncoreScalerConfig } from './types.js';
 // scaler tracks in its status/instance hashes and echoes back to the caller.
 export function makeScalingEncoreClient(config: EncoreScalerConfig): EncoreClient {
   const { redis, workspaceId } = config;
+  // Endpoint shown in the fail-fast error/log — credentials stripped (#616).
+  const queueEndpoint = sanitizeEndpoint(config.redisUrl);
+  const dependencyTimeoutMs = resolveDependencyTimeoutMs();
   return {
     async submit(input) {
+      // Optional operator-configured job-throughput cap (issue #580): reject the
+      // submission up front with a 429 (JobThroughputCapExceededError) when
+      // accepting one more job would exceed the configured ceiling, instead of
+      // silently growing an unbounded backlog. Checked BEFORE the enqueue writes,
+      // against the scaler's own Valkey queue/inflight state (single source of
+      // truth — no parallel counter). No-op when config.maxQueuedJobs is unset.
+      await assertUnderJobThroughputCap(redis, workspaceId, config.maxQueuedJobs);
+
       const payload = toEncorePayload(input);
       const job: QueuedJob = {
         jobId: input.externalId,
         payload,
         enqueuedAt: Date.now()
       };
-      await redis.lpush(keys.queue(workspaceId), JSON.stringify(job));
-      await redis.hset(keys.jobStatus(workspaceId), input.externalId, 'QUEUED');
+      // Bound the outbound Valkey writes on the transcode submit path (#616).
+      // The shared IORedis client is `lazyConnect` with `maxRetriesPerRequest:
+      // null` (src/main.ts:744), so a command issued while Valkey is unreachable
+      // is buffered offline and never rejects — the request would otherwise hang
+      // until the inbound socket is dropped (~50s) with no response. A bounded
+      // deadline turns that silent hang into a prompt, named DependencyUnreachable
+      // error the route maps to a 504 (see routes/assets.ts, routes/encore-compat.ts).
+      await withDependencyTimeout(
+        () => redis.lpush(keys.queue(workspaceId), JSON.stringify(job)),
+        {
+          dependency: 'queue',
+          endpoint: queueEndpoint,
+          stackName: workspaceId,
+          operation: `lpush ${keys.queue(workspaceId)}`,
+          timeoutMs: dependencyTimeoutMs
+        }
+      );
+      await withDependencyTimeout(
+        () => redis.hset(keys.jobStatus(workspaceId), input.externalId, 'QUEUED'),
+        {
+          dependency: 'queue',
+          endpoint: queueEndpoint,
+          stackName: workspaceId,
+          operation: `hset ${keys.jobStatus(workspaceId)}`,
+          timeoutMs: dependencyTimeoutMs
+        }
+      );
       // Our internal id IS the externalId: the scaler correlates on it and the
       // real Encore internal id is not known until the job is dispatched.
       return { encoreInternalId: input.externalId };

@@ -94,6 +94,173 @@ export type StatusTransition = {
   to: AssetStatus;
 };
 
+// ---------------------------------------------------------------------------
+// Storage tier (ADR-019, issue #556)
+// ---------------------------------------------------------------------------
+
+// The physical byte-location axis of an asset's stored bytes, ORTHOGONAL to the
+// lifecycle `status` above and to `reviewState`. Where `status` tracks the
+// ingest lifecycle and `reviewState` a human approval workflow, `storageTier`
+// tracks WHERE the bytes physically live — not what the asset is. The two are
+// INDEPENDENT: a `ready` (or any) asset may have its bytes on either tier, and
+// moving one axis never moves another (ADR-019 D1, mirroring the
+// `reviewState`-beside-`status` house pattern at src/data/asset-repo.ts:53-57).
+//
+// Vocabulary is deliberately small (ADR-019 D1):
+//   - `hot`     — bytes on a low-latency backend, immediately readable by
+//                 delivery and processing jobs. The default and only tier a
+//                 fresh asset has.
+//   - `archive` — bytes moved to a cheaper, higher-latency archive-class
+//                 backend; not directly readable at playback latency until
+//                 rehydrated (see rehydrate state below).
+//
+// NAMING RULE (normative, ADR-019 D1/D6): the value is `archive`, NEVER
+// `archived`. The `-d` form is the terminal lifecycle `status` (V1) that drives
+// the destructive retention purge; using it here would reintroduce the exact
+// collision the tier/status firewall (ADR-019 D6) exists to prevent. This axis
+// is NEVER written to `status` and never reuses the `-> archived`
+// statusHistory transition (the purge clock).
+export const STORAGE_TIERS = ['hot', 'archive'] as const;
+export type StorageTier = (typeof STORAGE_TIERS)[number];
+
+// The byte classes an asset references, each tracked with its own tier
+// (ADR-019 D3 — tiering is PER BYTE CLASS, not one asset-wide flag, because the
+// classes have different delivery obligations). The names mirror the asset's
+// existing byte-class fields:
+//   - source      — the mezzanine/original (`objectKey`); primary archive
+//                   candidate (not on the playback path).
+//   - renditions  — ABR variants (`renditions[].objectKey`); may be archived
+//                   alongside source once packaged output exists.
+//   - packaged    — CMAF HLS/DASH manifests + segments (`packagedOutput`); on
+//                   the live `/stream/*` playback read path, so it MUST stay
+//                   `hot` for a deliverable asset (ADR-019 D3). Modelled here so
+//                   the record can HONESTLY express "source archived, packaged
+//                   hot"; this slice is representation-only and does NOT enforce
+//                   the pin.
+//   - subtitles   — subtitle track objects (`subtitleTracks[].objectKey`);
+//                   default `hot` (D3).
+//   - thumbnails  — thumbnail object keys (`thumbnails[]`); default `hot` (D3).
+export const STORAGE_BYTE_CLASSES = [
+  'source',
+  'renditions',
+  'packaged',
+  'subtitles',
+  'thumbnails'
+] as const;
+export type StorageByteClass = (typeof STORAGE_BYTE_CLASSES)[number];
+
+// In-flight rehydrate indicator (ADR-019 D4). Rehydrate is the explicit-restore
+// concept that moves a byte class `archive -> hot`; this type models ONLY its
+// in-flight REPRESENTATION so callers can reason about current availability. It
+// carries the byte class being restored and when the restore started. This
+// slice adds NO rehydrate execution, trigger, or relocation — it is a state
+// field the (future, out-of-scope) restore operation would set and clear.
+export type RehydrateState = {
+  // The byte class currently being restored from `archive` back to `hot`.
+  byteClass: StorageByteClass;
+  // ISO timestamp the restore was requested/started (mirrors the asset's
+  // existing ISO timestamp conventions, e.g. `createdAt`/`updatedAt`).
+  startedAt: string;
+};
+
+// The two observable steps of a restore on the tier axis (ADR-019 D4, issue
+// #558). `begin` marks a class in-flight (bytes still `archive`); `complete`
+// flips it to `hot` and clears the in-flight marker. Modelled as a dedicated
+// enum (not a free string) so the single repo write path is type-checked.
+export const REHYDRATE_PHASES = ['begin', 'complete'] as const;
+export type RehydratePhase = (typeof REHYDRATE_PHASES)[number];
+
+// The per-asset storage-tiering state (ADR-019 D1/D3/D4). Holds the tier of
+// each byte class plus any in-flight rehydrates. A fresh/existing asset defaults
+// to every class `hot` with no rehydrate in flight (see `defaultStorageTiering`);
+// the field is optional on the flat `Asset` so pre-existing assets/documents
+// without it remain valid and are treated as the all-`hot` default throughout
+// (get/list/document round-trip), exactly like `reviewState` -> `draft`.
+export type StorageTiering = {
+  // Tier per byte class. Absent classes default to `hot`.
+  tiers: Partial<Record<StorageByteClass, StorageTier>>;
+  // Byte classes with a restore currently in flight (ADR-019 D4). Always an
+  // array; empty means no rehydrate is in progress.
+  rehydrating: RehydrateState[];
+};
+
+// Apply a storage-tier write (ADR-019 D1/D3, issue #557): merge the given
+// per-byte-class tier overrides onto the asset's existing tiering, preserving any
+// in-flight rehydrate state. PURE (no side effects) so both repos reuse it and
+// the couch repo can safely re-run it inside updateWithRetry. This is the
+// relocation engine's ONLY mutation of the asset — it writes the byte-location
+// axis and NOTHING else (never `status`/`statusHistory` — the ADR-019 D6
+// tier/status firewall). Absent classes in `overrides` keep their prior tier.
+export function applyStorageTier(
+  existing: StorageTiering | undefined,
+  overrides: Partial<Record<StorageByteClass, StorageTier>>
+): StorageTiering {
+  const base = existing ?? defaultStorageTiering();
+  return {
+    tiers: { ...base.tiers, ...overrides },
+    rehydrating: base.rehydrating ?? []
+  };
+}
+
+// Mark a byte class as having a restore IN FLIGHT (ADR-019 D4, issue #558):
+// record it in the `rehydrating[]` list WITHOUT touching the `tiers` axis. The
+// byte class stays on `archive` (its bytes are still cold) while the restore
+// runs; only when the copy completes does the tier flip to `hot` (see
+// `completeRehydrate`). PURE so both repos reuse it and the couch repo can
+// re-run it inside updateWithRetry. Idempotent: re-marking a class already in
+// flight refreshes nothing (keeps the original `startedAt`) so a retried
+// request does not reset the operator-facing latency clock. Never touches
+// `status`/`statusHistory` (the ADR-019 D6 tier/status firewall).
+export function beginRehydrate(
+  existing: StorageTiering | undefined,
+  byteClass: StorageByteClass,
+  startedAt: string
+): StorageTiering {
+  const base = existing ?? defaultStorageTiering();
+  const already = (base.rehydrating ?? []).some((r) => r.byteClass === byteClass);
+  return {
+    tiers: { ...base.tiers },
+    rehydrating: already
+      ? [...base.rehydrating]
+      : [...(base.rehydrating ?? []), { byteClass, startedAt }]
+  };
+}
+
+// Complete a restore for a byte class (ADR-019 D4, issue #558): flip its tier
+// `archive -> hot` AND drop it from `rehydrating[]`, atomically, so the asset is
+// never observed as both `hot` and still-rehydrating. PURE and idempotent: a
+// class not currently rehydrating (already hot, or never started) is simply set
+// `hot` and the list is left consistent. Never touches `status`/`statusHistory`
+// (the ADR-019 D6 tier/status firewall) — a rehydrate flips ONLY the byte tier
+// and can never move an asset out of the `archived` lifecycle status.
+export function completeRehydrate(
+  existing: StorageTiering | undefined,
+  byteClass: StorageByteClass
+): StorageTiering {
+  const base = existing ?? defaultStorageTiering();
+  return {
+    tiers: { ...base.tiers, [byteClass]: 'hot' },
+    rehydrating: (base.rehydrating ?? []).filter((r) => r.byteClass !== byteClass)
+  };
+}
+
+// The canonical "nothing tiered, nothing rehydrating" default: every byte class
+// `hot`, no rehydrate in flight (ADR-019 — new/existing assets default to `hot`).
+// Returned wherever an asset carries no explicit tiering state so the axis is
+// always concretely present on the API without back-filling persistence.
+export function defaultStorageTiering(): StorageTiering {
+  return {
+    tiers: {
+      source: 'hot',
+      renditions: 'hot',
+      packaged: 'hot',
+      subtitles: 'hot',
+      thumbnails: 'hot'
+    },
+    rehydrating: []
+  };
+}
+
 // Provenance log entry (ADR-005, issue #53). Append-only audit of who/what
 // mutated which namespace.
 export const PROVENANCE_ACTORS = ['user', 'system', 'ai'] as const;
@@ -104,6 +271,18 @@ export type ProvenanceEntry = {
   by: ProvenanceActor;
   op: string;
   detail?: string;
+};
+
+// A namespaced correlation to an upstream system of record (issue #575,
+// ADR-019). `{ namespace, id }` foreign key. Modelled as a SET on the asset
+// (array), not a scalar, so an asset can be correlated with more than one
+// system at once. System-owned mapping data (ADR-005 administrative namespace).
+// The runtime Zod validation lives in asset-document.ts (ExternalIdentifierSchema).
+export type ExternalIdentifier = {
+  // Upstream system label, e.g. `ingest-mam` or `rights-registry`.
+  namespace: string;
+  // Foreign key value in that system (opaque string).
+  id: string;
 };
 
 // How an asset entered the system (ADR-005 administrative.source.method).
@@ -254,6 +433,17 @@ export type SubtitleTrack = {
   default?: boolean;
 };
 
+// Explicit delete-lock (ADR-020 decision 3, issue #568). Persisted in the
+// system-owned `administrative` namespace (asset-document.ts). Absent on the
+// flat Asset means unlocked. Field names/types match ADR-020 decision 3 exactly:
+//   locked, reason?, lockedAt, lockedBy?.
+export type DeleteLock = {
+  locked: boolean;
+  reason?: string;
+  lockedAt: string;
+  lockedBy?: string;
+};
+
 export type Asset = {
   id: string;
   name: string;
@@ -269,6 +459,23 @@ export type Asset = {
   // pre-existing assets/documents without it remain valid; absent is treated as
   // the initial state `draft` throughout (get/list/document round-trip).
   reviewState?: AssetReviewState;
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). When present and
+  // `locked === true` the asset is delete-protected: DELETE /:id (archive) is
+  // hard-blocked with 409 `delete_protected` until the lock is cleared, and
+  // `?force=true` does NOT override it. Set/cleared ONLY via the dedicated
+  // system path (PUT/DELETE /:id/lock) — never the editorial update path —
+  // because it lives in the system-owned `administrative` namespace. Optional:
+  // absent = unlocked, so pre-#568 assets remain valid on read/round-trip.
+  deleteLock?: DeleteLock;
+  // Storage-tier state (ADR-019, issue #556): the physical byte-location axis
+  // (`hot` | `archive`) per byte class, plus any in-flight rehydrate. INDEPENDENT
+  // of `status` and `reviewState` (mirrors the `reviewState`-beside-`status`
+  // pattern above). Optional so pre-existing assets/documents without it remain
+  // valid; absent is treated as the all-`hot`, nothing-rehydrating default
+  // (`defaultStorageTiering`) throughout (get/list/document round-trip). This is
+  // REPRESENTATION ONLY — no relocation, rehydrate execution, tiering trigger, or
+  // enforcement lives here (ADR-019 D1/D3/D4/D6).
+  storageTiering?: StorageTiering;
   // Source asset id for renditions/children; undefined for top-level sources.
   parentId?: string;
   // Version-chain linkage (issue #118), DISTINCT from `parentId`. Where
@@ -352,6 +559,13 @@ export type Asset = {
   originUri?: string;
   // Append-only provenance log (ADR-005 / issue #53).
   provenance?: ProvenanceEntry[];
+  // Namespaced external identifiers (issue #575, ADR-019): a SET of
+  // { namespace, id } foreign keys correlating this asset with one or more
+  // UPSTREAM systems of record. System-owned mapping data, so it maps onto the
+  // ADR-005 `administrative` namespace (see asset-document.ts), NOT the
+  // editorial `descriptive` one. Optional/additive: absent on assets/documents
+  // written before #575. Lookup (#576) and uniqueness (#577) are out of scope.
+  externalIdentifiers?: ExternalIdentifier[];
   // Collection memberships projected onto the asset (ADR-005 structural).
   collections?: string[];
   // TAMS time-addressable bridge addressing (issue #165, epic #116). Machine/
@@ -532,6 +746,36 @@ export class HasChildrenError extends Error {
   }
 }
 
+// Raised when a delete is blocked by an explicit delete-lock (ADR-020 issue
+// #568) -> 409. The route maps this to the shared `delete_blocked` envelope with
+// `reason: 'delete_protected'` and empty `blockedBy` arrays (the block is
+// intrinsic to the document, not a foreign reference). `?force=true` does NOT
+// override it (ADR-020 decision 2: explicit lock is ALWAYS a hard block).
+export class DeleteProtectedError extends Error {
+  readonly statusCode = 409;
+  constructor(id: string) {
+    super(`asset ${id} is protected from deletion by an explicit lock`);
+    this.name = 'DeleteProtectedError';
+  }
+}
+
+// Raised when a delete is blocked because an IN-FLIGHT (running/pending/queued)
+// job still references the asset (issue #569, ADR-020 decision 1) -> 409. The
+// route maps this to the shared `delete_blocked` envelope with
+// `reason: 'referenced_by_job'` and the referencing job ids in
+// `blockedBy.jobIds`. An active reference is a HARD block: `?force=true` does
+// NOT override it (ADR-020 decision 2 — force is only honoured for settled jobs,
+// which are never detected here).
+export class ReferencedByJobError extends Error {
+  readonly statusCode = 409;
+  readonly jobIds: string[];
+  constructor(id: string, jobIds: string[]) {
+    super(`asset ${id} is referenced by ${jobIds.length} in-flight job(s)`);
+    this.name = 'ReferencedByJobError';
+    this.jobIds = jobIds;
+  }
+}
+
 export const DEFAULT_LIMIT = 50;
 export const MAX_LIMIT = 200;
 
@@ -565,6 +809,17 @@ export interface AssetRepository {
   // asset in this workspace carries the slug. Used by the `/:id` route to accept
   // a slug in place of the ULID id.
   getBySlug(slug: string): Promise<Asset | undefined>;
+  // Resolve an asset by an upstream external identifier (issue #576, ADR-019),
+  // scoped to the repository's (structurally isolated) workspace. Matches the
+  // `{ namespace, id }` entry in `administrative.externalIdentifiers` (the set
+  // modelled by #575). Returns undefined when no asset in this workspace carries
+  // the pair. Used by the `/by-external-id/:namespace/:id` resolver route.
+  //
+  // Index-backed, NOT a linear scan: the CouchDB implementation pushes the pair
+  // down as a Mango `$elemMatch` selector over the persisted array (mirroring the
+  // TAMS flow-id push-down in couch-search-repo.ts), so CouchDB filters within
+  // the tenant database rather than the caller paging the whole asset set.
+  getByExternalId(namespace: string, id: string): Promise<Asset | undefined>;
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
@@ -573,6 +828,45 @@ export interface AssetRepository {
   // on an illegal move) and persists the new state. Returns the updated asset,
   // or undefined if the asset does not exist. INDEPENDENT of `status`.
   transitionReviewState(id: string, to: AssetReviewState): Promise<Asset | undefined>;
+  // Set or clear the explicit delete-lock (ADR-020 decision 3, issue #568). This
+  // is the DEDICATED system write path for the `administrative.deleteLock` flag —
+  // distinct from `update()` (the editorial path), which never touches the lock,
+  // so a user cannot clear their own protection editorially. `input.locked`
+  // true = protect, false = clear. Appends a `lock`/`unlock` provenance entry so
+  // the change is traceable (ADR-005 append-only administrative provenance).
+  // Returns the updated asset, or undefined when the id is unknown.
+  setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined>;
+  // Dedicated storage-tier write path (ADR-019 D1/D3, issue #557). Merges the
+  // given per-byte-class tier overrides onto the asset's `storageTiering` axis
+  // and persists them. DISTINCT from `update()` (the editorial/pipeline patch
+  // path) so a tier flip never rides on an editorial write and — critically —
+  // NEVER touches lifecycle `status`/`statusHistory` (the ADR-019 D6 tier/status
+  // firewall: a byte-location change must be structurally incapable of enqueuing
+  // an asset for the retention purge). Metadata is otherwise left untouched and
+  // searchable. Returns the updated asset, or undefined when the id is unknown.
+  setStorageTier(
+    id: string,
+    overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined>;
+  // Dedicated rehydrate-state write path (ADR-019 D4, issue #558). Drives ONE
+  // byte class through the restore lifecycle on the `storageTiering` axis:
+  //   - phase 'begin'    — record the class in `rehydrating[]` (in-flight),
+  //                        leaving its tier on `archive` while the cold->hot copy
+  //                        runs, so callers see the restore is underway and can
+  //                        wait on it.
+  //   - phase 'complete' — flip the class `archive -> hot` AND drop it from
+  //                        `rehydrating[]` atomically, once the bytes are hot.
+  // DISTINCT from `update()` and from `setStorageTier()` so the rehydrate
+  // lifecycle never rides on an editorial or relocation write, and — like every
+  // tier-axis write — NEVER touches lifecycle `status`/`statusHistory` (the
+  // ADR-019 D6 tier/status firewall; D6 rule #4: rehydrate flips only the byte
+  // tier and can never revive an `archived`-status asset). Returns the updated
+  // asset, or undefined when the id is unknown.
+  setRehydrateState(
+    id: string,
+    byteClass: StorageByteClass,
+    phase: RehydratePhase
+  ): Promise<Asset | undefined>;
   // Returns the count of direct children of an asset (for delete-blocking).
   countChildren(id: string): Promise<number>;
   // Enumerate every asset in the version lineage of `id` (issue #118), oldest
@@ -638,6 +932,53 @@ export function initialHistory(now: string): StatusTransition[] {
 // Build the initial provenance log for a freshly created asset (issue #53).
 export function initialProvenance(now: string, method: AssetSourceMethod): ProvenanceEntry[] {
   return [{ at: now, by: 'user', op: 'create', detail: `source=${method}` }];
+}
+
+// Input to the dedicated delete-lock write path (ADR-020, issue #568).
+//   locked  — true to protect, false to clear.
+//   reason  — optional operator note (stored only when locking).
+//   lockedBy — optional provenance actor id (stored only when locking).
+export type SetDeleteLockInput = {
+  locked: boolean;
+  reason?: string;
+  lockedBy?: string;
+};
+
+// Pure computation of the delete-lock write (ADR-020 decision 3, issue #568):
+// given the current asset and the lock input, produce the next `deleteLock`
+// value and the provenance entry to append. NO side effects, so both repos can
+// reuse it and the couch repo can safely re-run it inside updateWithRetry.
+//   - locked=true  -> a fresh lock object { locked, reason?, lockedAt: now,
+//     lockedBy? } and a `lock` provenance entry.
+//   - locked=false -> deleteLock cleared (undefined) and an `unlock` entry.
+// The provenance actor is `user` (an explicit operator action, cf. the `restore`
+// entry which is also `by: 'user'`). ADR-005 append-only: history is never
+// rewritten.
+export function applyDeleteLock(
+  existing: Asset,
+  input: SetDeleteLockInput,
+  now: string
+): { deleteLock: DeleteLock | undefined; provenance: ProvenanceEntry[] } {
+  const provenance = existing.provenance ?? [];
+  if (input.locked) {
+    const lock: DeleteLock = {
+      locked: true,
+      reason: input.reason,
+      lockedAt: now,
+      lockedBy: input.lockedBy
+    };
+    return {
+      deleteLock: lock,
+      provenance: [
+        ...provenance,
+        { at: now, by: 'user', op: 'lock', detail: input.reason }
+      ]
+    };
+  }
+  return {
+    deleteLock: undefined,
+    provenance: [...provenance, { at: now, by: 'user', op: 'unlock' }]
+  };
 }
 
 // Derive the provenance entries a given patch produces (issue #53).
@@ -958,6 +1299,21 @@ export class InMemoryAssetRepository implements AssetRepository {
     return undefined;
   }
 
+  // Resolve by external identifier (issue #576, ADR-019). Scans this store, which
+  // holds exactly one tenant's assets, so the lookup is inherently
+  // workspace-scoped — mirroring getBySlug's isolation. The CouchDB backend does
+  // the equivalent match with an indexed Mango `$elemMatch` push-down; here the
+  // in-memory backend walks the (small, dev/test) store and returns the first
+  // asset carrying the `{ namespace, id }` pair.
+  async getByExternalId(namespace: string, id: string): Promise<Asset | undefined> {
+    for (const a of this.store.values()) {
+      if (a.externalIdentifiers?.some((e) => e.namespace === namespace && e.id === id)) {
+        return { ...a };
+      }
+    }
+    return undefined;
+  }
+
   async list(opts: ListOptions = {}): Promise<ListResult> {
     const limit = clampLimit(opts.limit);
     const offset = Math.max(0, opts.offset ?? 0);
@@ -1080,6 +1436,69 @@ export class InMemoryAssetRepository implements AssetRepository {
     const applied = applyReviewState(existing.reviewState, to);
     const now = new Date().toISOString();
     const next: Asset = { ...existing, reviewState: applied.reviewState, updatedAt: now };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  // Dedicated delete-lock write path (ADR-020 decision 3, issue #568). Bypasses
+  // `update()` (the editorial path) so the system-owned lock is never settable
+  // through ordinary metadata edits. Appends a `lock`/`unlock` provenance entry.
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const applied = applyDeleteLock(existing, input, now);
+    const next: Asset = {
+      ...existing,
+      deleteLock: applied.deleteLock,
+      provenance: applied.provenance,
+      updatedAt: now
+    };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  // Dedicated storage-tier write path (ADR-019 D1/D3, issue #557). Bypasses
+  // `update()` so the byte-location axis is never coupled to an editorial patch,
+  // and touches NEITHER `status` NOR `statusHistory` (ADR-019 D6 firewall). Only
+  // `storageTiering` and `updatedAt` change; the metadata stays searchable.
+  async setStorageTier(
+    id: string,
+    overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const next: Asset = {
+      ...existing,
+      storageTiering: applyStorageTier(existing.storageTiering, overrides),
+      updatedAt: now
+    };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  // Dedicated rehydrate-state write path (ADR-019 D4, issue #558). Mutates ONLY
+  // `storageTiering` + `updatedAt`; NEVER `status`/`statusHistory` (D6 firewall).
+  async setRehydrateState(
+    id: string,
+    byteClass: StorageByteClass,
+    phase: RehydratePhase
+  ): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const tiering =
+      phase === 'begin'
+        ? beginRehydrate(existing.storageTiering, byteClass, now)
+        : completeRehydrate(existing.storageTiering, byteClass);
+    const next: Asset = { ...existing, storageTiering: tiering, updatedAt: now };
     this.store.set(id, next);
     return { ...next };
   }

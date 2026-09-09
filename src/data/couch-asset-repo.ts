@@ -29,11 +29,19 @@ import {
   type CreateAssetInput,
   type ListOptions,
   type ListResult,
+  type RehydratePhase,
+  type SetDeleteLockInput,
+  type StorageByteClass,
+  type StorageTier,
   type UpdateAssetInput,
+  applyDeleteLock,
   applyMetadata,
   applyRestore,
   applyReviewState,
   applyStatus,
+  applyStorageTier,
+  beginRehydrate,
+  completeRehydrate,
   clampLimit,
   generateUniqueSlug,
   initialHistory,
@@ -146,6 +154,32 @@ export class CouchAssetRepository implements AssetRepository {
   async getBySlug(slug: string): Promise<Asset | undefined> {
     const couch = this.couchFor();
     const matches = await couch.find({ resourceType: RESOURCE_TYPE, slug }, { limit: 1 });
+    const doc = matches.find((d) => d.resourceType === RESOURCE_TYPE);
+    if (!doc) {
+      return undefined;
+    }
+    return fromDoc(doc);
+  }
+
+  // Resolve by external identifier (issue #576, ADR-019). The persisted document
+  // carries the correlation set under the four-namespace `administrative`
+  // namespace as `administrative.externalIdentifiers[]`, each entry a
+  // `{ namespace, id }` object (asset-document.ts: toAssetDocument attaches the
+  // block only when present). We push the pair down as a dotted Mango `$elemMatch`
+  // selector so CouchDB filters WITHIN the tenant database — this is the same
+  // index-backed array-push-down the TAMS flow lookup uses
+  // (couch-search-repo.ts: `structural.tams.flowIds` -> `$elemMatch`), NOT a
+  // client-side page walk. `(namespace, id)` uniqueness is out of scope here
+  // (#577), so at most one match is expected; we take the first document.
+  async getByExternalId(namespace: string, id: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const matches = await couch.find(
+      {
+        resourceType: RESOURCE_TYPE,
+        'administrative.externalIdentifiers': { $elemMatch: { namespace, id } }
+      },
+      { limit: 1 }
+    );
     const doc = matches.find((d) => d.resourceType === RESOURCE_TYPE);
     if (!doc) {
       return undefined;
@@ -312,6 +346,101 @@ export class CouchAssetRepository implements AssetRepository {
     // Carry _rev so CouchDB accepts the update; put() forces the partition.
     await couch.put(id, { ...toDoc(next), _rev: doc._rev });
     return next;
+  }
+
+  // Dedicated delete-lock write path (ADR-020 decision 3, issue #568). Distinct
+  // from update() (the editorial path, which never touches the lock), so the
+  // system-owned `administrative.deleteLock` flag can only be set/cleared here.
+  // Routed through updateWithRetry for the same conflict-retry safety as the
+  // other read-modify-write paths (issues #278/#279/#281); applyDeleteLock is
+  // pure so it re-runs safely per attempt. Appends a `lock`/`unlock` provenance
+  // entry (ADR-005 append-only). Returns undefined when the id is unknown.
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const now = new Date().toISOString();
+      const applied = applyDeleteLock(existing, input, now);
+      const next: Asset = {
+        ...existing,
+        deleteLock: applied.deleteLock,
+        provenance: applied.provenance,
+        updatedAt: now
+      };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
+  // Dedicated storage-tier write path (ADR-019 D1/D3, issue #557). Distinct from
+  // update() (the editorial/pipeline path) so a byte-location flip never rides on
+  // an editorial write and — critically — never touches lifecycle
+  // `status`/`statusHistory` (the ADR-019 D6 tier/status firewall: a cold-tiered
+  // asset keeps a non-`archived` status and stays structurally invisible to the
+  // retention purge). Routed through updateWithRetry for the same conflict-retry
+  // safety as the other read-modify-write paths; applyStorageTier is pure so it
+  // re-runs safely per attempt. Only `storageTiering`/`updatedAt` change; the
+  // metadata document is otherwise untouched and searchable. Returns undefined
+  // when the id is unknown.
+  async setStorageTier(
+    id: string,
+    overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const now = new Date().toISOString();
+      const next: Asset = {
+        ...existing,
+        storageTiering: applyStorageTier(existing.storageTiering, overrides),
+        updatedAt: now
+      };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
+  // Dedicated rehydrate-state write path (ADR-019 D4, issue #558). Routed through
+  // updateWithRetry like setStorageTier so the read-modify-write is conflict-safe;
+  // beginRehydrate/completeRehydrate are pure and re-run safely per attempt. Only
+  // `storageTiering`/`updatedAt` change; lifecycle `status`/`statusHistory` are
+  // NEVER touched (the ADR-019 D6 tier/status firewall). Returns undefined when
+  // the id is unknown.
+  async setRehydrateState(
+    id: string,
+    byteClass: StorageByteClass,
+    phase: RehydratePhase
+  ): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const now = new Date().toISOString();
+      const tiering =
+        phase === 'begin'
+          ? beginRehydrate(existing.storageTiering, byteClass, now)
+          : completeRehydrate(existing.storageTiering, byteClass);
+      const next: Asset = { ...existing, storageTiering: tiering, updatedAt: now };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
   }
 
   // Workspace-scoped slug existence check (issue #131). Queries the top-level

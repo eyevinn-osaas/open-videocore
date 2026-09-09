@@ -27,12 +27,19 @@ import {
   ASSET_REVIEW_STATES,
   ASSET_SOURCE_METHODS,
   PROVENANCE_ACTORS,
+  STORAGE_BYTE_CLASSES,
+  STORAGE_TIERS,
   SUBTITLE_FORMATS,
+  defaultStorageTiering,
   type Asset,
   type AssetReviewState,
   type AssetSourceMethod,
   type AssetStatus,
-  type ProvenanceEntry
+  type ExternalIdentifier,
+  type ProvenanceEntry,
+  type StorageByteClass,
+  type StorageTier,
+  type StorageTiering
 } from './asset-repo.js';
 
 export const ASSET_SCHEMA_VERSION = 1;
@@ -133,6 +140,47 @@ const StatusTransitionSchema = z.object({
   to: z.string()
 });
 
+// Explicit delete-lock (ADR-020 decision 3, issue #568). An operator-set flag
+// that hard-blocks archive/purge until cleared. Lives in the system-owned
+// `administrative` namespace (see the namespace table above) so a user cannot
+// clear their own protection through the editorial update path. Optional/
+// additive: absent = unlocked, so no schemaVersion bump is required and every
+// pre-#568 document remains a valid v1 document (mirroring the reviewState /
+// packagedOutput optional-field precedent).
+export const DeleteLockSchema = z.object({
+  locked: z.boolean(),
+  reason: z.string().optional(),
+  lockedAt: z.string(),
+  lockedBy: z.string().optional()
+});
+
+// ---------------------------------------------------------------------------
+// External identifiers (issue #575, ADR-019).
+//
+// A namespaced correlation to an UPSTREAM system of record: `{ namespace, id }`.
+// Modelled as a SET (array) — not a single scalar — so one asset can be
+// correlated with more than one system simultaneously (e.g. an ingest MAM plus
+// a rights registry). These are system-owned FOREIGN KEYS, not editorial
+// content, so ADR-019 places the collection under the `administrative`
+// namespace (system-provenance) rather than user-writable `descriptive`,
+// consistent with the ADR-005 writer-provenance rules described in this file's
+// header (lines 5-11) and grounded in ADR-009 lines 95-101.
+//
+// This is scope-limited to the DATA MODEL only: no lookup (#576) or uniqueness
+// (#577) logic lives here. The field is OPTIONAL and additive, so documents
+// written before #575 (field absent) still deserialize — no schemaVersion bump
+// is required, and all v1 documents remain valid.
+export const ExternalIdentifierSchema: z.ZodType<ExternalIdentifier> = z.object({
+  // Upstream system identifier, e.g. `ingest-mam`, `rights-registry`. A short,
+  // opaque namespace label distinguishing which system of record `id` belongs
+  // to. Non-empty so an entry always names its owning system.
+  namespace: z.string().min(1),
+  // The foreign key value in that system. Kept as an opaque string (systems
+  // vary: UUIDs, numeric ids, slugs), non-empty so an entry always carries a
+  // value.
+  id: z.string().min(1)
+});
+
 // ---------------------------------------------------------------------------
 // TAMS addressing (issue #165, sub-task of the #116 TAMS bridge epic).
 //
@@ -195,6 +243,32 @@ export const TamsAddressingSchema = z.object({
 export type TamsAddressing = z.infer<typeof TamsAddressingSchema>;
 
 // ---------------------------------------------------------------------------
+// Storage tiering (ADR-019, issue #556)
+//
+// The physical byte-location axis of an asset's bytes (`hot` | `archive`) tracked
+// PER BYTE CLASS (ADR-019 D3), plus any in-flight rehydrate (ADR-019 D4). It is
+// machine/pipeline-derived (a property of WHERE bytes live, next to renditions,
+// manifests, packagedOutput), so it lives under the `structural` namespace —
+// NEVER under user-writable `descriptive`, and NEVER on the lifecycle `state`
+// (ADR-019 D6 firewall). Both fields optional/additive: documents written before
+// #556 (block absent) still deserialize as the all-`hot`, nothing-rehydrating
+// default (fromAssetDocument), so no schemaVersion bump is required.
+// ---------------------------------------------------------------------------
+
+const RehydrateStateSchema = z.object({
+  byteClass: z.enum(STORAGE_BYTE_CLASSES),
+  startedAt: z.string()
+});
+
+export const StorageTieringSchema = z.object({
+  // Tier per byte class. Absent classes are treated as `hot` by the mapper.
+  tiers: z.record(z.enum(STORAGE_BYTE_CLASSES), z.enum(STORAGE_TIERS)).default({}),
+  // Byte classes with a restore in flight (ADR-019 D4). Empty means none.
+  rehydrating: z.array(RehydrateStateSchema).default([])
+});
+export type DocStorageTiering = z.infer<typeof StorageTieringSchema>;
+
+// ---------------------------------------------------------------------------
 // Asset document (the four-namespace aggregate root)
 // ---------------------------------------------------------------------------
 
@@ -245,7 +319,18 @@ export const AssetDocumentSchema = z.object({
     // `.default('draft')` means documents written before reviewState existed
     // (the field simply absent) deserialize as `draft` — no schemaVersion bump
     // is required, so all v1 documents remain valid.
-    reviewState: z.enum(ASSET_REVIEW_STATES).default('draft')
+    reviewState: z.enum(ASSET_REVIEW_STATES).default('draft'),
+    // Namespaced external identifiers (issue #575, ADR-019): a set of
+    // { namespace, id } foreign keys to upstream systems of record. System-owned
+    // mapping data, so it lives here under `administrative` — NOT under
+    // user-writable `descriptive`. Optional so documents written before #575
+    // (field absent) still deserialize; no schemaVersion bump required. Lookup
+    // (#576) and uniqueness (#577) are intentionally out of scope here.
+    externalIdentifiers: z.array(ExternalIdentifierSchema).optional(),
+    // Explicit delete-lock (ADR-020 decision 3, issue #568). Optional so
+    // documents written before #568 (field absent) still deserialize as
+    // unlocked — no schemaVersion bump required, all v1 documents remain valid.
+    deleteLock: DeleteLockSchema.optional()
   }),
 
   structural: z
@@ -291,7 +376,13 @@ export const AssetDocumentSchema = z.object({
       // -derived (flow UUIDs + validated TAI timerange grammar, ADR-008), so it
       // lives here under `structural` — NOT under user-writable `descriptive`.
       // Optional so documents written before #165 (field absent) still parse.
-      tams: TamsAddressingSchema.optional()
+      tams: TamsAddressingSchema.optional(),
+      // Storage-tier state (ADR-019, issue #556): per-byte-class `hot`/`archive`
+      // location + in-flight rehydrate. Machine/pipeline-derived, so it lives
+      // here under `structural` — NOT under `descriptive`, and NOT on `state`
+      // (the tier/status firewall, ADR-019 D6). Optional so documents written
+      // before #556 (field absent) still deserialize as the all-`hot` default.
+      storageTiering: StorageTieringSchema.optional()
     })
     .default({ renditions: [], collections: [] })
 });
@@ -381,6 +472,8 @@ export function toAssetDocument(
       // asset has never been moved out of draft; persist the default explicitly.
       reviewState: asset.reviewState ?? 'draft'
     },
+    // externalIdentifiers (issue #575) is attached below, only when present, so
+    // pre-#575 assets round-trip with the field absent (back-compat).
     structural: {
       renditions: asset.renditions ?? [],
       collections: asset.collections ?? [],
@@ -391,8 +484,25 @@ export function toAssetDocument(
       versionGroupId: asset.versionGroupId ?? null
     }
   };
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). Only persisted when
+  // the asset actually carries a lock object, so pre-#568 assets round-trip with
+  // the field absent (back-compat).
+  if (asset.deleteLock) {
+    doc.administrative.deleteLock = {
+      locked: asset.deleteLock.locked,
+      reason: asset.deleteLock.reason,
+      lockedAt: asset.deleteLock.lockedAt,
+      lockedBy: asset.deleteLock.lockedBy
+    };
+  }
   if (opts.rev) {
     doc._rev = opts.rev;
+  }
+  // Namespaced external identifiers (issue #575). Only persisted when the asset
+  // actually carries entries, so pre-#575 assets round-trip with the field
+  // absent (back-compat), mirroring the TAMS/packagedOutput pattern.
+  if (asset.externalIdentifiers && asset.externalIdentifiers.length > 0) {
+    doc.administrative.externalIdentifiers = asset.externalIdentifiers;
   }
   if (asset.objectKey) {
     doc.administrative.storage = {
@@ -459,7 +569,50 @@ export function toAssetDocument(
       doc.structural.tams.timerange = asset.tamsTimerange;
     }
   }
+  // Storage tiering (ADR-019, issue #556). Only persist the block when the asset
+  // actually carries non-default tier state (any class `archive`, or a rehydrate
+  // in flight), so pre-#556 assets and all-`hot` assets round-trip with the field
+  // absent (back-compat) — the mapper below fills the all-`hot` default on read.
+  if (asset.storageTiering && isNonDefaultTiering(asset.storageTiering)) {
+    const tiers: Partial<Record<StorageByteClass, StorageTier>> = {};
+    for (const [cls, tier] of Object.entries(asset.storageTiering.tiers)) {
+      // Persist only the archived classes; `hot` is the implicit default on read.
+      if (tier === 'archive') {
+        tiers[cls as StorageByteClass] = tier;
+      }
+    }
+    doc.structural.storageTiering = {
+      tiers,
+      rehydrating: asset.storageTiering.rehydrating ?? []
+    };
+  }
   return doc;
+}
+
+// True when a tiering state carries anything other than the all-`hot`,
+// nothing-rehydrating default: any byte class on `archive`, or a rehydrate in
+// flight. Used to decide whether the block is worth persisting (back-compat).
+function isNonDefaultTiering(tiering: StorageTiering): boolean {
+  const anyArchived = Object.values(tiering.tiers).some((t) => t === 'archive');
+  const anyRehydrating = (tiering.rehydrating?.length ?? 0) > 0;
+  return anyArchived || anyRehydrating;
+}
+
+// Map a persisted storage-tiering block back to the flat domain `StorageTiering`
+// (ADR-019, issue #556). Starts from the all-`hot`, nothing-rehydrating default
+// and overlays any persisted archived classes / in-flight rehydrates, so an
+// absent block reads as concretely all-`hot` (never undefined) and a partial
+// block (only archived classes persisted) fills the remaining classes as `hot`.
+function storageTieringFromDoc(block: DocStorageTiering | undefined): StorageTiering {
+  const tiering = defaultStorageTiering();
+  if (!block) {
+    return tiering;
+  }
+  for (const [cls, tier] of Object.entries(block.tiers)) {
+    tiering.tiers[cls as StorageByteClass] = tier;
+  }
+  tiering.rehydrating = block.rehydrating ?? [];
+  return tiering;
 }
 
 // Map a persisted four-namespace document back to the flat domain Asset.
@@ -485,6 +638,16 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     // Editorial review state (issue #134). The schema defaults absent values to
     // `draft`, so legacy documents round-trip to `draft` rather than undefined.
     reviewState: doc.administrative.reviewState as AssetReviewState,
+    // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent maps to
+    // undefined so pre-#568 assets stay clean (treated as unlocked everywhere).
+    deleteLock: doc.administrative.deleteLock
+      ? {
+          locked: doc.administrative.deleteLock.locked,
+          reason: doc.administrative.deleteLock.reason,
+          lockedAt: doc.administrative.deleteLock.lockedAt,
+          lockedBy: doc.administrative.deleteLock.lockedBy
+        }
+      : undefined,
     parentId: derivedFrom ?? undefined,
     versionOfAssetId,
     versionGroupId,
@@ -536,13 +699,24 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
         ? doc.structural.tams.flowIds
         : undefined,
     tamsTimerange: doc.structural?.tams?.timerange,
+    // Storage tiering (ADR-019, issue #556). An absent block maps back to the
+    // all-`hot`, nothing-rehydrating default so pre-#556 assets and all-`hot`
+    // assets read as concretely `hot`, never undefined. Persisted archived
+    // classes and in-flight rehydrates are merged over that default.
+    storageTiering: storageTieringFromDoc(doc.structural?.storageTiering),
     sourceMethod: doc.administrative.source.method,
     originUri: doc.administrative.source.originUri,
     provenance: doc.administrative.provenance ?? [],
+    // Namespaced external identifiers (issue #575). Absent / empty maps back to
+    // undefined so the flat type stays clean for pre-#575 assets.
+    externalIdentifiers:
+      doc.administrative.externalIdentifiers && doc.administrative.externalIdentifiers.length > 0
+        ? doc.administrative.externalIdentifiers
+        : undefined,
     collections: collections && collections.length > 0 ? collections : undefined,
     createdAt: doc.administrative.createdAt,
     updatedAt: doc.administrative.updatedAt
   };
 }
 
-export type { ProvenanceEntry };
+export type { ExternalIdentifier, ProvenanceEntry };
