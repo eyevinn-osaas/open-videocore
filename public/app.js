@@ -4100,6 +4100,14 @@ async function renderCollectionsTab(container) {
 //     member endpoint on that router (the only other membership route is
 //     DELETE /:id/assets/:assetId, :533), so "add several" is one PUT per
 //     asset, issued from a single user interaction.
+//   - Result truncation: the envelope's `total` is the count of matching ASSETS
+//     across the WHOLE matched set, not the page in hand (`searchResultSchema`,
+//     src/routes/search.ts:130 — "Count of matching ASSETS (unchanged
+//     pagination contract)"; the page itself is `matched.slice(start, start +
+//     pageSize)` against `total: matched.length`,
+//     src/data/inmemory-search-repo.ts:53-57). So `total > assets.length` means
+//     the list on screen is cut short, and the picker says so rather than
+//     letting "not shown" read as "not there" (issue #949).
 const ASSET_PICKER_DEBOUNCE_MS = 250;
 const ASSET_PICKER_PAGE_SIZE = 20;
 
@@ -4124,6 +4132,23 @@ function assetPickerHits(res) {
       status: (a && a.status) || '',
     };
   }).filter(function(a) { return a.id !== ''; });
+}
+
+// Count of matching assets the search found in total, or null when the envelope
+// does not say. Read separately from the hits so `assetPickerHits` keeps its
+// one job (issue #949).
+function assetPickerTotal(res) {
+  return res && typeof res.total === 'number' ? res.total : null;
+}
+
+// The line above a truncated hit list. A one-page picker that shows 20 of 57
+// matches and says nothing makes an asset that exists look like an asset that
+// does not, and the operator has no way to tell which — so name the gap and say
+// what to do about it. Empty string when everything that matched is on screen.
+function assetPickerResultNote(shown, total) {
+  if (total === null || total === undefined || total <= shown) return '';
+  return 'Showing the first ' + shown + ' of ' + total +
+    ' matching assets. Add a word from the name to narrow the search.';
 }
 
 // Add several assets to one collection. One PUT per asset (the contract has no
@@ -4235,13 +4260,16 @@ function renderCollectionAssetPicker(collectionId, opts) {
     });
   }
 
-  function renderHits(hits) {
+  function renderHits(hits, total) {
     searchInput.setAttribute('aria-expanded', hits.length > 0 ? 'true' : 'false');
     if (hits.length === 0) {
       resultsEl.innerHTML = '<div class="empty">No assets match.</div>';
       return;
     }
-    resultsEl.innerHTML = hits.map(function(hit) {
+    const note = assetPickerResultNote(hits.length, total);
+    resultsEl.innerHTML = (note
+      ? '<div class="form-hint" id="add-asset-results-note">' + escHtml(note) + '</div>'
+      : '') + hits.map(function(hit) {
       return '<label class="checkbox-label">' +
         '<input type="checkbox" class="add-asset-hit" value="' + escHtml(hit.id) + '"' +
         (selected.has(hit.id) ? ' checked' : '') +
@@ -4278,7 +4306,7 @@ function renderCollectionAssetPicker(collectionId, opts) {
     try {
       const res = await apiFetch(assetPickerSearchPath(q));
       if (seq !== searchSeq) return; // a newer keystroke already won
-      renderHits(assetPickerHits(res));
+      renderHits(assetPickerHits(res), assetPickerTotal(res));
     } catch (err) {
       if (seq !== searchSeq) return;
       resultsEl.innerHTML = '';
@@ -7091,18 +7119,20 @@ function relativeTime(epochMs) {
   return day + ' day' + (day === 1 ? '' : 's') + ' ago';
 }
 
-// Derive per-instance job capacity from the pool records rather than hardcoding.
-// The scaler treats an instance as "busy" at JOBS_PER_INSTANCE (=1) but that
-// constant is not on the wire; instead we infer capacity as the highest
-// activeJobs observed across the pool, floored at 1 so a fully-idle pool still
-// reports a sane capacity of 1.
-function deriveInstanceCapacity(instances) {
-  let cap = 1;
-  (instances || []).forEach(function(inst) {
-    const a = Number(inst.activeJobs) || 0;
-    if (a > cap) cap = a;
-  });
-  return cap;
+// Per-instance job capacity, read from the status payload (issue #979).
+//
+// Contract: GET /api/v1/scaler/status -> `jobsPerInstance`
+// (scalerStatusSchema, src/routes/scaler.ts), the server's own
+// JOBS_PER_INSTANCE (src/encore-scaler/types.ts) — the count at which the scaler
+// loop treats an instance as busy. This used to be inferred from the pool's
+// highest observed activeJobs, which agreed with the truth only while the
+// constant was 1: the card showed "the busiest thing seen in this pool", not the
+// instance's capacity. Falls back to 1 (one job per instance, the scaler's own
+// default) when talking to a server that predates the field, rather than
+// resuming the guess.
+function resolveJobsPerInstance(status) {
+  const n = Number(status && status.jobsPerInstance);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 }
 
 // Green (idle) / amber (partial) / red (at capacity) load class for an instance.
@@ -7111,6 +7141,19 @@ function loadClass(activeJobs, capacity) {
   if (a <= 0) return 'load-idle';
   if (a >= capacity) return 'load-full';
   return 'load-partial';
+}
+
+// Operator-facing wording for each load class. Derived from the class rather
+// than re-deciding the same thresholds a second time, so the dot colour and the
+// tooltip can never disagree.
+const LOAD_CLASS_LABELS = {
+  'load-idle': 'idle',
+  'load-partial': 'partially loaded',
+  'load-full': 'at capacity',
+};
+
+function loadLabel(cls) {
+  return LOAD_CLASS_LABELS[cls] || cls;
 }
 
 async function renderTranscodersTab(container) {
@@ -7174,7 +7217,7 @@ async function renderTranscodersTab(container) {
       return;
     }
 
-    const capacity = deriveInstanceCapacity(flatInstances.map(function(f) { return f.inst; }));
+    const capacity = resolveJobsPerInstance(status);
 
     const grid = document.createElement('div');
     grid.className = 'tc-grid';
@@ -7182,7 +7225,7 @@ async function renderTranscodersTab(container) {
       const inst = f.inst;
       const active = Number(inst.activeJobs) || 0;
       const cls = loadClass(active, capacity);
-      const label = active <= 0 ? 'idle' : (active >= capacity ? 'at capacity' : 'partial');
+      const label = loadLabel(cls);
       return [
         '<div class="tc-card">',
         '  <div class="tc-card-head">',
@@ -7361,6 +7404,12 @@ export {
   addAssetsToCollection,
   addAssetsSummary,
   ASSET_PICKER_DEBOUNCE_MS,
+  // Truncation disclosure on the hit list (issue #949). Exported so a unit test
+  // can pin the "showing N of M" wording and the no-note case without going
+  // through a search round trip.
+  assetPickerTotal,
+  assetPickerResultNote,
+  ASSET_PICKER_PAGE_SIZE,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
@@ -7375,6 +7424,14 @@ export {
   renderSearchTab,
   SEARCH_FORMAT_LABEL,
   SEARCH_FORMAT_PLACEHOLDER,
+  // Per-instance capacity is read from the wire, not inferred (issue #979).
+  // Exported so a DOM/unit test can assert the card reports the server's
+  // `jobsPerInstance` and that an instance below it renders as partially loaded —
+  // the state that was unreachable while capacity was derived from observed load.
+  resolveJobsPerInstance,
+  loadClass,
+  loadLabel,
+  renderTranscodersTab,
   // Exported so a DOM/unit test can prove every rendered tab button is
   // routable — i.e. present in the allowlist AND backed by a renderer — and
   // that an unroutable one is reported rather than silently dropped (#823).
